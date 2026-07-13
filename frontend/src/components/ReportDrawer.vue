@@ -131,6 +131,42 @@ async function restoreArchived() {
   }
 }
 
+async function rejectArchived() {
+  // AI 未采纳驳回：直接设 user_status=rejected，从未采纳列表移除。
+  try {
+    await api.userReview(f.value.id, { user_status: "rejected" });
+    emit("toast", "已驳回");
+    emit("updated");
+    emit("close");
+  } catch (e) {
+    emit("toast", String(e.message || e).replace(/^\d+\s*/, ""));
+  }
+}
+
+async function restoreDiscarded() {
+  // AI 已作废（superseded）：走专用接口改 verdict + finding 状态才能真正进复审队列。
+  try {
+    await api.restoreDiscarded(f.value.id);
+    emit("toast", "已恢复到复审队列");
+    emit("updated");
+    emit("close");
+  } catch (e) {
+    emit("toast", String(e.message || e).replace(/^\d+\s*/, ""));
+  }
+}
+
+async function rejectDiscarded() {
+  // AI 已作废驳回：直接设 user_status=rejected，从已作废列表移除。
+  try {
+    await api.userReview(f.value.id, { user_status: "rejected" });
+    emit("toast", "已驳回");
+    emit("updated");
+    emit("close");
+  } catch (e) {
+    emit("toast", String(e.message || e).replace(/^\d+\s*/, ""));
+  }
+}
+
 function copyMd() {
   copyText(buildReportMd(f.value)).then(() => emit("toast", "报告已复制（Markdown）"))
     .catch(() => emit("toast", "复制失败，请使用导出按钮"));
@@ -376,10 +412,35 @@ async function askAssistant(preset = "") {
           </div>
         </div>
         <div class="review-bar">
-          <span class="rb-hint">AI 未采纳，可救回复审或继续深挖</span>
+          <span class="rb-hint">AI 未采纳，可救回复审、继续深挖或驳回</span>
           <span class="grow"></span>
           <button class="deep" @click="deepenOpen = !deepenOpen">+ 继续深挖</button>
+          <button class="no" @click="rejectArchived">✕ 驳回</button>
           <button class="ok" @click="restoreArchived">↩ 恢复到复审队列</button>
+        </div>
+      </div>
+
+      <!-- AI 已作废操作栏（superseded 归档）：恢复走专用接口改 verdict + 状态，驳回直接设 rejected -->
+      <div v-if="mode === 'discarded' && !readonly" class="review-wrap">
+        <div v-if="deepenOpen" class="deepen-box">
+          <label>深挖指令（告诉 worker 这一轮去把什么打穿，越具体越好）</label>
+          <textarea v-model="deepenText" rows="2"
+            placeholder="例：用泄露的初始密码 123456 实际登录某个真实账号，证明能进系统拿到数据"></textarea>
+          <div v-if="deepenCapHit" class="deepen-cap-warn">
+            ⚠ 深挖次数已达上限（自动化防护），人工确认后可强制继续，不受次数限制
+          </div>
+          <div class="deepen-actions">
+            <button class="ghost" @click="deepenOpen = false; deepenCapHit = false">取消</button>
+            <button v-if="deepenCapHit" class="go force" @click="submitDeepen(true)">⚡ 强制深挖（绕过次数限制）</button>
+            <button v-else class="go" @click="submitDeepen()">↻ 打回深挖并重新入队</button>
+          </div>
+        </div>
+        <div class="review-bar">
+          <span class="rb-hint">AI 已作废，可救回复审、继续深挖或驳回</span>
+          <span class="grow"></span>
+          <button class="deep" @click="deepenOpen = !deepenOpen">+ 继续深挖</button>
+          <button class="no" @click="rejectDiscarded">✕ 驳回</button>
+          <button class="ok" @click="restoreDiscarded">↩ 恢复到复审队列</button>
         </div>
       </div>
     </div>

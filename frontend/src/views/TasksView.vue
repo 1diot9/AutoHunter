@@ -12,6 +12,53 @@ const editingTask = ref(null);
 const writable = computed(() => authRoleRef.value === "full");
 const router = useRouter();
 
+// 搜索与排序
+const searchQuery = ref("");
+const sortBy = ref("created"); // created | pinyin
+const _pinyinCollator = new Intl.Collator("zh-Hans-CN", { sensitivity: "accent" });
+
+// 分页与筛选 —— 从位置记忆模块恢复上次位置
+const page = ref(taskListState.hasSavedState ? taskListState.page : 0);                 // 当前页，0-based
+const pageSize = ref(taskListState.hasSavedState ? taskListState.pageSize : 20);            // 每页数量
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
+const filterBy = ref("all");         // all | review_archived | discarded | pending_reg
+
+const filteredTasks = computed(() => {
+  let list = tasks.value;
+  const q = searchQuery.value.trim().toLowerCase();
+  if (q) {
+    list = list.filter((t) =>
+      (t.name || "").toLowerCase().includes(q) ||
+      (t.fofa_query || "").toLowerCase().includes(q)
+    );
+  }
+  // 筛选：待复审/AI未采纳（红点+绿点）/ AI已作废（灰点）/ 待注册目标
+  if (filterBy.value === "review_archived") {
+    list = list.filter((t) => (t.pending_user_review > 0) || (t.pending_archived > 0));
+  } else if (filterBy.value === "discarded") {
+    list = list.filter((t) => (t.pending_discarded > 0));
+  } else if (filterBy.value === "pending_reg") {
+    list = list.filter((t) => (t.pending_input ?? 0) > 0);
+  }
+  const sorted = [...list];
+  if (sortBy.value === "pinyin") {
+    sorted.sort((a, b) => _pinyinCollator.compare(a.name || "", b.name || ""));
+  } else {
+    sorted.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  }
+  return sorted;
+});
+
+const totalFiltered = computed(() => filteredTasks.value.length);
+const totalPages = computed(() => Math.max(1, Math.ceil(totalFiltered.value / pageSize.value)));
+const pagedTasks = computed(() => {
+  const start = page.value * pageSize.value;
+  return filteredTasks.value.slice(start, start + pageSize.value);
+});
+
+function prevPage() { if (page.value > 0) page.value--; }
+function nextPage() { if (page.value < totalPages.value - 1) page.value++; }
+
 const STATUS_LABEL = {
   running: "运行中",
   idle: "空闲",
@@ -119,6 +166,19 @@ watch(authReadyRef, (ready) => {
   <section class="view tasks-view" :class="{ 'is-refreshing': refreshing }">
     <div v-if="refreshing && !initialLoading" class="view-progress" aria-hidden="true"><i></i></div>
     <header class="page-head">
+      <div class="toolbar-row">
+        <input v-model="searchQuery" class="task-search" placeholder="搜索任务名/FOFA语法…" />
+        <select v-model="filterBy" class="task-sort">
+          <option value="all">全部任务</option>
+          <option value="review_archived">待复审 / AI未采纳</option>
+          <option value="discarded">AI已作废</option>
+          <option value="pending_reg">待注册目标</option>
+        </select>
+        <select v-model="sortBy" class="task-sort">
+          <option value="created">按创建时间</option>
+          <option value="pinyin">按拼音排序</option>
+        </select>
+      </div>
       <div>
         <h2>任务列表</h2>
         <p class="page-sub">点击进入指挥台，查看实时看板与复审队列</p>
@@ -172,6 +232,10 @@ watch(authReadyRef, (ready) => {
           </div>
           <span v-if="t.pending_user_review > 0" class="review-dot"
                 :title="`${t.pending_user_review} 个漏洞待复审`">{{ t.pending_user_review }}</span>
+          <span v-if="t.pending_archived > 0" class="archived-dot"
+                :title="`${t.pending_archived} 个漏洞 AI 未采纳`">{{ t.pending_archived }}</span>
+          <span v-if="t.pending_discarded > 0" class="discarded-dot"
+                :title="`${t.pending_discarded} 个漏洞 AI 已作废`">{{ t.pending_discarded }}</span>
           <div class="task-card-meta">
             <span class="badge" :class="t.status">{{ STATUS_LABEL[t.status] || t.status }}</span>
             <span class="meta">{{ taskModeLabel(t) }} · {{ targetSourceLabel(t.target_source) }} · 并发 {{ t.concurrency }}</span>
