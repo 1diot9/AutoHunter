@@ -301,6 +301,132 @@ KNOWLEDGE_TOOL_SCHEMAS = [
 ]
 
 
+# AutoPoc 漏洞知识库（已知组件 CVE/报告/PoC/nuclei）。指纹已知后再用；分 search/read/run 三工具。
+AUTOPOC_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "autopoc_search",
+            "description": (
+                "AutoPoc KB：列组件或搜已完成漏洞条目。先认栈再搜。"
+                "action=list_components|search。"
+                "search 必填 component 或 q；severity 默认 critical。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list_components", "search"],
+                        "description": "list_components=列组件标签；search=按组件/关键词搜洞",
+                    },
+                    "component": {
+                        "type": "string",
+                        "description": "组件标签（模糊），如 confluence/activemq；search 时优先填",
+                    },
+                    "q": {
+                        "type": "string",
+                        "description": "关键词：组件模糊(list) 或 CVE/标题(search)",
+                    },
+                    "severity": {
+                        "type": "string",
+                        "description": "critical|high|medium|low，可逗号组合；默认 critical",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "返回条数上限，默认 10，最大 50",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "autopoc_read",
+            "description": (
+                "AutoPoc KB：读条目。action=get|artifact|poc_meta。"
+                "必填 vuln_id（来自 search）。artifact 另需 path。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["get", "artifact", "poc_meta"],
+                        "description": "get=元数据+文件清单；artifact=读正文；poc_meta=PoC flag",
+                    },
+                    "vuln_id": {
+                        "type": "string",
+                        "description": "search 返回的 id / identifier / slug",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "仅 artifact：相对路径，如 report.md（来自 get.files）",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "仅 artifact：续读偏移，用上次 next_offset",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "仅 artifact：本次最多字符，默认约 6000",
+                    },
+                },
+                "required": ["action", "vuln_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "autopoc_run",
+            "description": (
+                "AutoPoc KB：对当前授权 target 跑 nuclei 或 PoC（同步等结果）。"
+                "action=nuclei|poc。hit/PoC 输出不是 finding，须 http_request 实证。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["nuclei", "poc"],
+                        "description": "nuclei=库内模板扫描；poc=跑 Python PoC",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "当前任务授权目标 URL/host",
+                    },
+                    "vuln_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "nuclei：最多 10 个 id/CVE/slug（来自 search）",
+                    },
+                    "vuln_id": {
+                        "type": "string",
+                        "description": "poc（或 nuclei 单条）的 id/CVE/slug",
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "poc：CLI flag 对象，键须来自 poc_meta，如 {\"--url\":\"https://…\"}",
+                    },
+                    "script": {
+                        "type": "string",
+                        "description": "poc：可选，相对 poc/ 的脚本路径",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "超时秒数；nuclei 默认 300，poc 默认 120",
+                    },
+                },
+                "required": ["action", "target"],
+            },
+        },
+    },
+]
+
+
 JS_ANALYZER_TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -662,4 +788,5 @@ ESCALATE_TOOL_SCHEMAS = _compact_descriptions(ESCALATE_TOOL_SCHEMAS)
 COLLECTOR_QUERY_SCHEMAS = _compact_descriptions(COLLECTOR_QUERY_SCHEMAS)
 COLLECTOR_EDU_SCHEMAS = _compact_descriptions(COLLECTOR_EDU_SCHEMAS)
 KNOWLEDGE_TOOL_SCHEMAS = _compact_descriptions(KNOWLEDGE_TOOL_SCHEMAS)
+AUTOPOC_TOOL_SCHEMAS = _compact_descriptions(AUTOPOC_TOOL_SCHEMAS)
 PROXY_TOOL_SCHEMAS = _compact_descriptions(PROXY_TOOL_SCHEMAS)

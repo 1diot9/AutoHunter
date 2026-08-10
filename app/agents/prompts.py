@@ -184,6 +184,7 @@ WORKER_SYSTEM_PROMPT = """你是一名顶尖的 SRC 漏洞挖掘专家，正在�
 - decode_transform: 本地解码/解析凭证——自动识别 base64/hex/url 编码、解析 JWT（看 alg/payload 给攻击建议）、识别哈希。遇到看不懂的 token/参数/响应字段先用它看清结构（如发现 base64 串、JWT、可疑哈希），是打通越权/凭证链的关键中间步。纯本地零副作用。
 - suggest_waf_bypass: 纯本地 WAF 辅助——当一个【具体漏洞验证请求】被 403/406/429/拦截页阻断时，用已有响应和 payload 判断 WAF 指纹并给少量候选变形。它不发网络、不代表已绕过，必须再用 http_request 做 baseline vs variant 实证。
 - fofa_lookup: 只读资产测绘（走任务所选引擎，统一写 FOFA 语法、自动翻译）——拿到裸 IP/确认不了归属时，用它查 org/备案/证书把 owner 填准；也能查同 IP/同域还开了哪些端口和服务，发现隐藏攻击面。只测绘，不碰目标。
+- autopoc_search / autopoc_read / autopoc_run: AutoPoc 已知组件漏洞库（指纹明确后解锁）。search 列组件/搜 CVE；read 读报告与 poc_meta；run 对当前授权 target 跑 nuclei/PoC。hit 与历史 PoC 输出不是洞，必须 http_request 实证后再 submit；改编利用链，勿照抄。
 - report_intel: 出洞/撞库成功后，把可复用情报（验证过的凭证/有效端点/技术栈画像）沉淀到全局情报库，供后续打同类系统的 worker 复用。只报真验证有效的，不灌垃圾。纯本地。垃圾标准（一律不要报）：未验证/失败/失效的凭证、公开通用路径（/、/login、favicon、静态资源）、区分度不足的浅路径、空泛或占位的画像（标题/状态/未知）、含"无漏洞/未发现/无法利用"等结论的内容。报之前先自问：换台同类系统它还有用吗？没用就别报。
 - analyze_javascript: 审计前端 JS/接口/硬编码密钥/路由。SPA、登录页、接口藏在前端、常规入口不足时优先使用；它只给线索地图，后续必须用 http_request/run_shell 实证。
 - check_duplicate_finding: 提交漏洞前查重，判断是否和全局同系统历史漏洞重复；只拦同系统同洞，同系统其它洞可以继续挖。
@@ -604,6 +605,7 @@ finish 时在 deepen_lead 里写清【下一轮顺着这个据点该怎么打】
 - **session_set（据点深挖关键）**：一旦突破入口拿到登录态（cookie / Authorization Bearer token），立刻用 session_set 登记，之后所有 http_request 会自动携带，不必每次手动带头；http_request 也会自动吸收响应的 Set-Cookie。这是第 2 层据点深挖不断链的基础——拿到凭证→session_set 固化→连续深挖受限接口/枚举越权对象。换账号时用 clear=true。
 - **decode_transform**：遇到看不懂的 token/参数/响应字段（base64 串、JWT、可疑哈希）先解一下看清结构，是打通凭证/越权链的关键中间步。
 - **fofa_lookup**：拿到裸 IP 或确认不了归属时，用它查 org/备案/证书填准 owner；也能发现同 IP/同域的其它端口与服务，扩大攻击面。只读，不碰目标。
+- **autopoc_***：指纹明确后查已知组件 CVE；run 的 hit/PoC 须 http_request 实证；缺参按返回 example 补。
 - **report_intel**：拿下据点后（验证过的凭证/有效未授权端点/识别出的技术栈），用它把情报沉淀到全局库供后续 worker 复用。只报真验证有效的高价值情报。维护器会拦截垃圾（未验证凭证、公开/静态/浅路径、占位画像、含失败结论的内容），别浪费 round 报这些。
 - analyze_javascript 用于审计前端 JS/接口/硬编码密钥/路由；SPA、登录页、接口藏在前端、常规入口不足时应主动使用。它只给线索地图，后续必须实证。
 - 有攻击面的目标，给足探索深度——不要因为前几个动作没立刻出洞就放弃；只有真无攻击面才早收。
@@ -684,6 +686,9 @@ submit_finding 前必须 check_duplicate_finding；duplicate=true 不再 submit�
 
 # 人工知识库（辅助参考）
 knowledge_lookup 工具解锁时机：第一轮挖掘（尚未深挖）轮数>8 可调用；第二轮及以后深挖轮数>3 可调用。它是辅助手段，不是首选：你必须先依赖自身推理和工具能力测试，确有必要时再查阅。第一次调用返回文档标题+摘要，选择后用 doc_id 获取完整原文。知识库内容可能过时或不适用当前目标，与你的分析冲突时以你的独立判断为准。
+
+# AutoPoc 漏洞知识库
+autopoc_search/read/run：认栈后查已知 CVE（轮数>5/>2 且已配置 KB）。hit/PoC≠finding，须 http_request 实证；缺参按 example 纠错。
 """
 
 
@@ -729,6 +734,7 @@ WORKER_SYSTEM_PROMPT_LEGACY = """你是一名顶尖的 SRC 漏洞挖掘专家，
 - decode_transform: 新工具，本地解码/解析 JWT/base64/hex/url/hash 等可疑 token/参数/响应字段，只做本地分析，不发网络。
 - suggest_waf_bypass: 新工具，当一个具体漏洞验证请求被 WAF/403/406/429 拦截时，基于已有 payload 和响应给少量绕过候选；它不发网络，必须再实测。
 - fofa_lookup: 新工具，只读资产测绘（走任务所选引擎，统一写 FOFA 语法、自动翻译），用于确认裸 IP/归属/同 IP 服务，不碰目标。
+- autopoc_search / autopoc_read / autopoc_run: AutoPoc 已知组件漏洞库（认栈后解锁）。search→read→可选 run；hit/历史 PoC≠finding，须 http_request 实证；缺参按返回的 example 补。
 - report_intel: 新工具，只有验证过的可复用凭证/端点/技术栈画像才上报；未验证、失败、空泛结论不要报。
 - check_duplicate_finding: 提交漏洞前查重，判断是否和该目标历史已提交漏洞重复。
 - submit_finding: 提交一个已用真实证据验证的漏洞。
@@ -852,6 +858,9 @@ self_check 里如实填 is_public_interface 和 info_leak_hits_strict_list。
 
 # 人工知识库（辅助参考）
 knowledge_lookup 工具解锁时机：第一轮挖掘（尚未深挖）轮数>8 可调用；第二轮及以后深挖轮数>3 可调用。它是辅助手段，不是首选：你必须先依赖自身推理和工具能力测试，确有必要时再查阅。第一次调用返回文档标题+摘要，选择后用 doc_id 获取完整原文。知识库内容可能过时或不适用当前目标，与你的分析冲突时以你的独立判断为准。
+
+# AutoPoc 漏洞知识库（已知组件 CVE）
+autopoc_search/read/run 解锁：第一轮轮数>5、深挖轮数>2（且已配置 KB）。流程：认栈 → search(component) → read(get/artifact/poc_meta) → 可选 run(nuclei|poc) → 必须用 http_request 实证 → submit。参数缺了会返回 required_for_action/example，按提示补参重试。nuclei hit / 历史 PoC 输出 ≠ finding。
 """
 
 
@@ -877,6 +886,9 @@ submit_finding 前必须 check_duplicate_finding；raw_request/raw_response 必�
 
 # 人工知识库（辅助参考）
 knowledge_lookup 工具解锁时机：第一轮挖掘（尚未深挖）轮数>8 可调用；第二轮及以后深挖轮数>3 可调用。它是辅助手段，不是首选：你必须先依赖自身推理和工具能力测试，确有必要时再查阅。知识库内容可能过时或不适用当前目标，与你的分析冲突时以你的独立判断为准。
+
+# AutoPoc 漏洞知识库
+autopoc_search/read/run：认栈后查已知 CVE（轮数>5/>2 且已配置 KB）。hit/PoC 输出须经 http_request 实证才可 submit；缺参按 example 纠错。
 """
 
 

@@ -25,12 +25,14 @@ from app.llm.client import LLMClient, LLMError
 from app.schemas import Finding, Verdict, WorkerResult
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import (
+    AUTOPOC_TOOL_SCHEMAS,
     JS_ANALYZER_TOOL_SCHEMAS,
     KNOWLEDGE_TOOL_SCHEMAS,
     PROXY_TOOL_SCHEMAS,
     SESSION_TOOL_SCHEMAS,
     TOOL_SCHEMAS,
 )
+from app.tools import autopoc_bridge
 
 
 _BROAD_NMAP_RE = re.compile(r"\bnmap\b[\s\S]*(?:-p\s*(?:-|1-10000|1-65535|0-65535)|--top-ports\s+\d{3,})", re.IGNORECASE)
@@ -121,6 +123,23 @@ class Worker:
         if self._deepen_count >= 1:
             return "第二轮挖掘需工具轮数超过3轮后才可使用"
         return "第一轮挖掘需工具轮数超过8轮后才可使用"
+
+    def _autopoc_unlocked(self, rounds: int) -> bool:
+        """AutoPoc KB：需已配置 kb；解锁略早于人工知识库（认栈后即可查已知 CVE）。"""
+        if not autopoc_bridge.available():
+            return False
+        if os.environ.get("AUTOPOC_KB_ALWAYS_ON", "").lower() in {"1", "true", "yes"}:
+            return True
+        if self._deepen_count >= 1:
+            return rounds > 2
+        return rounds > 5
+
+    def _autopoc_unlock_hint(self) -> str:
+        if not autopoc_bridge.available():
+            return "未配置 AUTOPOC_KB_DIR 或目录内无 meta.json 条目"
+        if self._deepen_count >= 1:
+            return "第二轮挖掘需工具轮数超过2轮后才可使用"
+        return "第一轮挖掘需工具轮数超过5轮后才可使用（先指纹再搜库）"
 
     def _initial_js_tool_enabled(self) -> bool:
         if worker_config.js_tool_always_on:
@@ -346,6 +365,8 @@ class Worker:
                 # 知识库仅作辅助，AI必须先依赖自身推理能力测试
                 if self._knowledge_unlocked(rounds):
                     tools += KNOWLEDGE_TOOL_SCHEMAS
+                if self._autopoc_unlocked(rounds):
+                    tools += AUTOPOC_TOOL_SCHEMAS
                 send_messages = compact_messages(messages, rounds)
                 # 每轮注入当前状态块（会话态 + 工作笔记）——临时消息，不存入 messages 历史，
                 # 避免累积膨胀；每轮新鲜生成，始终反映最新的 cookie/token/notes。
@@ -982,6 +1003,86 @@ class Worker:
                        vuln_found=vuln_found, vuln_type=vuln_type[:40])
             return self.executor.knowledge_lookup(
                 doc_id=doc_id, vuln_found=vuln_found, vuln_type=vuln_type,
+            )
+
+        if name == "autopoc_search":
+            self._mark_tool_used(name, rnd)
+            if not self._autopoc_unlocked(rnd):
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "error": f"AutoPoc KB 尚未解锁：{self._autopoc_unlock_hint()}",
+                    "guidance": "先用 http_request/run_shell 完成指纹识别；认栈后再搜已知 CVE。",
+                }
+            action = (args.get("action") or "search").strip()
+            self._emit("tool_autopoc_search", round=rnd, action=action[:32],
+                       component=str(args.get("component") or "")[:60])
+            return self.executor.autopoc_search(
+                action=action,
+                component=args.get("component") or "",
+                q=args.get("q") or "",
+                severity=args.get("severity", "critical"),
+                limit=args.get("limit", 10),
+            )
+
+        if name == "autopoc_read":
+            self._mark_tool_used(name, rnd)
+            if not self._autopoc_unlocked(rnd):
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "error": f"AutoPoc KB 尚未解锁：{self._autopoc_unlock_hint()}",
+                    "guidance": "先指纹再查库；解锁后用 search 拿到 vuln_id 再 read。",
+                }
+            action = (args.get("action") or "get").strip()
+            vuln_id = str(args.get("vuln_id") or "").strip()
+            if not vuln_id:
+                return self._tool_arg_error(
+                    "autopoc_read", "vuln_id",
+                    "必须传 search 返回的 id/identifier/slug。example: "
+                    '{"action":"get","vuln_id":"CVE-2024-21683"}',
+                )
+            self._emit("tool_autopoc_read", round=rnd, action=action[:32], vuln_id=vuln_id[:80])
+            return self.executor.autopoc_read(
+                action=action,
+                vuln_id=vuln_id,
+                path=args.get("path") or "",
+                offset=args.get("offset", 0),
+                max_chars=args.get("max_chars", 6000),
+            )
+
+        if name == "autopoc_run":
+            self._mark_tool_used(name, rnd)
+            if not self._autopoc_unlocked(rnd):
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "error": f"AutoPoc KB 尚未解锁：{self._autopoc_unlock_hint()}",
+                    "guidance": "先 search/read 再 run；仅对当前授权目标。",
+                }
+            action = (args.get("action") or "nuclei").strip()
+            target = (args.get("target") or "").strip()
+            if not target:
+                return self._tool_arg_error(
+                    "autopoc_run", "target",
+                    "必须传当前授权目标 URL。example: "
+                    '{"action":"nuclei","vuln_ids":["CVE-2024-21683"],"target":"https://…"}',
+                )
+            self._emit(
+                "tool_autopoc_run",
+                round=rnd,
+                action=action[:32],
+                target=target[:120],
+                vuln_id=str(args.get("vuln_id") or "")[:80],
+            )
+            return self.executor.autopoc_run(
+                action=action,
+                target=target,
+                vuln_id=args.get("vuln_id") or "",
+                vuln_ids=args.get("vuln_ids"),
+                args=args.get("args"),
+                script=args.get("script") or "",
+                timeout=args.get("timeout"),
             )
 
         if name == "session_set":

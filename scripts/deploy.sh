@@ -18,6 +18,9 @@ case "$MODE" in
     # It keeps volumes/env intact, copies the already-synced source into the running container, then restarts.
     docker cp app/. "$SERVICE":/app/app/
     docker cp scripts/. "$SERVICE":/app/scripts/
+    if [ -d tools ]; then
+      docker cp tools/. "$SERVICE":/app/tools/
+    fi
     if [ -f requirements.txt ]; then
       docker cp requirements.txt "$SERVICE":/app/requirements.txt
       if [ "${AUTOHUNTER_HOT_INSTALL_REQUIREMENTS:-0}" = "1" ]; then

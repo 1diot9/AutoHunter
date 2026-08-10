@@ -20,6 +20,7 @@ from typing import Any, Optional
 import httpx
 
 from app.config import worker_config
+from app.tools import autopoc_bridge
 from app.tools.decoder import decode_transform as _decode_transform
 from app.tools.guard import CommandBlocked, check_command
 from app.tools.js_analyzer import analyze_javascript as analyze_js_text
@@ -1145,3 +1146,56 @@ class ToolExecutor:
             }
         except Exception as e:
             return {"ok": False, "error": f"知识库查询异常: {type(e).__name__}: {e}"}
+
+    # ---- AutoPoc 漏洞知识库（search / read / run）----
+    def autopoc_search(
+        self,
+        action: str = "search",
+        component: str = "",
+        q: str = "",
+        severity: str = "critical",
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        return autopoc_bridge.autopoc_search(
+            action=action,
+            component=component,
+            q=q,
+            severity=severity,
+            limit=limit,
+        )
+
+    def autopoc_read(
+        self,
+        action: str = "get",
+        vuln_id: str = "",
+        path: str = "",
+        offset: int = 0,
+        max_chars: int = 6000,
+    ) -> dict[str, Any]:
+        return autopoc_bridge.autopoc_read(
+            action=action,
+            vuln_id=vuln_id,
+            path=path,
+            offset=offset,
+            max_chars=max_chars,
+        )
+
+    def autopoc_run(
+        self,
+        action: str = "nuclei",
+        target: str = "",
+        vuln_id: str = "",
+        vuln_ids: Any = None,
+        args: Any = None,
+        script: str = "",
+        timeout: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return autopoc_bridge.autopoc_run(
+            action=action,
+            target=target,
+            vuln_id=vuln_id,
+            vuln_ids=vuln_ids,
+            args=args,
+            script=script,
+            timeout=timeout,
+        )

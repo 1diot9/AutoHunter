@@ -103,6 +103,7 @@ _WORKER_TRACE_KINDS = frozenset({
     "tool_http", "tool_shell", "tool_shell_blocked", "tool_arg_error",
     "tool_exception", "tool_js_analyze", "tool_decode", "tool_waf_advice",
     "tool_fofa_lookup", "tool_session_set",
+    "tool_autopoc_search", "tool_autopoc_read", "tool_autopoc_run",
     "llm_round_start", "llm_error", "llm_soft_retry", "llm_interrupt",
     "finding_submitted", "finding_duplicate", "finding_invalid",
     "auth_status", "finish_blocked",
