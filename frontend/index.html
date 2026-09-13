@@ -9,7 +9,8 @@
   <script>
     try {
       var u = JSON.parse(localStorage.getItem("ah-ui") || "{}");
-      var t = u.theme || localStorage.getItem("ah-theme") || "dark";
+      var t = u.theme || localStorage.getItem("ah-theme") || "light";
+      if (localStorage.getItem("ah-theme-gen") !== "2" && t === "dark") t = "light";
       document.documentElement.setAttribute("data-theme", t);
       if (u.accentHue != null) document.documentElement.style.setProperty("--accent-h", String(u.accentHue));
     } catch (e) {}

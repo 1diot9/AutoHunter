@@ -18,7 +18,7 @@ _ALLOWED_SIGS = (
 )
 
 DEFAULT_UI = {
-    "theme": "dark",
+    "theme": "light",
     "accentHue": 235,
     "wallpaperKind": "none",
     "wallpaperUrl": "",
@@ -132,7 +132,7 @@ def normalize_ui(raw: Any, *, saved: bool | None = None) -> dict[str, Any]:
     elif src:
         mark = True
     return {
-        "theme": "light" if src.get("theme") == "light" else "dark",
+        "theme": "dark" if src.get("theme") == "dark" else "light",
         "accentHue": _clamp_hue(src.get("accentHue", src.get("accent_hue"))),
         "wallpaperKind": kind,
         "wallpaperUrl": url if kind == "url" else "",

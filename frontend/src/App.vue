@@ -10,7 +10,7 @@ import {
   loadAuthRole,
   submitTokenModal,
 } from "./api.js";
-import { applyUi, loadUiPrefs, markUiMigrated, prefsFromApi, prefsToApi, saveUiPrefs, uiNeedsMigrate } from "./uiTheme.js";
+import { applyUi, commitDefaultThemeGen, loadUiPrefs, markUiMigrated, peekDefaultThemeGen, prefsFromApi, prefsToApi, saveUiPrefs, uiNeedsMigrate } from "./uiTheme.js";
 const route = useRoute();
 const KEEP_ALIVE_VIEWS = [
   "TasksView",
@@ -20,7 +20,7 @@ const KEEP_ALIVE_VIEWS = [
   "RuntimeLogsView",
 ];
 
-const theme = ref("dark");
+const theme = ref("light");
 const showTokenModal = ref(false);
 const tokenInput = ref("");
 const tokenModalReason = ref("switch");
@@ -38,7 +38,7 @@ async function hydrateUiFromServer() {
     const s = await api.getSettings();
     const remote = s.ui || {};
     if (!remote.saved && uiNeedsMigrate()) {
-      const local = loadUiPrefs();
+      const local = commitDefaultThemeGen(loadUiPrefs());
       await api.updateSettings({ ui: prefsToApi(local) });
       markUiMigrated();
       await applyUi(saveUiPrefs(local));
@@ -46,11 +46,15 @@ async function hydrateUiFromServer() {
       return;
     }
     markUiMigrated();
-    const prefs = saveUiPrefs(prefsFromApi(remote));
+    const incoming = prefsFromApi(remote);
+    const prefs = saveUiPrefs(commitDefaultThemeGen(incoming));
     await applyUi(prefs);
     theme.value = prefs.theme;
+    if (prefs.theme !== incoming.theme) {
+      api.updateSettings({ ui: prefsToApi(prefs) }).catch(() => {});
+    }
   } catch {
-    const prefs = await applyUi(loadUiPrefs());
+    const prefs = await applyUi(saveUiPrefs(commitDefaultThemeGen(loadUiPrefs())));
     theme.value = prefs.theme;
   }
 }
@@ -105,7 +109,7 @@ function changeToken() {
 }
 
 onMounted(async () => {
-  const prefs = await applyUi(loadUiPrefs());
+  const prefs = await applyUi(peekDefaultThemeGen(loadUiPrefs()));
   theme.value = prefs.theme;
   window.addEventListener("autohunter-open-token-modal", onOpenTokenModal);
   window.addEventListener("ah-ui-changed", onUiChanged);

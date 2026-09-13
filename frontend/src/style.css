@@ -8,59 +8,6 @@
    ============================================================ */
 
 :root,
-:root[data-theme="dark"] {
-  color-scheme: dark;
-  /* 中性层（带极轻冷色调，承载背景/面板/边框） */
-  --bg:        oklch(20% 0.012 255);   /* 内容底 */
-  --surface:   oklch(24% 0.013 255);   /* 面板 */
-  --surface-2: oklch(28% 0.014 255);   /* 抬升面板/输入 */
-  --surface-3: oklch(31% 0.015 255);   /* hover / active */
-  --nav:       oklch(22% 0.013 255);   /* 第二中性层：侧栏/工具条 */
-  --border:    oklch(34% 0.014 255);
-  --border-soft: oklch(29% 0.013 255);
-
-  /* 文字阶（确保对比度：正文 ≥4.5:1） */
-  --ink:    oklch(95% 0.006 255);   /* 主文字 */
-  --ink-2:  oklch(82% 0.008 255);   /* 次级标题 */
-  --muted:  oklch(70% 0.012 255);   /* 弱化文字（仍达 4.5:1） */
-  --faint:  oklch(58% 0.012 255);   /* 极弱：仅元信息/时间戳 */
-
-  /* 单一品牌 accent：只用于主操作 / 当前选中 / 焦点 */
-  --accent-h: 235;
-  --accent:     oklch(70% 0.14 var(--accent-h));
-  --accent-ink: oklch(96% 0.02 var(--accent-h));
-  --accent-bg:  oklch(70% 0.14 var(--accent-h) / 0.14);
-  --on-accent:  oklch(22% 0.02 255);
-
-  /* 语义状态色（冷静、可区分；状态另有文字/图标冗余） */
-  --ok:    oklch(72% 0.15 155);   /* 成功/发现 */
-  --warn:  oklch(78% 0.14 75);    /* 警告/超时 */
-  --danger:oklch(68% 0.17 25);    /* 错误/严重 */
-  --info:  oklch(72% 0.12 var(--accent-h));   /* 信息/运行 */
-
-  --ok-bg:    oklch(72% 0.15 155 / 0.14);
-  --warn-bg:  oklch(78% 0.14 75 / 0.14);
-  --danger-bg:oklch(68% 0.17 25 / 0.14);
-  --info-bg:  oklch(72% 0.12 235 / 0.14);
-
-  --shadow:    0 1px 2px oklch(0% 0 0 / 0.4), 0 4px 16px oklch(0% 0 0 / 0.28);
-  --shadow-lg: 0 8px 40px oklch(0% 0 0 / 0.5);
-  --line: oklch(72% 0.12 var(--accent-h) / 0.08);
-  --radius: 10px;
-  --radius-sm: 7px;
-  --select-ring: 0 0 0 3px var(--accent-bg);
-  --select-border: color-mix(in oklch, var(--accent) 52%, var(--border));
-
-  --wallpaper-dim: 0.28;
-  --wallpaper-fit: cover;
-
-  /* 语义 z-index 阶 */
-  --z-sticky: 30;
-  --z-backdrop: 40;
-  --z-drawer: 50;
-  --z-toast: 60;
-}
-
 :root[data-theme="light"] {
   color-scheme: light;
   --bg:        oklch(98.5% 0.003 255);
@@ -95,6 +42,53 @@
   --shadow:    0 1px 2px oklch(0% 0 0 / 0.06), 0 4px 16px oklch(0% 0 0 / 0.08);
   --shadow-lg: 0 8px 40px oklch(0% 0 0 / 0.14);
   --line: oklch(54% 0.14 var(--accent-h) / 0.08);
+  --radius: 10px;
+  --radius-sm: 7px;
+  --select-ring: 0 0 0 3px var(--accent-bg);
+  --select-border: color-mix(in oklch, var(--accent) 52%, var(--border));
+
+  --wallpaper-dim: 0.28;
+  --wallpaper-fit: cover;
+
+  --z-sticky: 30;
+  --z-backdrop: 40;
+  --z-drawer: 50;
+  --z-toast: 60;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:        oklch(20% 0.012 255);
+  --surface:   oklch(24% 0.013 255);
+  --surface-2: oklch(28% 0.014 255);
+  --surface-3: oklch(31% 0.015 255);
+  --nav:       oklch(22% 0.013 255);
+  --border:    oklch(34% 0.014 255);
+  --border-soft: oklch(29% 0.013 255);
+
+  --ink:    oklch(95% 0.006 255);
+  --ink-2:  oklch(82% 0.008 255);
+  --muted:  oklch(70% 0.012 255);
+  --faint:  oklch(58% 0.012 255);
+
+  --accent:     oklch(70% 0.14 var(--accent-h));
+  --accent-ink: oklch(96% 0.02 var(--accent-h));
+  --accent-bg:  oklch(70% 0.14 var(--accent-h) / 0.14);
+  --on-accent:  oklch(22% 0.02 255);
+
+  --ok:    oklch(72% 0.15 155);
+  --warn:  oklch(78% 0.14 75);
+  --danger:oklch(68% 0.17 25);
+  --info:  oklch(72% 0.12 var(--accent-h));
+
+  --ok-bg:    oklch(72% 0.15 155 / 0.14);
+  --warn-bg:  oklch(78% 0.14 75 / 0.14);
+  --danger-bg:oklch(68% 0.17 25 / 0.14);
+  --info-bg:  oklch(72% 0.12 235 / 0.14);
+
+  --shadow:    0 1px 2px oklch(0% 0 0 / 0.4), 0 4px 16px oklch(0% 0 0 / 0.28);
+  --shadow-lg: 0 8px 40px oklch(0% 0 0 / 0.5);
+  --line: oklch(72% 0.12 var(--accent-h) / 0.08);
 }
 
 * { box-sizing: border-box; }
@@ -2621,17 +2615,6 @@ main {
   transition: border-color .15s, background-color .15s, transform .15s ease;
 }
 .result-row:hover { border-color: var(--border); background: var(--surface); transform: translateY(-1px); }
-.result-row.host-row { cursor: default; }
-.result-row.host-row.found { border-color: color-mix(in srgb, var(--ok, #1a7f4b) 28%, var(--border-soft)); }
-.host-status {
-  flex: none; min-width: 58px; text-align: center;
-  font-size: 11px; font-weight: 700; padding: 4px 8px; border-radius: 8px;
-  background: var(--surface-2); color: var(--muted);
-}
-.host-status.done { background: var(--ok-bg, #e8f8ee); color: var(--ok, #1a7f4b); }
-.host-status.dead { background: var(--surface-2); color: var(--text, #333); }
-.host-status.scanning { background: var(--info-bg); color: var(--info); }
-.host-status.queued { background: var(--warn-bg); color: var(--warn); }
 .result-row.submitted { opacity: .5; }
 .result-row.rejected { opacity: .62; }
 .result-row.rejected:hover { opacity: 1; }

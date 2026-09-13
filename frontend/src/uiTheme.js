@@ -13,8 +13,11 @@ export const ACCENT_PRESETS = [
   { h: 255, name: "靛" },
 ];
 
+export const THEME_DEFAULT_GEN_KEY = "ah-theme-gen";
+export const THEME_DEFAULT_GEN = "2"; // 1=暗色默认，2=亮色默认
+
 export const DEFAULTS = {
-  theme: "dark",
+  theme: "light",
   accentHue: 235,
   wallpaperKind: "none",
   wallpaperUrl: "",
@@ -40,7 +43,7 @@ function clampDim(d) {
 
 export function prefsFromApi(ui = {}) {
   return {
-    theme: ui.theme === "light" ? "light" : "dark",
+    theme: ui.theme === "dark" ? "dark" : "light",
     accentHue: clampHue(ui.accentHue),
     wallpaperKind: ["none", "url", "file"].includes(ui.wallpaperKind) ? ui.wallpaperKind : "none",
     wallpaperUrl: typeof ui.wallpaperUrl === "string" ? ui.wallpaperUrl.trim() : "",
@@ -72,8 +75,25 @@ export function loadUiPrefs() {
   const legacyTheme = localStorage.getItem(THEME_STORAGE_KEY);
   return prefsFromApi({
     ...parsed,
-    theme: parsed.theme || (legacyTheme === "light" ? "light" : DEFAULTS.theme),
+    theme: parsed.theme || legacyTheme || DEFAULTS.theme,
   });
+}
+
+/** 产品默认从暗色改为亮色：旧默认暗色在未确认新代际前显示为亮色。 */
+export function peekDefaultThemeGen(prefs) {
+  if (localStorage.getItem(THEME_DEFAULT_GEN_KEY) === THEME_DEFAULT_GEN) {
+    return prefs;
+  }
+  if (prefs.theme === "dark") {
+    return { ...prefs, theme: "light" };
+  }
+  return prefs;
+}
+
+export function commitDefaultThemeGen(prefs) {
+  const next = peekDefaultThemeGen(prefs);
+  localStorage.setItem(THEME_DEFAULT_GEN_KEY, THEME_DEFAULT_GEN);
+  return next;
 }
 
 export function saveUiPrefs(prefs) {
