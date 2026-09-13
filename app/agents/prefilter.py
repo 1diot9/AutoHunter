@@ -2,12 +2,13 @@
 
 只做确定性的机械判断（不耗 LLM）：
 0. 敏感域名（.gov / .mil / 军政公安关键词等）→ 跳过（永不攻击）
+0.5 回环地址（127.0.0.1 / ::1 / localhost，含 DNS 解析到回环）→ 跳过（永不打本机）
 1. CDN / 对象存储 / 云 WAF 域名特征 → 跳过
 2. 死链 / 连接超时 / 无响应 → 跳过
 3. 纯前端静态站（无任何后端交互特征，且是 SPA/静态托管）→ 跳过
 
 判断尽量保守：拿不准就放行（宁可多挖，不要误杀有价值目标）。
-例外：敏感域名一律跳过，无例外。
+例外：敏感域名、回环地址一律跳过，无例外。
 """
 from __future__ import annotations
 
@@ -21,6 +22,11 @@ from urllib.parse import urlparse
 import httpx
 
 from app.http_defaults import BROWSER_HEADERS
+from app.tools.netguard import (
+    LOOPBACK_SKIP_REASON,
+    is_loopback_ip,
+    is_loopback_target,
+)
 
 # ---------------------------------------------------------------------------
 # 黑洞 DNS 防护：autodiscover 等记录常解析出几十个 IP（大量 IPv6 黑洞地址），
@@ -81,7 +87,7 @@ _SENSITIVE_KEYWORDS = (
 )
 
 _SENSITIVE_SKIP_REASON = "敏感域名（政府/军政/政法等），自动跳过"
-# 兼容旧常量名
+# 兼容旧常量名；LOOPBACK_SKIP_REASON / is_loopback_* 从 netguard 再导出
 
 
 def _extra_sensitive_suffixes() -> tuple[str, ...]:
@@ -213,6 +219,9 @@ def should_skip_ex(host: str, url: str, timeout: float = 8.0) -> tuple[bool, str
     # 敏感域名最先拦：不探活、不发包、不派 worker
     if is_sensitive_host(host) or is_sensitive_host(url):
         return True, _SENSITIVE_SKIP_REASON, {}
+    # 回环次之：域名 A/AAAA 指向 127.0.0.1 时探活会打到 AutoHunter 自己（Issue #49）
+    if is_loopback_target(host) or is_loopback_target(url):
+        return True, LOOPBACK_SKIP_REASON, {}
     if is_cdn_host(host):
         return True, "CDN/对象存储/静态托管域名", {}
     info = probe(url, timeout=timeout)

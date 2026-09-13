@@ -104,6 +104,15 @@ def _is_unusable(raw: str, host: str) -> bool:
     return is_unusable_host(raw) or is_unusable_host(host)
 
 
+def _is_loopback_asset(host: str, url: str = "", ip: str = "") -> bool:
+    """目标是否指向本机回环（含 FOFA 记录的 IP）。"""
+    return (
+        prefilter.is_loopback_target(host)
+        or prefilter.is_loopback_target(url)
+        or prefilter.is_loopback_ip(ip)
+    )
+
+
 def _is_edusrc_intent_task(task: Task, raw: str, is_intent: bool) -> bool:
     if not is_intent:
         return False
@@ -375,6 +384,14 @@ async def refill(session: AsyncSession, task: Task, low_watermark: int = 5,
                     dead_reason=prefilter._SENSITIVE_SKIP_REASON,
                 ))
                 continue
+            if _is_loopback_asset(host, url):
+                session.add(Target(
+                    task_id=task.id, url=url or _ensure_url(host), host=host,
+                    source="manual", status="skipped",
+                    verdict="skip_loopback",
+                    dead_reason=prefilter.LOOPBACK_SKIP_REASON,
+                ))
+                continue
             pending.append({"url": url or _ensure_url(host), "host": host})
         if pending:
             await progress(
@@ -499,6 +516,18 @@ async def _site_collect(
                     source="site", status="skipped",
                     verdict="skip_sensitive",
                     dead_reason=prefilter._SENSITIVE_SKIP_REASON,
+                ))
+            continue
+        if _is_loopback_asset(host, url):
+            existing = (await session.execute(
+                select(Target.source).where(Target.task_id == task.id, Target.host == host)
+            )).all()
+            if not existing:
+                session.add(Target(
+                    task_id=task.id, url=url or _ensure_url(host), host=host,
+                    source="site", status="skipped",
+                    verdict="skip_loopback",
+                    dead_reason=prefilter.LOOPBACK_SKIP_REASON,
                 ))
             continue
         work.append({"url": url or _ensure_url(host), "host": host})
@@ -876,6 +905,16 @@ async def _fofa_collect(
                 source="fofa", status="skipped",
                 verdict="skip_sensitive",
                 dead_reason=prefilter._SENSITIVE_SKIP_REASON,
+            ))
+            continue
+        if _is_loopback_asset(host, ip=rec.get("ip") or ""):
+            seen.add(host)
+            session.add(Target(
+                task_id=task.id, url=_ensure_url(rec.get("host") or host), host=host,
+                ip=rec.get("ip", ""), org=rec.get("org", ""), title=rec.get("title", ""),
+                source="fofa", status="skipped",
+                verdict="skip_loopback",
+                dead_reason=prefilter.LOOPBACK_SKIP_REASON,
             ))
             continue
         seen.add(host)

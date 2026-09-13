@@ -540,6 +540,19 @@ class ToolExecutor:
             req = client.build_request(method.upper(), url, **send_kwargs)
             with capped_resolution():
                 resp = client.send(req, stream=True, follow_redirects=follow_redirects)
+            from app.tools.netguard import LOOPBACK_BLOCK_ERROR, is_loopback_target
+            final_url = str(getattr(resp, "url", "") or url)
+            if is_loopback_target(final_url):
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "error": LOOPBACK_BLOCK_ERROR,
+                    "url": url,
+                }
             body, truncated = self._read_limited_response(resp)
             # 吸收整条重定向链（resp.history 里每个中间 302 + 最终响应）的 Set-Cookie，
             # 而不是只读最终 resp.cookies；再兜底吸收 client.cookies jar 里的全部。

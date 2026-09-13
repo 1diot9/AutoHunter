@@ -963,6 +963,7 @@ class TaskRunner:
 
         removed_unreachable = 0
         skipped_low_success = 0
+        skipped_loopback = 0
         deferred_transient = 0
         selected: tuple[Target, dict] | None = None
         # 小批探活：不必每次把最多 120 个候选全探完才派发一个 worker。
@@ -986,6 +987,16 @@ class TaskRunner:
 
                 skip_reason = self._low_success_skip_reason(target, probe)
                 if skip_reason:
+                    if "回环" in skip_reason:
+                        self._queue_prefilter_retry_after.pop(target.id, None)
+                        target.status = "skipped"
+                        target.verdict = "skip_loopback"
+                        target.assigned_worker = ""
+                        target.heartbeat_at = None
+                        target.last_error = ""
+                        target.dead_reason = skip_reason[:300]
+                        skipped_loopback += 1
+                        continue
                     if self._is_transient_prefilter_reason(skip_reason):
                         self._queue_prefilter_retry_after[target.id] = now + QUEUE_TRANSIENT_PREFILTER_COOLDOWN
                         target.status = "queued"
@@ -1036,6 +1047,12 @@ class TaskRunner:
                     f"派发前跳过 {skipped_low_success} 个低成功率目标",
                     level="warn", skipped=skipped_low_success,
                 )
+            if skipped_loopback:
+                await self._log(
+                    session, "orchestrator", "target_loopback_skip",
+                    f"派发前跳过 {skipped_loopback} 个回环地址目标",
+                    level="warn", skipped=skipped_loopback,
+                )
             if deferred_transient:
                 await self._log(
                     session, "orchestrator", "target_prefilter_defer",
@@ -1065,6 +1082,13 @@ class TaskRunner:
                 session, "orchestrator", "target_prefilter_skip",
                 f"派发前跳过 {skipped_low_success} 个低成功率目标",
                 level="warn", skipped=skipped_low_success,
+            )
+        if skipped_loopback:
+            await session.commit()
+            await self._log(
+                session, "orchestrator", "target_loopback_skip",
+                f"派发前跳过 {skipped_loopback} 个回环地址目标",
+                level="warn", skipped=skipped_loopback,
             )
         if deferred_transient:
             await session.commit()
@@ -1123,6 +1147,12 @@ class TaskRunner:
 
     @staticmethod
     def _low_success_skip_reason(target: Target, probe: dict) -> str:
+        # 回环永不豁免：手动清单 / 单站 / 通杀也不能打到 AutoHunter 自己（Issue #49）。
+        if prefilter.is_loopback_target(target.host) or prefilter.is_loopback_target(target.url):
+            return prefilter.LOOPBACK_SKIP_REASON
+        probe_reason = str(probe.get("reason") or "")
+        if probe.get("skip") and "回环" in probe_reason:
+            return probe_reason
         if not QUEUE_LOW_SUCCESS_SKIP:
             return ""
         # 定向深挖和通杀验证目标是明确有线索的例外，不因低分/静态特征提前拦。

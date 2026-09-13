@@ -155,6 +155,9 @@ def check_http_request(
     confirm_destructive: Any = False,
     confirm_reason: str = "",
 ) -> None:
+    from app.tools.netguard import LOOPBACK_BLOCK_ERROR, is_loopback_target
+    if is_loopback_target(url):
+        raise CommandBlocked(LOOPBACK_BLOCK_ERROR)
     parts = [method or "", url or "", data or ""]
     if json_body is not None:
         parts.append(str(json_body))
@@ -174,6 +177,9 @@ def check_command(
     confirm_reason: str = "",
 ) -> None:
     """命中自毁模式则抛 CommandBlocked。疑似破坏目标则 NeedsConfirm。"""
+    from app.tools.netguard import LOOPBACK_BLOCK_ERROR, command_hits_loopback
+    if command_hits_loopback(cmd):
+        raise CommandBlocked(LOOPBACK_BLOCK_ERROR)
     for pat in _COMPILED:
         if pat.search(cmd):
             hint = ""
