@@ -555,6 +555,40 @@ def _parse_emulated_tool_calls(text: str) -> tuple[str, list[Any] | None]:
     return text, None
 
 
+# MiniMax-M3 / DeepSeek R1 / Qwen3 thinking 把思考嵌在 content 的 <think>…</think>，
+# 不是独立 reasoning 字段，会污染 reviewer/worker 的 JSON / YES-NO 判断。
+# 必须匹配闭合标签：错误写法 r"<think>.*?\s*" 会在第一段空白处截断，
+# 留下思考正文和 </think>，JSON 仍然脏。API 生成完才剥，不动 tool_calls。
+_THINK_TAG_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking_tags(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    if "<think" not in text.lower():
+        return text
+    return _THINK_TAG_RE.sub("", text).strip()
+
+
+def _strip_message_thinking(msg: Any) -> Any:
+    """剥掉 message.content 里的 <think> 块，不改 tool_calls。"""
+    content = getattr(msg, "content", None)
+    if not isinstance(content, str) or not content:
+        return msg
+    stripped = _strip_thinking_tags(content)
+    if stripped == content:
+        return msg
+    try:
+        msg.content = stripped
+        return msg
+    except Exception:
+        return SimpleNamespace(
+            content=stripped,
+            tool_calls=getattr(msg, "tool_calls", None),
+            role=getattr(msg, "role", "assistant"),
+        )
+
+
 def _apply_emulated_tool_calls(msg: Any) -> Any:
     """把模拟模式下的纯文本响应解析成带 tool_calls 的 message。"""
     text = getattr(msg, "content", None) or ""
@@ -623,7 +657,9 @@ def _coerce_chat_message(resp: Any) -> Any:
         try:
             resp = json.loads(text)
         except json.JSONDecodeError:
-            return SimpleNamespace(content=text, tool_calls=None, role="assistant")
+            return _strip_message_thinking(
+                SimpleNamespace(content=text, tool_calls=None, role="assistant")
+            )
 
     if isinstance(resp, dict):
         if resp.get("error"):
@@ -637,15 +673,19 @@ def _coerce_chat_message(resp: Any) -> Any:
         if isinstance(choices, list) and choices:
             first = choices[0]
             if isinstance(first, str):
-                return SimpleNamespace(content=first, tool_calls=None, role="assistant")
+                return _strip_message_thinking(
+                    SimpleNamespace(content=first, tool_calls=None, role="assistant")
+                )
             if isinstance(first, dict):
                 msg = first.get("message", first)
                 if isinstance(msg, str):
-                    return SimpleNamespace(content=msg, tool_calls=None, role="assistant")
+                    return _strip_message_thinking(
+                        SimpleNamespace(content=msg, tool_calls=None, role="assistant")
+                    )
                 if isinstance(msg, dict):
-                    return _dict_to_message(msg)
+                    return _strip_message_thinking(_dict_to_message(msg))
         if "content" in resp or "tool_calls" in resp:
-            return _dict_to_message(resp)
+            return _strip_message_thinking(_dict_to_message(resp))
         raise LLMError(
             "upstream", "LLM 响应无法解析为 message。",
             detail=_sanitize_error_detail(str(resp)[:400]),
@@ -657,14 +697,16 @@ def _coerce_chat_message(resp: Any) -> Any:
         first = choices[0]
         msg = getattr(first, "message", None)
         if msg is not None:
-            return msg
+            return _strip_message_thinking(msg)
         if isinstance(first, str):
-            return SimpleNamespace(content=first, tool_calls=None, role="assistant")
-        return first
+            return _strip_message_thinking(
+                SimpleNamespace(content=first, tool_calls=None, role="assistant")
+            )
+        return _strip_message_thinking(first)
 
     # 已是 message 形态（如 Anthropic 解析结果）
     if hasattr(resp, "content") or hasattr(resp, "tool_calls"):
-        return resp
+        return _strip_message_thinking(resp)
 
     raise LLMError(
         "upstream",
@@ -1267,6 +1309,7 @@ class LLMClient:
             tool_choice = "auto"
 
         def _finish(msg: Any) -> Any:
+            msg = _strip_message_thinking(msg)
             return _apply_emulated_tool_calls(msg) if prompt_tools else msg
 
         kwargs: dict[str, Any] = {
@@ -1553,7 +1596,10 @@ class LLMClient:
                         arguments=json.dumps(block.get("input") or {}, ensure_ascii=False),
                     ),
                 ))
-        return SimpleNamespace(content="".join(text_parts), tool_calls=calls or None)
+        return SimpleNamespace(
+            content=_strip_thinking_tags("".join(text_parts)),
+            tool_calls=calls or None,
+        )
 
     def _record_openai_usage(self, resp: Any) -> None:
         usage = getattr(resp, "usage", None)
