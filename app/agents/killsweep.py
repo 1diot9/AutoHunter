@@ -72,7 +72,8 @@ def _normalize_affected_table(rows: Any, vuln_type: str) -> list[dict[str, Any]]
 
 
 def _engine_search_sync(engine_name: str, key: str, query: str, edu_only: bool = False,
-                        size: int = 20, base_url: str | None = None) -> dict[str, Any]:
+                        size: int = 20, base_url: str | None = None,
+                        task_id: str = "") -> dict[str, Any]:
     """同步测绘查询（走任务选定引擎），返回 {size, sample:[{host,title,org}], query, engine}。
 
     查询按 FOFA 语法书写，非 FOFA 引擎在请求前自动翻译（含 edu 圈定过滤条件）。
@@ -89,6 +90,8 @@ def _engine_search_sync(engine_name: str, key: str, query: str, edu_only: bool =
             engine_name, key, q,
             page=1, page_size=size, base_url=base_url or None,
         )
+        from app.engines.meter import record_engine_search
+        record_engine_search(task_id, "killsweep", q, engine_name)
     except Exception as e:
         return {"size": 0, "sample": [], "query": q, "engine": engine_name,
                 "error": f"{disp} 调用失败: {e}"}
@@ -117,8 +120,10 @@ class KillsweepHunter:
         cancel_event: Optional[threading.Event] = None,
         fofa_base_url: str = "",
         engine: str = "fofa",
+        task_id: str = "",
     ):
         self.finding = finding
+        self.task_id = task_id or str(finding.get("task_id") or "")
         # 测绘引擎：通杀圈定/统计走任务选定引擎（FOFA / Quake / Hunter / …），
         # key/base_url 为该引擎凭证，由编排层按 resolve_engine_config 注入。
         self.engine = engine or "fofa"
@@ -216,7 +221,8 @@ class KillsweepHunter:
             edu = bool(args.get("edu_only", False))
             self._emit("killsweep_fofa", query=q, edu_only=edu, engine=self.engine)
             return _engine_search_sync(self.engine, self.fofa_key, q,
-                                       edu_only=edu, base_url=self.fofa_base_url)
+                                       edu_only=edu, base_url=self.fofa_base_url,
+                                       task_id=self.task_id)
         if name == "http_request":
             url = args.get("url")
             if not url:

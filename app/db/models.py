@@ -65,6 +65,8 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
     is_top: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    # token / 测绘调用累计：内存实时 + 这里落库，任务结束或重启后还能看。
+    runtime_stats: Mapped[dict] = mapped_column(JSON, default=dict)
 
     targets: Mapped[list["Target"]] = relationship(back_populates="task", cascade="all, delete-orphan")
 

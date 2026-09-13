@@ -41,7 +41,9 @@ from app.db.models import CST, Finding, Killsweep, Review, Target, Task, TaskEve
 from app.db.session import SessionLocal
 from app.events import bus
 from app.maintenance.cleanup import TRACE_FINE_KINDS, prune_target_traces
+from app.engines.meter import persist_engine_usage
 from app.llm.client import LLMClient
+from app.llm.usage import persist_usage
 from app.settings_service import (
     llm_client_for_task,
     resolve_engine_config,
@@ -843,6 +845,11 @@ class TaskRunner:
             elif task.status == "idle" and (queued or busy):
                 task.status = "running"
                 await session.commit()
+            self._flush_runtime_stats()
+
+    def _flush_runtime_stats(self) -> None:
+        persist_usage(self.task_id)
+        persist_engine_usage(self.task_id)
 
     async def _count(self, session: AsyncSession, status: str) -> int:
         from sqlalchemy import func
@@ -1274,10 +1281,12 @@ class TaskRunner:
 
     async def pause(self, reason: str = "任务暂停") -> None:
         """暂停调度并收回正在跑的 worker。已进入同步调用的线程会收到取消标记，结果不再落库。"""
+        self._flush_runtime_stats()
         await self._cancel_active_workers(f"{reason}：运行中 worker 已取消并回队")
 
     async def stop(self, reason: str = "任务停止") -> None:
         """停止 runner，并取消 worker/reviewer/killsweep 的后续落库。"""
+        self._flush_runtime_stats()
         self._stop.set()
         await self._cancel_active_workers(f"{reason}：运行中 worker 已取消并回队")
         self._cancel_review_tasks(reason)
@@ -3227,6 +3236,7 @@ class TaskRunner:
                 finding_dict, fofa_key, llm=llm, on_event=emit,
                 src_type=src_type, cancel_event=cancel_event,
                 fofa_base_url=fofa_base_url, engine=engine_name,
+                task_id=task_id,
             )
             try:
                 return hunter.run().model_dump(mode="json")

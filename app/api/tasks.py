@@ -20,6 +20,7 @@ from app.agents.manual_targets import clean_manual_target_list
 from app.agents.prompts import normalize_src_type
 from app.db.models import Finding, Killsweep, Review, Target, Task, TaskEvent, to_cst_iso
 from app.db.session import get_session
+from app.engines.meter import engine_snapshot
 from app.llm.usage import usage_snapshot
 from app.orchestrator import manager
 from app.security import resolve_role, token_from_headers
@@ -215,6 +216,24 @@ def _public_model_config(task: Task) -> dict:
     }
 
 
+_OPEN_STATUSES = ("queued", "assigned", "scanning")
+_FINISHED_STATUSES = ("done", "dead")
+
+
+def host_is_checked(statuses: list[str]) -> bool:
+    """扫完且当前没有待跑/待深挖的站才算已检查。"""
+    if any(s in _OPEN_STATUSES for s in statuses):
+        return False
+    return any(s in _FINISHED_STATUSES for s in statuses)
+
+
+def _runtime_parts(task: Task) -> tuple[dict, dict]:
+    raw = dict(getattr(task, "runtime_stats", None) or {})
+    llm = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
+    engine = raw.get("engine") if isinstance(raw.get("engine"), dict) else {}
+    return llm, engine
+
+
 def _public_fofa_config(task: Task) -> dict:
     cfg = dict(task.fofa_config or {})
     eff = resolve_engine_config(task)
@@ -287,7 +306,10 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         model_config_data=model_config,
         fofa_config=_observer_fofa_config() if observer else _public_fofa_config(t),
         engine_config={} if observer else {"engine": t.engine or ""},
-        llm_usage={} if observer else usage_snapshot(t.id, model_config.get("model", "")),
+        llm_usage={} if observer else usage_snapshot(
+            t.id, model_config.get("model", ""), persisted=_runtime_parts(t)[0],
+        ),
+        engine_usage={} if observer else engine_snapshot(t.id, persisted=_runtime_parts(t)[1]),
         created_at=to_cst_iso(t.created_at), updated_at=to_cst_iso(t.updated_at),
         stats=stats, pending_user_review=pending_user_review,
         is_top=getattr(t, "is_top", False),
@@ -378,6 +400,32 @@ async def _compute_stats(session: AsyncSession, task_id: str) -> TaskStats:
             ),
         )
     )).scalar() or 0
+
+    stats.hosts_total = (await session.execute(
+        select(func.count(func.distinct(Target.host))).where(
+            Target.task_id == task_id, Target.host != "",
+        )
+    )).scalar() or 0
+    open_hosts = {
+        h for (h,) in (await session.execute(
+            select(Target.host).where(
+                Target.task_id == task_id,
+                Target.host != "",
+                Target.status.in_(_OPEN_STATUSES),
+            ).distinct()
+        )).all() if h
+    }
+    finished_hosts = {
+        h for (h,) in (await session.execute(
+            select(Target.host).where(
+                Target.task_id == task_id,
+                Target.host != "",
+                Target.status.in_(_FINISHED_STATUSES),
+            ).distinct()
+        )).all() if h
+    }
+    stats.hosts_checked = len(finished_hosts - open_hosts)
+    stats.checked = (stats.done or 0) + (stats.dead or 0)
     return stats
 
 
@@ -956,7 +1004,12 @@ async def task_board(
         "stats": stats.model_dump(),
         "fofa_config": _observer_fofa_config() if observer else _public_fofa_config(task),
         "model_config_data": _observer_model_config() if observer else _public_model_config(task),
-        "llm_usage": {} if observer else usage_snapshot(task.id, resolve_llm_config(task).model),
+        "llm_usage": {} if observer else usage_snapshot(
+            task.id, resolve_llm_config(task).model, persisted=_runtime_parts(task)[0],
+        ),
+        "engine_usage": {} if observer else engine_snapshot(
+            task.id, persisted=_runtime_parts(task)[1],
+        ),
         "events": events,
         "site_collab": site_overview,
     }
@@ -1065,6 +1118,64 @@ async def list_targets(task_id: str, request: Request, status: str | None = None
         "last_error": "" if observer else t.last_error,
         "created_at": to_cst_iso(t.created_at),
     } for t in rows]
+
+
+@router.get("/{task_id}/hosts")
+async def list_hosts(
+    task_id: str,
+    request: Request,
+    checked_only: bool = True,
+    limit: int = 500,
+    session: AsyncSession = Depends(get_session),
+):
+    """按独立网站聚合目标。默认只返回已扫完（无待跑/待深挖）的站。"""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    rows = (await session.execute(
+        select(Target).where(Target.task_id == task_id)
+    )).scalars().all()
+    grouped: dict[str, list] = {}
+    for t in rows:
+        key = (t.host or "").strip() or (t.url or "").strip()
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(t)
+    observer = _is_observer(request)
+    out = []
+    for host, items in grouped.items():
+        statuses = [x.status for x in items]
+        checked = host_is_checked(statuses)
+        if checked_only and not checked:
+            continue
+        found = any(x.status == "done" or x.verdict == "found" for x in items)
+        if any(s in ("assigned", "scanning") for s in statuses):
+            rollup = "scanning"
+        elif any(s == "queued" for s in statuses):
+            rollup = "queued"
+        elif found:
+            rollup = "done"
+        elif any(s == "dead" for s in statuses):
+            rollup = "dead"
+        else:
+            rollup = "skipped"
+        pick = max(items, key=lambda x: ((x.updated_at or x.created_at), x.priority_score or 0))
+        out.append({
+            "host": _observer_host(host) if observer else host,
+            "url": _observer_url(pick.url, pick.host) if observer else pick.url,
+            "title": _observer_text(pick.title) if observer else pick.title,
+            "school": _observer_text(pick.school) if observer else pick.school,
+            "org": _observer_text(pick.org) if observer else pick.org,
+            "status": rollup,
+            "checked": checked,
+            "found": found,
+            "target_count": len(items),
+            "deepen_count": max((x.deepen_count or 0) for x in items),
+            "verdict": pick.verdict or "",
+        })
+    out.sort(key=lambda r: (not r["found"], r["host"]))
+    return out[: max(1, min(int(limit or 500), 2000))]
+
 
 @router.post("/{task_id}/start", response_model=TaskResponse)
 async def start_task(task_id: str, session: AsyncSession = Depends(get_session)):

@@ -2621,6 +2621,17 @@ main {
   transition: border-color .15s, background-color .15s, transform .15s ease;
 }
 .result-row:hover { border-color: var(--border); background: var(--surface); transform: translateY(-1px); }
+.result-row.host-row { cursor: default; }
+.result-row.host-row.found { border-color: color-mix(in srgb, var(--ok, #1a7f4b) 28%, var(--border-soft)); }
+.host-status {
+  flex: none; min-width: 58px; text-align: center;
+  font-size: 11px; font-weight: 700; padding: 4px 8px; border-radius: 8px;
+  background: var(--surface-2); color: var(--muted);
+}
+.host-status.done { background: var(--ok-bg, #e8f8ee); color: var(--ok, #1a7f4b); }
+.host-status.dead { background: var(--surface-2); color: var(--text, #333); }
+.host-status.scanning { background: var(--info-bg); color: var(--info); }
+.host-status.queued { background: var(--warn-bg); color: var(--warn); }
 .result-row.submitted { opacity: .5; }
 .result-row.rejected { opacity: .62; }
 .result-row.rejected:hover { opacity: 1; }

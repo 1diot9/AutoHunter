@@ -11,7 +11,7 @@ defineOptions({ name: "BoardView" });
 
 const props = defineProps({ id: String });
 const task = ref(null);
-const tab = ref("board");          // board | review | submit | killsweep | rejected | archived
+const tab = ref("board");          // board | sites | review | submit | killsweep | rejected | archived
 const boardPanel = ref("workers"); // workers | stream（手机端看板切换）
 const events = ref([]);
 const liveWorkers = ref([]);       // 在跑 worker 活态
@@ -22,6 +22,7 @@ const submitItems = ref([]);       // 待提交
 const killsweepItems = ref([]);    // 通杀列
 const rejectedItems = ref([]);     // 已驳回
 const archivedItems = ref([]);     // AI 未采纳归档（ignored/deepen，可救回）
+const hostItems = ref([]);         // 已检查网站列表
 const expandedKillsweeps = ref(new Set());
 const searchDraft = ref("");
 const searchText = ref("");
@@ -59,7 +60,7 @@ const STREAM_DETAIL_CAP = 40;
 let ws = null, poll = null, boardPoll = null, searchTimer = null;
 let wsReconnectTimer = null, wsReconnectAttempt = 0, wsIntentionalClose = false;
 let eventRefreshTimer = null, eventRefreshPending = null;
-const LIST_TABS = new Set(["review", "submit", "killsweep", "rejected", "archived"]);
+const LIST_TABS = new Set(["sites", "review", "submit", "killsweep", "rejected", "archived"]);
 // 记录哪些列表 tab 已经加载过数据：首屏只拉看板，列表按需加载；后台只刷新看过的列表。
 const loadedTabs = ref(new Set());
 // 内存中按 target 聚合的实时轨迹（WS 推送），配合落库 trace API 做回放。
@@ -88,6 +89,11 @@ async function loadTask() {
   const id = props.id;
   const t = await api.getTask(id);
   if (id === props.id && id === loadedTaskId.value) task.value = t;
+}
+async function loadHosts() {
+  const id = props.id;
+  const rows = await api.listTaskHosts(id, { checked_only: true, limit: 1000 });
+  if (id === props.id) hostItems.value = (rows || []).map(withSearchCache);
 }
 async function loadQueue() {
   const id = props.id;
@@ -168,7 +174,8 @@ async function refreshAll(opts = {}) {
 }
 
 async function loadTabData(t = tab.value) {
-  if (t === "review") await loadQueue();
+  if (t === "sites") await loadHosts();
+  else if (t === "review") await loadQueue();
   else if (t === "submit") await loadSubmit({ reset: true });
   else if (t === "killsweep") await loadKillsweeps();
   else if (t === "rejected") await loadRejected();
@@ -209,6 +216,9 @@ async function refreshFromEvent(ev) {
   if (k.includes("killsweep") && shouldRefreshTab("killsweep")) {
     jobs.push(loadTabData("killsweep"));
   }
+  if ((k.includes("target_") || k === "worker_finish" || k === "auto_deepen") && shouldRefreshTab("sites")) {
+    jobs.push(loadTabData("sites"));
+  }
   await Promise.all(jobs);
 }
 
@@ -230,6 +240,7 @@ function resetTaskState(full = true) {
     killsweepItems.value = [];
     rejectedItems.value = [];
     archivedItems.value = [];
+    hostItems.value = [];
     archivedHasMore.value = false;
     submitHasMore.value = false;
     loadedTabs.value = new Set();
@@ -714,6 +725,7 @@ async function loadBoard() {
       if (b.fofa_config) task.value.fofa_config = b.fofa_config;
       if (b.model_config_data) task.value.model_config_data = b.model_config_data;
       if (b.llm_usage) task.value.llm_usage = b.llm_usage;
+      if (b.engine_usage) task.value.engine_usage = b.engine_usage;
     }
     if (!events.value.length && b.events?.length) {
       const existingByKey = new Map(events.value.map((e) => [streamEventStableKey(e), e]));
@@ -1173,6 +1185,8 @@ const rejectedCount = computed(() =>
 const archivedCount = computed(() =>
   Math.max(stats.value.archived ?? 0, loadedTabs.value.has("archived") ? archivedItems.value.length : 0));
 const archivedWriteCount = computed(() => Number(stats.value.archived_write || 0));
+const checkedHosts = computed(() => Number(stats.value.hosts_checked || 0));
+const totalHosts = computed(() => Number(stats.value.hosts_total || 0));
 const totalTargets = computed(() =>
   (stats.value.queued ?? 0) + (stats.value.scanning ?? 0) +
   (stats.value.done ?? 0) + (stats.value.dead ?? 0) + (stats.value.skipped ?? 0)
@@ -1258,6 +1272,24 @@ function workerModelTitle(worker) {
   return [worker?.model_role || "挖掘模型", worker?.model, worker?.model_base_url].filter(Boolean).join(" · ");
 }
 const tokenUsage = computed(() => task.value?.llm_usage || {});
+const engineUsage = computed(() => task.value?.engine_usage || {});
+const ENGINE_SRC_LABEL = { collector: "搜集", worker: "Worker", killsweep: "通杀" };
+const engineSourceHint = computed(() => {
+  const by = engineUsage.value.by_source || {};
+  return Object.entries(by)
+    .filter(([, n]) => Number(n) > 0)
+    .map(([k, n]) => `${ENGINE_SRC_LABEL[k] || k} ${n}`)
+    .join(" · ");
+});
+function hostStatusLabel(s) {
+  return ({
+    done: "已出洞",
+    dead: "已扫完",
+    scanning: "扫描中",
+    queued: "待深挖",
+    skipped: "已跳过",
+  }[s] || s);
+}
 const cacheHitRate = computed(() => {
   const u = tokenUsage.value || {};
   const hit = Number(u.cache_hit_tokens || 0);
@@ -1292,11 +1324,12 @@ const missionEyebrow = computed(() => {
   if (task.value?.target_source === "site") return "COOPERATIVE SINGLE-SITE OPERATION";
   return isEnterpriseTask.value ? "AUTONOMOUS ENTERPRISE SRC OPERATION" : "AUTONOMOUS EDU SRC OPERATION";
 });
-const searchPlaceholder = computed(() =>
-  isEnterpriseTask.value
+const searchPlaceholder = computed(() => {
+  if (tab.value === "sites") return "搜索网站：域名 / 标题 / 单位";
+  return isEnterpriseTask.value
     ? "搜索漏洞：标题 / URL / 类型 / 单位 / 系统 / 报告正文 / 审核备注"
-    : "搜索漏洞：标题 / URL / 类型 / 学校 / 报告正文 / 审核备注"
-);
+    : "搜索漏洞：标题 / URL / 类型 / 学校 / 报告正文 / 审核备注";
+});
 const scopeCountLabel = computed(() => isEnterpriseTask.value ? "范围" : "教育");
 
 const searchTokens = computed(() =>
@@ -1327,12 +1360,14 @@ function matchSearch(item) {
   const text = stringifyForSearch(item);
   return tokens.every((t) => text.includes(t));
 }
+const filteredHosts = computed(() => hostItems.value.filter(matchSearch));
 const filteredQueue = computed(() => queue.value.filter(matchSearch));
 const filteredSubmit = computed(() => submitItems.value.filter(matchSearch));
 const filteredKillsweeps = computed(() => killsweepItems.value.filter(matchSearch));
 const filteredRejected = computed(() => rejectedItems.value.filter(matchSearch));
 const filteredArchived = computed(() => archivedItems.value.filter(matchSearch));
 const visibleCount = computed(() => {
+  if (tab.value === "sites") return filteredHosts.value.length;
   if (tab.value === "review") return filteredQueue.value.length;
   if (tab.value === "submit") return filteredSubmit.value.length;
   if (tab.value === "killsweep") return filteredKillsweeps.value.length;
@@ -1341,6 +1376,7 @@ const visibleCount = computed(() => {
   return 0;
 });
 const rawCount = computed(() => {
+  if (tab.value === "sites") return hostItems.value.length;
   if (tab.value === "review") return queue.value.length;
   if (tab.value === "submit") return submitItems.value.length;
   if (tab.value === "killsweep") return killsweepItems.value.length;
@@ -1421,6 +1457,12 @@ function parseEventTs(ts) {
           <span class="runtime-chip">
             <i>请求</i>
             <b>{{ tokenUsage.requests || 0 }}</b>
+          </span>
+          <span class="runtime-chip" :title="engineUsage.last_query || ''">
+            <i>测绘</i>
+            <b>{{ engineUsage.count || 0 }}</b>
+            <small>{{ engineUsage.last_engine || engineName }}</small>
+            <small v-if="engineSourceHint">{{ engineSourceHint }}</small>
           </span>
         </div>
       </div>
@@ -1509,13 +1551,13 @@ function parseEventTs(ts) {
 
     <div class="metric-grid">
       <div class="metric-card">
-        <span class="metric-k">TARGETS</span><b>{{ totalTargets }}</b><em>目标总数</em>
+        <span class="metric-k">SITES</span><b>{{ totalHosts || totalTargets }}</b><em>独立网站 · {{ totalTargets }} 条目标</em>
       </div>
       <div class="metric-card active">
         <span class="metric-k">ACTIVE</span><b>{{ stats.scanning ?? 0 }}</b><em>扫描中</em>
       </div>
       <div class="metric-card">
-        <span class="metric-k">DONE</span><b>{{ stats.done ?? 0 }}</b><em>已扫</em>
+        <span class="metric-k">CHECKED</span><b>{{ checkedHosts }}</b><em>已检查</em>
       </div>
       <div class="metric-card hot">
         <span class="metric-k">FINDINGS</span><b>{{ stats.findings_total ?? 0 }}</b><em>原始发现</em>
@@ -1534,6 +1576,10 @@ function parseEventTs(ts) {
     <div class="tabs" role="tablist">
       <button type="button" role="tab" :aria-selected="tab === 'board'" :class="{ active: tab === 'board' }" @click="tab = 'board'">
         <span class="tab-long">实时看板</span><span class="tab-short">看板</span>
+      </button>
+      <button type="button" role="tab" :aria-selected="tab === 'sites'" :class="{ active: tab === 'sites' }" @click="tab = 'sites'">
+        <span class="tab-long">已检查网站</span><span class="tab-short">网站</span>
+        <i v-if="checkedHosts">{{ checkedHosts }}</i>
       </button>
       <button type="button" role="tab" :aria-selected="tab === 'review'" :class="{ active: tab === 'review' }" @click="tab = 'review'">
         <span class="tab-long">复审队列</span><span class="tab-short">复审</span>
@@ -1699,6 +1745,25 @@ function parseEventTs(ts) {
             </div>
           </template>
         </div>
+      </div>
+    </div>
+
+    <!-- 已检查网站 -->
+    <div v-show="tab === 'sites'" class="list-panel">
+      <div class="list-head">
+        <span>已检查网站</span>
+        <small>扫完才计入；同站还有待跑或待深挖的不算。预筛跳过的站不计入。</small>
+      </div>
+      <div v-if="!hostItems.length" class="empty">还没有扫完的网站（待深挖回队的站不会出现在这里）</div>
+      <div v-else-if="!filteredHosts.length" class="empty">没有匹配当前关键词的网站</div>
+      <div v-for="h in filteredHosts" :key="h.host" class="result-row host-row" :class="{ found: h.found }">
+        <span class="host-status" :class="h.status">{{ hostStatusLabel(h.status) }}</span>
+        <div class="rr-main">
+          <div class="rr-title">{{ h.host }}</div>
+          <div class="meta">{{ h.title || "无标题" }}<template v-if="h.school || h.org"> · {{ h.school || h.org }}</template></div>
+          <div class="meta">{{ h.url }} · {{ h.target_count }} 条目标<template v-if="h.deepen_count"> · 深挖 {{ h.deepen_count }}</template></div>
+        </div>
+        <span class="score" v-if="h.found">有洞</span>
       </div>
     </div>
 

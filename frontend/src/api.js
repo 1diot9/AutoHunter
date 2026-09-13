@@ -287,6 +287,8 @@ export const api = {
   rejectedList: (id, q) => req("GET", `/api/tasks/${id}/rejected${qs({ q })}`),
   archivedList: (id, q, opts = {}) => req("GET", `/api/tasks/${id}/archived${qs({ q, ...opts })}`),
   restoreArchived: (id) => req("POST", `/api/results/${id}/restore`),
+  listTaskHosts: (taskId, opts = {}) =>
+    req("GET", `/api/tasks/${taskId}/hosts${qs(opts)}`),
   skipTarget: (taskId, targetId) => req("POST", `/api/tasks/${taskId}/targets/${targetId}/skip`),
   targetTrace: (taskId, targetId, limit = 200) =>
     req("GET", `/api/tasks/${taskId}/targets/${targetId}/trace${qs({ limit })}`),

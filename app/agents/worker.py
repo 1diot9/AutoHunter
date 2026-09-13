@@ -84,7 +84,7 @@ class Worker:
         self.executor = ToolExecutor(
             target, cancel_event=self.cancel_event,
             enterprise=self._enterprise, fofa_key=fofa_key, fofa_base_url=fofa_base_url,
-            engine=engine,
+            engine=engine, task_id=self.task_id,
         )
         self._cookie_hub = CookieHub(self.task_id, target)
         self.executor._cookie_hub = self._cookie_hub

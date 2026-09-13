@@ -229,8 +229,10 @@ class ToolExecutor:
         fofa_key: str = "",
         fofa_base_url: str = "",
         engine: str = "fofa",
+        task_id: str = "",
     ):
         self.target = target
+        self.task_id = task_id or ""
         self.cancel_event = cancel_event or threading.Event()
         # 企业模式：对目标生产环境的破坏性命令做额外硬拦截。
         self.enterprise = enterprise
@@ -892,6 +894,8 @@ class ToolExecutor:
                 engine_name, self.fofa_key, q,
                 page=1, page_size=safe_size, base_url=self.fofa_base_url or None,
             )
+            from app.engines.meter import record_engine_search
+            record_engine_search(self.task_id, "worker", q, engine_name)
         except Exception as e:
             return {"ok": False, "error": f"{disp} 调用失败: {type(e).__name__}: {e}"[:300],
                     "guidance": f"{disp} 不可用，改用 http_request 直接验证归属。"}

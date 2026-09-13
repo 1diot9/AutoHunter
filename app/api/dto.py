@@ -131,6 +131,9 @@ class TaskStats(BaseModel):
     rejected: int = 0
     archived: int = 0
     archived_write: int = 0
+    hosts_total: int = 0
+    hosts_checked: int = 0
+    checked: int = 0
 
 
 class TaskResponse(BaseModel):
@@ -151,6 +154,7 @@ class TaskResponse(BaseModel):
     fofa_config: dict = Field(default_factory=dict)
     engine_config: dict = Field(default_factory=dict)
     llm_usage: dict = Field(default_factory=dict)
+    engine_usage: dict = Field(default_factory=dict)
     created_at: str
     updated_at: str
     stats: Optional[TaskStats] = None

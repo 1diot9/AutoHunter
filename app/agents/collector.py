@@ -687,7 +687,11 @@ async def _fofa_collect(
             base_url=base_url,
             cursor=engine_cursor,
         )
+        from app.engines.meter import record_engine_search
+        record_engine_search(task.id, "collector", native_query, engine.name)
     except QuakeRateLimitError as e:
+        from app.engines.meter import record_engine_search
+        record_engine_search(task.id, "collector", native_query, engine.name)
         # Quake 专用限流异常
         err = f"{e}"[:300]
         rl_count = int(cfg.get("rate_limit_count", 0)) + 1
@@ -706,6 +710,8 @@ async def _fofa_collect(
         task.fofa_config = {**cfg}
         return 0
     except (ValueError, Exception) as e:
+        from app.engines.meter import record_engine_search
+        record_engine_search(task.id, "collector", native_query, engine.name)
         err = f"{e}"[:300]
         err_lower = str(e).lower()
         # 每日额度耗尽检测（FOFA [820041] 等）：每小时重试一次，12 次都卡才停任务。
