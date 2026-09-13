@@ -354,6 +354,7 @@ async function askAssistant(preset = "") {
         <section class="report-facts">
           <div><span>漏洞类型</span><b>{{ f.vuln_type }}</b></div>
           <div><span>归属单位</span><b>{{ f.edu_school || f.owner || "待确认" }}</b></div>
+          <div v-if="f.owner_proof"><span>归属证明</span><b>{{ f.owner_proof }}</b></div>
           <div><span>发现时间</span><b>{{ fmtFindingTime(f.created_at) }}</b></div>
           <div v-if="f.llm_model"><span>产出模型</span><b :title="f.llm_base_url || ''">{{ f.llm_model }}</b></div>
           <div><span>信度</span><b>{{ confidenceText }}</b></div>

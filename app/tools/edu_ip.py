@@ -1,52 +1,55 @@
-"""教育网 IP → 高校归属查询（离线，纯真库导出的本地 SQLite）。
+"""IP / 域名 → 资产归属（ip138 在线查询）。
 
-用于写报告时把目标 IP/域名反查成「所属高校」，供 EduSRC 报告标题/归属单位使用。
+写报告时把目标反查成单位名 + 归属证明（Issue #53）。纯真离线库已过时，
+改为查 https://www.ip138.com/iplookup.php?ip=…&action=2 。
 
-- 数据文件：app/data_static/edu_ip.db（随镜像打包，只读）。
-- 查询只读、线程安全（check_same_thread=False + 只读连接），失败时静默返回 None，
-  绝不因归属查询异常影响主流程。
+- 只查 IPv4；IPv6 直接无归属。
+- 结果按 IP 缓存在内存：同一地址不重复打 ip138。
+- 查询失败不缓存，下次还能自愈。
+- `school_name_no_dns` / peek 只读缓存，绝不在列表接口里同步打网。
+- 失败一律返回 None，不影响主流程。
 """
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
-import sqlite3
 import threading
+import time
 from functools import lru_cache
-from pathlib import Path
+from urllib.parse import quote
 
-_DB_PATH = Path(__file__).resolve().parent.parent / "data_static" / "edu_ip.db"
+import httpx
 
-_conn: sqlite3.Connection | None = None
-_conn_lock = threading.Lock()
-_read_lock = threading.Lock()  # 共享连接跨线程读时串行化（查询是微秒级，无性能影响）
+from app.http_defaults import BROWSER_UA
 
+_IP138_URL = "https://www.ip138.com/iplookup.php"
+_MIN_INTERVAL = 0.45
+_HTTP_TIMEOUT = 8.0
 
-def _get_conn() -> sqlite3.Connection | None:
-    global _conn
-    if _conn is not None:
-        return _conn
-    with _conn_lock:
-        if _conn is not None:
-            return _conn
-        if not _DB_PATH.exists():
-            return None
-        try:
-            c = sqlite3.connect(f"file:{_DB_PATH}?mode=ro", uri=True,
-                                check_same_thread=False, timeout=5)
-            c.row_factory = sqlite3.Row
-            _conn = c
-        except Exception:
-            return None
-    return _conn
+_cache: dict[str, dict] = {}
+_cache_lock = threading.Lock()
+_rate_lock = threading.Lock()
+_last_fetch_at = 0.0
+
+_JUNK_RE = re.compile(r"html\.join|function\s*\(|^\s*'\+")
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_RE = re.compile(r"<script\b.*?</script>", re.I | re.S)
+_ROW_RE = re.compile(
+    r'<td class="th">(.*?)</td>\s*<td>(.*?)</td>',
+    re.I | re.S,
+)
+_SUFFIX_RE = re.compile(
+    r"(教育网.*|无线.*|宿舍.*|公寓.*|校区.*|分校.*|学生.*|住宅.*|机房.*|"
+    r"实验室.*|中心.*|研究院.*|研究生院.*|附属中学.*|附中.*|\(.*\)|（.*）).*$"
+)
 
 
 def _host_from_target(target: str) -> str | None:
     t = (target or "").strip()
     if not t:
         return None
-    # 走 urlnorm：裸合法 IPv6 会先补方括号，safe_hostname 才能取到完整地址而非首段。
     from app.urlnorm import ensure_scheme, safe_hostname
     host = safe_hostname(ensure_scheme(t))
     return host or None
@@ -62,11 +65,6 @@ def _is_ip(host: str) -> bool:
 
 @lru_cache(maxsize=8192)
 def _resolve_host(host: str) -> str | None:
-    """域名 → IP。带缓存；解析失败/超时返回 None。
-
-    注意：不使用 socket.setdefaulttimeout（那是全局副作用，会污染 httpx 等）。
-    这里用 getaddrinfo，本函数应在线程池里调用，超时由调用方 wait 控制上限。
-    """
     if _is_ip(host):
         return host
     try:
@@ -78,129 +76,213 @@ def _resolve_host(host: str) -> str | None:
     return None
 
 
-def _lookup_ip(ip: str) -> sqlite3.Row | None:
-    # DB 暂不可用（瞬态：卷 late-mount / 首次连接瞬时失败）时返回 None 但【不缓存】——
-    # 否则会把这些 IP 永久缓存成 None，DB 恢复后仍查不到归属、无法自愈。
-    if _get_conn() is None:
-        return None
-    return _lookup_ip_cached(ip)
+def _plain(html: str) -> str:
+    text = _SCRIPT_RE.sub("", html or "")
+    text = _TAG_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
-@lru_cache(maxsize=4096)
-def _lookup_ip_cached(ip: str) -> sqlite3.Row | None:
-    # edu_ip.db 是随镜像打包的只读静态归属库，运行期不变 → 按 ip 缓存零风险，
-    # 消除评审队列/列表接口里每个 IP 目标一次同步 sqlite 查询在事件循环上的阻塞。
-    conn = _get_conn()
-    if conn is None:
-        return None
-    try:
-        ip_obj = ipaddress.ip_address(ip)
-    except ValueError:
-        return None
-    # 归属库为纯 IPv4 ranges；IPv6→int 是 128bit 大整数，传给 sqlite 会抛
-    # OverflowError（此前被外层 try 吞掉）。IPv6 直接短路无归属。
-    if ip_obj.version != 4:
-        return None
-    n = int(ip_obj)
-    try:
-        with _read_lock:
-            # 优先真高校（非噪音）；命中范围最小者最精确；无则回退含噪音
-            row = conn.execute(
-                "SELECT school, province, city, isp FROM ranges "
-                "WHERE ip_start <= ? AND ip_end >= ? AND is_noise = 0 "
-                "ORDER BY (ip_end - ip_start) ASC LIMIT 1",
-                (n, n),
-            ).fetchone()
-            if row is None:
-                row = conn.execute(
-                    "SELECT school, province, city, isp FROM ranges "
-                    "WHERE ip_start <= ? AND ip_end >= ? "
-                    "ORDER BY (ip_end - ip_start) ASC LIMIT 1",
-                    (n, n),
-                ).fetchone()
-        return row
-    except Exception:
-        return None
+def _is_junk(value: str) -> bool:
+    return bool(_JUNK_RE.search(value or ""))
 
 
-# 学校名清洗：去掉「教育网/校区/院系/宿舍」等后缀，尽量归到主校名
-_SUFFIX_RE = re.compile(
-    r"(教育网.*|无线.*|宿舍.*|公寓.*|校区.*|分校.*|学生.*|住宅.*|机房.*|"
-    r"实验室.*|中心.*|研究院.*|研究生院.*|附属中学.*|附中.*|\(.*\)|（.*）).*$"
-)
+def parse_ip138_html(html: str) -> dict | None:
+    """解析 ip138 查询页。供单测直接喂 HTML，不打网。"""
+    fields: dict[str, str] = {}
+    for raw_k, raw_v in _ROW_RE.findall(html or ""):
+        key = _plain(raw_k)
+        val = _plain(raw_v)
+        if not key or not val or _is_junk(val):
+            continue
+        fields[key] = val
+    location = fields.get("ASN归属地") or fields.get("归属地") or ""
+    isp = fields.get("运营商") or ""
+    tag = fields.get("标记") or ""
+    ip_type = fields.get("iP类型") or fields.get("IP类型") or ""
+    if not any((location, isp, tag, ip_type)):
+        return None
+    return {
+        "location": location,
+        "isp": isp,
+        "tag": tag,
+        "ip_type": ip_type,
+    }
+
+
+def _split_location(loc: str) -> tuple[str, str]:
+    parts = [p for p in (loc or "").split() if p]
+    if not parts:
+        return "", ""
+    if parts[0] in {"中国", "美国", "日本", "韩国", "英国", "德国", "法国", "新加坡", "澳大利亚"}:
+        parts = parts[1:]
+    province = parts[0] if parts else ""
+    city = parts[1] if len(parts) > 1 else ""
+    return province, city
 
 
 def _clean_school_name(name: str | None) -> str | None:
     if not name:
         return None
     s = name.strip()
-    # 若含「大学/学院」，截取到第一个「大学」或「学院」结尾，去掉后面的校区/院系
     m = re.search(r"^(.*?(?:大学|学院|学校))", s)
     base = m.group(1) if m else _SUFFIX_RE.sub("", s)
     base = base.strip()
     return base or s
 
 
-def lookup_school(target: str) -> dict | None:
-    """输入 target_url / 域名 / IP，返回 {school, school_full, province, city} 或 None。
+def _format_proof(ip: str, raw: dict) -> str:
+    bits = [f"IP {ip} 经 ip138 查询"]
+    if raw.get("tag"):
+        bits.append(f"标记「{raw['tag']}」")
+    if raw.get("isp"):
+        bits.append(f"运营商{raw['isp']}")
+    if raw.get("location"):
+        bits.append(f"ASN归属地{raw['location']}")
+    if raw.get("ip_type"):
+        bits.append(f"类型{raw['ip_type']}")
+    if len(bits) == 1:
+        return ""
+    return "，".join(bits)
 
-    school      = 清洗后的主校名（如「清华大学」），适合做报告标题/归属；
-    school_full = 原始细分名（如「清华大学教育网无线校园项目」），保留备查。
+
+def _info_from_raw(ip: str, raw: dict) -> dict:
+    tag = (raw.get("tag") or "").strip()
+    province, city = _split_location(raw.get("location") or "")
+    return {
+        "school": _clean_school_name(tag) if tag else None,
+        "school_full": tag or (raw.get("isp") or ""),
+        "province": province,
+        "city": city,
+        "ip": ip,
+        "isp": raw.get("isp") or "",
+        "location": raw.get("location") or "",
+        "ip_type": raw.get("ip_type") or "",
+        "source": "ip138",
+        "proof": _format_proof(ip, raw),
+    }
+
+
+def _cache_get(ip: str) -> dict | None:
+    with _cache_lock:
+        hit = _cache.get(ip)
+    return None if hit is None else dict(hit)
+
+
+def _cache_put(ip: str, info: dict) -> None:
+    with _cache_lock:
+        _cache[ip] = dict(info)
+
+
+def cache_clear() -> None:
+    with _cache_lock:
+        _cache.clear()
+    _resolve_host.cache_clear()
+
+
+def _rate_limit() -> None:
+    global _last_fetch_at
+    with _rate_lock:
+        wait = _MIN_INTERVAL - (time.monotonic() - _last_fetch_at)
+        if wait > 0:
+            time.sleep(wait)
+        _last_fetch_at = time.monotonic()
+
+
+def _ip138_disabled() -> bool:
+    return os.environ.get("AUTOHUNTER_DISABLE_IP138", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _fetch_ip138(ip: str) -> dict | None:
+    if _ip138_disabled():
+        return None
+    _rate_limit()
+    try:
+        with httpx.Client(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(
+                _IP138_URL,
+                params={"ip": ip, "action": "2"},
+                headers={
+                    "User-Agent": BROWSER_UA,
+                    "Referer": "https://www.ip138.com/",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            resp.raise_for_status()
+            return parse_ip138_html(resp.text)
+    except Exception:
+        return None
+
+
+def source_url(ip: str) -> str:
+    return f"{_IP138_URL}?ip={quote(ip, safe='.')}&action=2"
+
+
+def _lookup_ip(ip: str) -> dict | None:
+    """查单个 IPv4。命中缓存直接返回；失败不写缓存。"""
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    if ip_obj.version != 4:
+        return None
+    cached = _cache_get(ip)
+    if cached is not None:
+        return cached or None
+    raw = _fetch_ip138(ip)
+    if raw is None:
+        return None
+    info = _info_from_raw(ip, raw)
+    _cache_put(ip, info)
+    return info
+
+
+def peek_cached(target: str) -> dict | None:
+    """只读缓存：目标本身是 IPv4 且查过才返回。不做 DNS、不打网。"""
+    host = _host_from_target(target)
+    if not host or not _is_ip(host):
+        return None
+    try:
+        if ipaddress.ip_address(host).version != 4:
+            return None
+    except ValueError:
+        return None
+    return _cache_get(host) or None
+
+
+def lookup_school(target: str) -> dict | None:
+    """输入 target_url / 域名 / IP，返回归属 dict 或 None。
+
+    school      = 清洗后的单位名（ip138「标记」，如「清华大学」）
+    school_full = 原始标记
+    proof       = 可直接写进报告的归属证明
     """
     host = _host_from_target(target)
     if not host:
         return None
+    # 无点号的假主机（测试用 http://x）不走 DNS，避免列表接口被解析拖死。
+    if not _is_ip(host) and "." not in host and host != "localhost":
+        return None
     ip = _resolve_host(host)
     if not ip:
         return None
-    row = _lookup_ip(ip)
-    if row is None or not row["school"]:
-        return None
-    full = row["school"]
-    return {
-        "school": _clean_school_name(full),
-        "school_full": full,
-        "province": row["province"],
-        "city": row["city"],
-        "ip": ip,
-    }
+    return _lookup_ip(ip)
 
 
-def _lookup_no_dns(target: str) -> dict | None:
-    """仅当 target 本身是 IP 时查库；是域名则不解析、直接返回 None（零阻塞）。"""
-    host = _host_from_target(target)
-    if not host or not _is_ip(host):
-        return None
-    row = _lookup_ip(host)
-    if row is None or not row["school"]:
-        return None
-    full = row["school"]
-    return {
-        "school": _clean_school_name(full),
-        "school_full": full,
-        "province": row["province"],
-        "city": row["city"],
-        "ip": host,
-    }
-
-
-async def lookup_school_async(target: str, timeout: float = 3.0) -> dict | None:
-    """事件循环安全版：
-    - target 是 IP：纯查库（微秒级，无网络）。
-    - target 是域名：DNS + 查库放线程池执行，最长等待 timeout 秒，超时返回 None。
-    任何异常/超时都返回 None，绝不阻塞事件循环、绝不抛给上层。
-    """
+async def lookup_school_async(target: str, timeout: float = 8.0) -> dict | None:
+    """事件循环安全版。先 peek 缓存；未命中则 DNS + ip138 放线程池。"""
     import asyncio
 
     try:
-        # 纯 IP 直接同步查库（不涉及 DNS，快且无阻塞风险）
-        fast = _lookup_no_dns(target)
-        if fast is not None:
-            return fast
+        cached = peek_cached(target)
+        if cached is not None:
+            return cached
         host = _host_from_target(target)
-        if not host or _is_ip(host):
-            # 是 IP 但没命中，或无 host —— 无需再走 DNS
-            return None
+        if host and _is_ip(host):
+            try:
+                if ipaddress.ip_address(host).version != 4:
+                    return None
+            except ValueError:
+                return None
         loop = asyncio.get_running_loop()
         return await asyncio.wait_for(
             loop.run_in_executor(None, lookup_school, target), timeout=timeout
@@ -210,6 +292,6 @@ async def lookup_school_async(target: str, timeout: float = 3.0) -> dict | None:
 
 
 def school_name_no_dns(target: str) -> str | None:
-    """仅 IP 命中返回校名；域名一律返回 None（零阻塞，可安全用于批量/列表）。"""
-    info = _lookup_no_dns(target)
-    return info["school"] if info else None
+    """仅当目标是已缓存的 IPv4 时返回单位名。列表接口用，零阻塞。"""
+    info = peek_cached(target)
+    return (info or {}).get("school") or None

@@ -116,7 +116,12 @@ async def _paginated_finding_list(session, q, search, compact, limit, offset, *,
         if limit:
             out = out[offset:offset + limit + 1]
     if limit:
-        return {"items": out[:limit], "has_more": len(out) > limit, "limit": limit, "offset": offset}
+        page = out[:limit]
+        if not compact:
+            await _enrich_findings_owner(page)
+        return {"items": page, "has_more": len(out) > limit, "limit": limit, "offset": offset}
+    if not compact:
+        await _enrich_findings_owner(out)
     return out
 
 
@@ -175,15 +180,15 @@ def _finding_dict(f: Finding, r: Review | None, *, compact: bool = False) -> dic
         if (f.assistant_messages or [])
         else _default_assistant_messages(),
         "self_check": f.self_check,
-        # 写报告用的高校归属：这里先用「零阻塞」的纯 IP 查库（不做 DNS，避免拖慢列表）。
-        # 域名目标的归属由 get_finding 详情接口异步补全（见 _resolve_edu_school_async）。
+        # 写报告用的高校归属：列表先读缓存（零阻塞）。详情/全字段列表再查 ip138。
         "edu_school": _edu_school_fast(f.target_url),
+        "owner_proof": _owner_proof_fast(f.target_url),
     })
     return item
 
 
 def _edu_school_fast(target_url: str | None) -> str | None:
-    """零阻塞归属：仅当目标本身是 IP 时查库；域名一律返回 None（不触发 DNS）。"""
+    """零阻塞归属：只读 ip138 缓存，不打网、不解析域名。"""
     if not target_url:
         return None
     try:
@@ -193,16 +198,52 @@ def _edu_school_fast(target_url: str | None) -> str | None:
         return None
 
 
-async def _resolve_edu_school_async(target_url: str | None) -> str | None:
-    """详情接口用：域名目标也解析（放线程池 + 3s 超时），任何异常返回 None。"""
+def _owner_proof_fast(target_url: str | None) -> str | None:
+    if not target_url:
+        return None
+    try:
+        from app.tools.edu_ip import peek_cached
+        info = peek_cached(target_url)
+        return (info or {}).get("proof") or None
+    except Exception:
+        return None
+
+
+def _apply_owner_info(d: dict, info: dict | None) -> None:
+    if not info:
+        return
+    if info.get("school"):
+        d["edu_school"] = info["school"]
+    if info.get("proof"):
+        d["owner_proof"] = info["proof"]
+
+
+async def _resolve_edu_school_async(target_url: str | None) -> dict | None:
+    """详情/导出用：DNS + ip138（线程池），任何异常返回 None。"""
     if not target_url:
         return None
     try:
         from app.tools.edu_ip import lookup_school_async
-        info = await lookup_school_async(target_url, timeout=3.0)
-        return info["school"] if info else None
+        return await lookup_school_async(target_url, timeout=8.0)
     except Exception:
         return None
+
+
+async def _enrich_findings_owner(items: list[dict]) -> None:
+    """全字段列表补归属证明：已缓存的秒回，未命中的并发查 ip138（有频率限制）。"""
+    pending = [
+        d for d in items
+        if d.get("target_url") and not d.get("owner_proof")
+    ]
+    if not pending:
+        return
+    sem = asyncio.Semaphore(3)
+
+    async def one(d: dict) -> None:
+        async with sem:
+            _apply_owner_info(d, await _resolve_edu_school_async(d.get("target_url")))
+
+    await asyncio.gather(*(one(d) for d in pending))
 
 
 @router.get("/tasks/{task_id}/findings")
@@ -267,9 +308,9 @@ async def get_finding(finding_id: str, session: AsyncSession = Depends(get_sessi
         raise HTTPException(404, "漏洞不存在")
     r = (await session.execute(select(Review).where(Review.finding_id == f.id))).scalar_one_or_none()
     d = _finding_dict(f, r)
-    # 域名目标：详情接口异步补全归属（列表接口用零阻塞快路径，这里做完整 DNS 反查）
-    if not d.get("edu_school"):
-        d["edu_school"] = await _resolve_edu_school_async(f.target_url)
+    # 详情补全归属 + 证明（列表只读缓存；这里允许 DNS + ip138）
+    if not d.get("owner_proof") or not d.get("edu_school"):
+        _apply_owner_info(d, await _resolve_edu_school_async(f.target_url))
     return d
 
 

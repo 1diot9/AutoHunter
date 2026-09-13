@@ -59,32 +59,33 @@ def test_compact_messages_not_windowed_unchanged():
     assert "_summary" not in msgs[0]
 
 
-# ---------- #2C _lookup_ip lru_cache ----------
-def test_lookup_ip_is_cached():
+# ---------- #2C ip138 查询结果按 IP 缓存 ----------
+def test_lookup_ip_is_cached(monkeypatch):
     from app.tools import edu_ip
 
-    edu_ip._lookup_ip_cached.cache_clear()
-    edu_ip._lookup_ip("202.115.32.1")
-    before = edu_ip._lookup_ip_cached.cache_info()
-    edu_ip._lookup_ip("202.115.32.1")
-    after = edu_ip._lookup_ip_cached.cache_info()
-    assert after.hits == before.hits + 1, "同一 IP 第二次应命中缓存，不再查 sqlite"
+    calls = {"n": 0}
 
-    edu_ip._lookup_ip_cached.cache_clear()
-    edu_ip._lookup_ip("0.0.0.0")
-    edu_ip._lookup_ip("0.0.0.0")
-    assert edu_ip._lookup_ip_cached.cache_info().hits >= 1, "确定性查询 None 结果也应缓存"
+    def fake_fetch(ip):
+        calls["n"] += 1
+        return {"location": "中国 四川省 成都市", "isp": "教育网", "tag": "四川大学", "ip_type": ""}
+
+    edu_ip.cache_clear()
+    monkeypatch.setattr(edu_ip, "_fetch_ip138", fake_fetch)
+    first = edu_ip._lookup_ip("202.115.32.1")
+    second = edu_ip._lookup_ip("202.115.32.1")
+    assert first and first["school"] == "四川大学"
+    assert second["school"] == "四川大学"
+    assert calls["n"] == 1, "同一 IP 第二次应命中缓存，不再打 ip138"
 
 
-def test_lookup_ip_transient_db_unavailable_not_cached(monkeypatch):
-    """DB 瞬态不可用（卷 late-mount/首连失败）返回的 None 不能被缓存，
-    否则 DB 恢复后该 IP 永久查不到归属、无法自愈（回归防护）。"""
+def test_lookup_ip_transient_fetch_fail_not_cached(monkeypatch):
+    """ip138 瞬时失败返回的 None 不能被缓存，否则恢复后该 IP 永久查不到。"""
     from app.tools import edu_ip
 
-    edu_ip._lookup_ip_cached.cache_clear()
-    monkeypatch.setattr(edu_ip, "_get_conn", lambda: None)  # 模拟 DB 暂不可用
+    edu_ip.cache_clear()
+    monkeypatch.setattr(edu_ip, "_fetch_ip138", lambda ip: None)
     assert edu_ip._lookup_ip("202.115.32.1") is None
-    assert edu_ip._lookup_ip_cached.cache_info().currsize == 0, "conn 为 None 时绝不写入缓存"
+    assert edu_ip.peek_cached("202.115.32.1") is None, "失败结果绝不写入缓存"
 
 
 # ---------- #3 executor 持久 http client ----------
@@ -146,6 +147,8 @@ def test_write_log_counts_shell_written_files(monkeypatch):
 # ---------- #2AB findings 列表 compact + 分页 ----------
 class FindingsPaginationTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        import os
+        os.environ["AUTOHUNTER_DISABLE_IP138"] = "1"
         from app.db.models import Base, Task, Target, Finding, Review
         from sqlalchemy.ext.asyncio import (
             AsyncSession, async_sessionmaker, create_async_engine,
