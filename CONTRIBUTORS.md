@@ -49,7 +49,7 @@
 
 ## 贡献约定（简要）
 
-- 仅限授权安全测试相关改进；遵守 [LICENSE](./LICENSE)（CC BY-NC 4.0）
+- 仅限授权安全测试相关改进；遵守 [LICENSE](./LICENSE)（Apache License 2.0）
 - PR 尽量小而清晰，附上「改了什么 / 怎么验证」
 - 二次分发请保留 `Powered By StanleyNull` 署名
 

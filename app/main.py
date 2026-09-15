@@ -2,7 +2,7 @@
 
 AutoHunter — AI 自主漏洞挖掘平台
 Powered By StanleyNull
-License: CC BY-NC 4.0（署名-非商业性使用）
+License: Apache License 2.0
 """
 from __future__ import annotations
 
@@ -229,7 +229,7 @@ async def about():
         "name": "AutoHunter",
         "description": "AI 自主漏洞挖掘平台",
         "author": "StanleyNull",
-        "license": "CC BY-NC 4.0",
+        "license": "Apache-2.0",
         "credit": CREDIT,
     }
 

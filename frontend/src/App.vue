@@ -197,7 +197,7 @@ onUnmounted(() => {
   <footer class="app-credit" aria-label="署名">
     <span>Powered By <b>StanleyNull</b></span>
     <span class="app-credit-sep">·</span>
-    <span>CC BY-NC 4.0</span>
+    <span>Apache License 2.0</span>
   </footer>
 
   <nav class="bottom-nav mobile-only-nav" aria-label="主导航">
