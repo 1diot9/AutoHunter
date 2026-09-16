@@ -15,6 +15,7 @@ AutoHunter 自己，产出「未授权访问 / 泄露漏洞报告」之类假洞
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import re
 import socket
@@ -178,6 +179,15 @@ def is_loopback_target(host_or_url: str) -> bool:
     ip = _parse_ip(host)
     if ip is not None:
         return _ip_is_loopback(ip)
+    # collector.refill / 派发跑在 asyncio 事件循环上。这里禁止阻塞 DNS：
+    # 字面 127.0.0.1 / localhost 已在上面拦掉（Issue #49 真场景）。
+    # 域名解析到回环只在 worker 线程里做（那边没有 running loop）。
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        return False
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:

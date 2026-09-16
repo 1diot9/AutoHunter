@@ -169,6 +169,8 @@ QUEUE_LOW_SUCCESS_SKIP = os.environ.get("QUEUE_LOW_SUCCESS_SKIP", "1").lower() n
 QUEUE_LOW_SUCCESS_SCORE_THRESHOLD = float(os.environ.get("QUEUE_LOW_SUCCESS_SCORE_THRESHOLD", "-3.5"))
 QUEUE_TRANSIENT_PREFILTER_COOLDOWN = float(os.environ.get("QUEUE_TRANSIENT_PREFILTER_COOLDOWN", "900"))
 QUEUE_DISPATCH_CANDIDATE_LIMIT = max(30, int(os.environ.get("QUEUE_DISPATCH_CANDIDATE_LIMIT", "120")))
+# 同款簇冷却只需要「在途 + 最近死/跳过」，禁止每次派发把任务全表 dead/skipped 灌进内存。
+QUEUE_CLUSTER_HISTORY_LIMIT = max(100, int(os.environ.get("QUEUE_CLUSTER_HISTORY_LIMIT", "800")))
 
 _LOW_SUCCESS_SCORE_MARKERS = (
     "pure_frontend", "pure_marketing_site", "static_assets", "data_display_platform",
@@ -901,21 +903,27 @@ class TaskRunner:
             for t in candidates
         )
         if need_cluster:
-            # 只取簇计算用到的列，不再水化不断增长的 dead/skipped 完整 ORM 实体。
-            all_targets = (await session.execute(
-                select(
-                    Target.host, Target.url, Target.title, Target.org,
-                    Target.status, Target.verdict, Target.dead_reason, Target.last_error,
-                ).where(
+            cluster_cols = (
+                Target.host, Target.url, Target.title, Target.org,
+                Target.status, Target.verdict, Target.dead_reason, Target.last_error,
+            )
+            inflight_rows = (await session.execute(
+                select(*cluster_cols).where(
                     Target.task_id == self.task_id,
-                    Target.status.in_(["queued", "assigned", "scanning", "dead", "skipped"]),
+                    Target.status.in_(["assigned", "scanning"]),
                 )
             )).all()
+            history_rows = (await session.execute(
+                select(*cluster_cols).where(
+                    Target.task_id == self.task_id,
+                    Target.status.in_(["dead", "skipped"]),
+                ).order_by(Target.updated_at.desc()).limit(QUEUE_CLUSTER_HISTORY_LIMIT)
+            )).all()
+            all_targets = [*candidates, *inflight_rows, *history_rows]
             cluster_state = self._cluster_state(all_targets)
             active_clusters = {
                 target_cluster.target_cluster_key(t.host or t.url, t.title, t.org)
-                for t in all_targets
-                if t.status in ("assigned", "scanning")
+                for t in inflight_rows
             }
             active_clusters.discard("")
         else:

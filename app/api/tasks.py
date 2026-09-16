@@ -1133,8 +1133,12 @@ async def list_hosts(
     if not task:
         raise HTTPException(404, "任务不存在")
     rows = (await session.execute(
-        select(Target).where(Target.task_id == task_id)
-    )).scalars().all()
+        select(
+            Target.host, Target.url, Target.title, Target.school, Target.org,
+            Target.status, Target.verdict, Target.deepen_count,
+            Target.updated_at, Target.created_at, Target.priority_score,
+        ).where(Target.task_id == task_id)
+    )).all()
     grouped: dict[str, list] = {}
     for t in rows:
         key = (t.host or "").strip() or (t.url or "").strip()

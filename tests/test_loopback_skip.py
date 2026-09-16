@@ -1,6 +1,7 @@
 """Issue #49：域名/IP 指向回环时必须跳过，不能打到 AutoHunter 自己。"""
 from __future__ import annotations
 
+import asyncio
 import socket
 import unittest
 from unittest.mock import patch
@@ -40,6 +41,15 @@ class LoopbackSkipTests(unittest.TestCase):
         fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
         with patch("app.tools.netguard.socket.getaddrinfo", return_value=fake):
             self.assertTrue(is_loopback_target("evil.example"))
+
+    def test_event_loop_skips_blocking_dns(self):
+        async def _run():
+            with patch("app.tools.netguard.socket.getaddrinfo") as ga:
+                ga.side_effect = AssertionError("event loop must not call getaddrinfo")
+                self.assertFalse(is_loopback_target("slow.invalid.example"))
+                ga.assert_not_called()
+                self.assertTrue(is_loopback_target("127.0.0.1"))
+        asyncio.run(_run())
 
     def test_should_skip_no_probe(self):
         with patch("app.agents.prefilter.probe") as probe:

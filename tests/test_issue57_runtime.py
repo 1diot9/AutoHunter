@@ -107,3 +107,18 @@ def test_engine_meter_persists_and_hydrates(tmp_path, monkeypatch):
     snap = meter.engine_snapshot("t1", persisted=saved["engine"])
     assert snap["count"] == 2
     assert snap["last_engine"] == "fofa"
+
+
+def test_list_hosts_uses_light_columns():
+    """hosts 聚合禁止 select(Target) 全实体（JSON 大字段会把大库租户事件循环打满）。"""
+    text = (ROOT / "app/api/tasks.py").read_text(encoding="utf-8")
+    hosts_fn = text.split("async def list_hosts", 1)[1].split("async def start_task", 1)[0]
+    assert "select(Target).where(Target.task_id == task_id)" not in hosts_fn
+    assert "Target.host" in hosts_fn
+    assert "leaked_creds" not in hosts_fn
+
+
+def test_queue_cluster_history_is_capped():
+    text = (ROOT / "app/orchestrator.py").read_text(encoding="utf-8")
+    assert "QUEUE_CLUSTER_HISTORY_LIMIT" in text
+    assert 'Target.status.in_(["queued", "assigned", "scanning", "dead", "skipped"])' not in text
