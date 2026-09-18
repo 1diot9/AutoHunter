@@ -144,6 +144,34 @@ class TaskStats(BaseModel):
     checked: int = 0
 
 
+class TaskListItem(BaseModel):
+    """任务列表卡片瘦 DTO：不含密钥/规则/凭据/完整 manual_targets。"""
+    id: str
+    name: str
+    status: str
+    src_type: str
+    target_source: str
+    engine: str = ""
+    fofa_query: str = ""
+    concurrency: int = 3
+    deepen_cap: int = 2
+    llm_cost: float = 0.0
+    created_at: str
+    updated_at: str
+    pending_user_review: int = 0
+    pending_archived: int = 0
+    pending_discarded: int = 0
+    pending_input: int = 0
+    retest_active: bool = False
+    progress_pct: int = 0
+    is_top: bool = False
+
+
+class TaskListResponse(BaseModel):
+    items: list[TaskListItem]
+    total: int
+
+
 class TaskResponse(BaseModel):
     id: str
     name: str

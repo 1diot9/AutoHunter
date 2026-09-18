@@ -132,7 +132,7 @@ def observer_path_allowed(path: str) -> bool:
     if len(parts) == 3:
         return True
     # /api/tasks/{task_id}/board 或 /targets
-    if len(parts) == 4 and parts[3] in {"board", "targets"}:
+    if len(parts) == 4 and parts[3] in {"board", "targets", "events"}:
         return True
     return False
 

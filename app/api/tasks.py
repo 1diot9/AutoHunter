@@ -9,13 +9,16 @@ import threading
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.agent_runtime import AGENT_EXECUTOR, agent_semaphore
 from app.api.dto import (
     CreateTaskRequest,
     DirectiveRequest,
+    TaskListItem,
+    TaskListResponse,
     TaskModelsProbeRequest,
     TaskResponse,
     TaskStats,
@@ -32,7 +35,7 @@ from app.agents.manual_targets import clean_manual_target_list
 from app.agents.prompts import normalize_src_type
 from app.db.models import Finding, Killsweep, Review, Target, Task, TaskEvent, to_cst_iso
 from app.db.session import get_session
-from app.llm.usage import usage_snapshot, usage_snapshot_by_model
+from app.llm.usage import usage_by_task_model, usage_snapshot, usage_snapshot_by_model
 from app.engines.meter import engine_snapshot
 from app.orchestrator import manager
 from app.security import resolve_role, token_from_headers
@@ -122,6 +125,82 @@ def _stream_event_visible(kind: str, level: str, *, verbose: bool = False) -> bo
     return False
 
 
+_STREAM_PAYLOAD_KEYS = (
+    "url", "method", "command", "text", "title", "verdict", "round", "tool", "error",
+)
+
+
+def _public_stream_event(e: TaskEvent, *, observer: bool = False) -> dict:
+    payload = e.payload or {}
+    item = {
+        "id": e.id,
+        "agent": e.agent,
+        "kind": e.kind,
+        "level": e.level,
+        "message": "" if observer else e.message,
+        "ts": to_cst_iso(e.ts),
+        "target_id": "" if observer else (payload.get("target_id") or ""),
+    }
+    if not observer:
+        item.update({k: payload.get(k) for k in _STREAM_PAYLOAD_KEYS if k in payload})
+    return item
+
+
+def _stream_event_clause(
+    task_id: str,
+    *,
+    verbose: bool = False,
+    before_id: int | None = None,
+):
+    """活动流 SQL 过滤：噪音剔除 + 重要 kind / warn+error，可选分页游标。"""
+    visible = [
+        TaskEvent.level.in_(("warn", "error")),
+        TaskEvent.kind.in_(sorted(_STREAM_IMPORTANT_KINDS)),
+        TaskEvent.kind == "error",
+    ]
+    if verbose:
+        visible.append(TaskEvent.kind.in_(sorted(_STREAM_TRACE_KINDS)))
+    clauses = [
+        TaskEvent.task_id == task_id,
+        TaskEvent.kind.notin_(sorted(_STREAM_NOISE_KINDS)),
+        or_(*visible),
+    ]
+    if before_id:
+        clauses.append(TaskEvent.id < int(before_id))
+    return and_(*clauses)
+
+
+def _target_payload_clause(task_id: str, target_id: str, *, before_id: int | None = None):
+    clauses = [
+        TaskEvent.task_id == task_id,
+        func.json_extract(TaskEvent.payload, "$.target_id") == target_id,
+    ]
+    if before_id:
+        clauses.append(TaskEvent.id < int(before_id))
+    return and_(*clauses)
+
+
+async def _fetch_stream_events(
+    session: AsyncSession,
+    task_id: str,
+    *,
+    limit: int,
+    before_id: int | None = None,
+    verbose: bool = False,
+    observer: bool = False,
+) -> dict:
+    safe_limit = max(1, min(int(limit or 40), 100))
+    rows = (await session.execute(
+        select(TaskEvent)
+        .where(_stream_event_clause(task_id, verbose=verbose, before_id=before_id))
+        .order_by(TaskEvent.id.desc())
+        .limit(safe_limit + 1)
+    )).scalars().all()
+    has_more = len(rows) > safe_limit
+    items = [_public_stream_event(e, observer=observer) for e in rows[:safe_limit]]
+    return {"items": items, "has_more": has_more, "limit": safe_limit}
+
+
 def _is_observer(request: Request | None) -> bool:
     return bool(request and resolve_role(token_from_headers(request.headers)) == "observer")
 
@@ -143,9 +222,15 @@ def _llm_usage_by_model_with_cost(task_id: str) -> list[dict]:
     if not task_id:
         return []
     models = usage_snapshot_by_model(task_id)
+    return _attach_model_costs(models)
+
+
+def _attach_model_costs(models: list[dict], pricing_config: dict | None = None) -> list[dict]:
+    """给用量行附加 cost（元）。pricing_config 可复用，避免列表接口反复读配置。"""
     if not models:
         return []
-    pricing_config = resolve_pricing()
+    if pricing_config is None:
+        pricing_config = resolve_pricing()
     result = []
     for m in models:
         model = m.get("model", "")
@@ -171,8 +256,13 @@ def _llm_usage_by_model_with_cost(task_id: str) -> list[dict]:
             "cache_miss_tokens": m.get("cache_miss_tokens", 0),
             "requests": m.get("requests", 0),
             "cost": cost,
+            "pricing": pricing,
         })
     return result
+
+
+def _task_cost_from_models(models: list[dict]) -> float:
+    return round(sum(float(m.get("cost") or 0) for m in models), 4)
 
 
 def _model_inherits_global(cfg: dict) -> bool:
@@ -352,11 +442,27 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
     model_config = _public_model_config(t)
     if observer:
         model_config = _observer_model_config()
-    llm_usage = {} if observer else usage_snapshot(t.id, model_config.get("model", ""))
-    llm_cost = 0.0
+    by_model = [] if observer else _llm_usage_by_model_with_cost(t.id)
+    llm_cost = 0.0 if observer else _task_cost_from_models(by_model)
+    # 汇总用量：一次聚合，避免重复 usage_snapshot
+    llm_usage: dict = {}
     if not observer:
-        for m in _llm_usage_by_model_with_cost(t.id):
-            llm_cost += m.get("cost", 0)
+        if by_model:
+            llm_usage = {
+                "prompt_tokens": sum(m.get("prompt_tokens", 0) for m in by_model),
+                "completion_tokens": sum(m.get("completion_tokens", 0) for m in by_model),
+                "total_tokens": sum(m.get("total_tokens", 0) or (
+                    m.get("prompt_tokens", 0) + m.get("completion_tokens", 0)
+                ) for m in by_model),
+                "cache_hit_tokens": sum(m.get("cache_hit_tokens", 0) for m in by_model),
+                "cache_miss_tokens": sum(m.get("cache_miss_tokens", 0) for m in by_model),
+                "requests": sum(m.get("requests", 0) for m in by_model),
+                "model": model_config.get("model", ""),
+            }
+        else:
+            llm_usage = usage_snapshot(
+                t.id, model_config.get("model", ""), persisted=_runtime_parts(t)[0],
+            )
     return TaskResponse(
         id=t.id, name=_observer_task_name(t.name, t.id) if observer else t.name, status=t.status, src_type=t.src_type,
         vuln_types=t.vuln_types or [], target_source=t.target_source,
@@ -371,9 +477,7 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         engine_config={} if observer else {"engine": t.engine or ""},
         enable_worker_fofa_lookup=t.enable_worker_fofa_lookup if hasattr(t, 'enable_worker_fofa_lookup') else True,
         enable_killsweep_fofa_search=t.enable_killsweep_fofa_search if hasattr(t, 'enable_killsweep_fofa_search') else True,
-        llm_usage={} if observer else usage_snapshot(
-            t.id, model_config.get("model", ""), persisted=_runtime_parts(t)[0],
-        ),
+        llm_usage=llm_usage,
         llm_cost=round(llm_cost, 4),
         engine_usage={} if observer else engine_snapshot(t.id, persisted=_runtime_parts(t)[1]),
         created_at=to_cst_iso(t.created_at), updated_at=to_cst_iso(t.updated_at),
@@ -386,7 +490,26 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
     )
 
 
-async def _compute_stats(session: AsyncSession, task_id: str) -> TaskStats:
+# 看板 / get_task 共用的短 TTL 缓存，避免进入看板时 getTask+board 双倍十连查
+_STATS_CACHE: dict[str, tuple[float, TaskStats]] = {}
+_STATS_CACHE_TTL = 2.0
+_STATS_CACHE_LOCK = threading.Lock()
+
+
+async def _compute_stats(
+    session: AsyncSession,
+    task_id: str,
+    *,
+    include_archived_write: bool = True,
+    use_cache: bool = True,
+) -> TaskStats:
+    import time as _time
+    if use_cache:
+        with _STATS_CACHE_LOCK:
+            hit = _STATS_CACHE.get(task_id)
+            if hit and (_time.monotonic() - hit[0]) < _STATS_CACHE_TTL:
+                return hit[1].model_copy()
+
     stats = TaskStats()
     rows = await session.execute(
         select(Target.status, func.count()).where(Target.task_id == task_id).group_by(Target.status)
@@ -467,27 +590,29 @@ async def _compute_stats(session: AsyncSession, task_id: str) -> TaskStats:
             ~Finding.target_id.in_(active_targets_sq),
         )
     )).scalar() or 0
-    stats.archived_write = (await session.execute(
-        select(func.count()).select_from(Finding)
-        .join(Review, Review.finding_id == Finding.id)
-        .where(
-            Finding.task_id == task_id,
-            Review.verdict.in_(["ignored", "deepen"]),
-            Review.user_status == "pending",
-            Finding.status != "superseded",
-            or_(
-                Finding.title.ilike("%删除%"),
-                Finding.title.ilike("%修改%"),
-                Finding.title.ilike("%更新%"),
-                Finding.title.ilike("%delete%"),
-                Finding.title.ilike("%update%"),
-                Finding.target_url.ilike("%delete%"),
-                Finding.target_url.ilike("%update%"),
-                Finding.target_url.ilike("%/save%"),
-                Finding.target_url.ilike("%remove%"),
-            ),
-        )
-    )).scalar() or 0
+    # archived_write 的多 ILIKE 较重，仅完整 stats 需要时计算
+    if include_archived_write:
+        stats.archived_write = (await session.execute(
+            select(func.count()).select_from(Finding)
+            .join(Review, Review.finding_id == Finding.id)
+            .where(
+                Finding.task_id == task_id,
+                Review.verdict.in_(["ignored", "deepen"]),
+                Review.user_status == "pending",
+                Finding.status != "superseded",
+                or_(
+                    Finding.title.ilike("%删除%"),
+                    Finding.title.ilike("%修改%"),
+                    Finding.title.ilike("%更新%"),
+                    Finding.title.ilike("%delete%"),
+                    Finding.title.ilike("%update%"),
+                    Finding.target_url.ilike("%delete%"),
+                    Finding.target_url.ilike("%update%"),
+                    Finding.target_url.ilike("%/save%"),
+                    Finding.target_url.ilike("%remove%"),
+                ),
+            )
+        )).scalar() or 0
 
     stats.hosts_total = (await session.execute(
         select(func.count(func.distinct(Target.host))).where(
@@ -514,7 +639,19 @@ async def _compute_stats(session: AsyncSession, task_id: str) -> TaskStats:
     }
     stats.hosts_checked = len(finished_hosts - open_hosts)
     stats.checked = (stats.done or 0) + (stats.dead or 0)
+
+    if use_cache:
+        with _STATS_CACHE_LOCK:
+            _STATS_CACHE[task_id] = (_time.monotonic(), stats.model_copy())
     return stats
+
+
+def invalidate_stats_cache(task_id: str | None = None) -> None:
+    with _STATS_CACHE_LOCK:
+        if task_id:
+            _STATS_CACHE.pop(task_id, None)
+        else:
+            _STATS_CACHE.clear()
 
 
 @router.post("", response_model=TaskResponse)
@@ -634,14 +771,20 @@ async def probe_task_models(
     )
 
 
-@router.get("", response_model=list[TaskResponse])
+@router.get("", response_model=TaskListResponse)
 async def list_tasks(request: Request, session: AsyncSession = Depends(get_session)):
-    # 置顶任务永远排最前，其次按创建时间倒序（最新在上）。
+    """任务列表瘦接口：卡片字段 + 徽标 + 进度 + 成本，不含密钥/规则/凭据。"""
+    # 只取卡片需要的列，避免拉 JSON 大字段
     rows = await session.execute(
-        select(Task).order_by(Task.is_top.desc(), Task.created_at.desc())
+        select(
+            Task.id, Task.name, Task.status, Task.src_type, Task.target_source,
+            Task.engine, Task.fofa_query, Task.concurrency, Task.deepen_cap,
+            Task.manual_targets, Task.retest_state, Task.is_top,
+            Task.created_at, Task.updated_at,
+        ).order_by(Task.is_top.desc(), Task.created_at.desc())
     )
-    tasks = rows.scalars().all()
-    # 一条聚合查询拿到所有任务的「待人工复审」数（AI accepted 且用户 pending），避免 N+1。
+    task_rows = rows.all()
+
     pending_map: dict[str, int] = {}
     pr_rows = await session.execute(
         select(Review.task_id, func.count())
@@ -650,7 +793,7 @@ async def list_tasks(request: Request, session: AsyncSession = Depends(get_sessi
     )
     for tid, cnt in pr_rows.all():
         pending_map[tid] = cnt
-    # AI 未采纳归档数（ignored/deepen 且用户 pending 且 finding 非 superseded）
+
     archived_map: dict[str, int] = {}
     ar_rows = await session.execute(
         select(Review.task_id, func.count())
@@ -664,27 +807,27 @@ async def list_tasks(request: Request, session: AsyncSession = Depends(get_sessi
     )
     for tid, cnt in ar_rows.all():
         archived_map[tid] = cnt
-    # AI 已作废数（superseded 且用户 pending，按 target_id 去重，排除已有非 superseded 报告的目标）
+
+    # 作废数：SQL NOT EXISTS anti-join，避免全库 pair 进 Python
     discarded_map: dict[str, int] = {}
-    # 先查所有有非 superseded 报告的 (task_id, target_id) 对
-    active_pairs: set[tuple[str, str]] = set()
-    for tid, target_id in (await session.execute(
-        select(Finding.task_id, Finding.target_id)
-        .where(Finding.status != "superseded")
-        .distinct()
-    )).all():
-        active_pairs.add((tid, target_id))
-    # 再查 superseded + pending 的 (task_id, target_id) 对，排除已有非 superseded 报告的
-    for tid, target_id in (await session.execute(
+    ActiveFinding = aliased(Finding)
+    discarded_rows = await session.execute(
         select(Finding.task_id, Finding.target_id)
         .join(Review, Review.finding_id == Finding.id)
-        .where(Finding.status == "superseded", Review.user_status == "pending")
+        .where(
+            Finding.status == "superseded",
+            Review.user_status == "pending",
+            ~select(ActiveFinding.id).where(
+                ActiveFinding.task_id == Finding.task_id,
+                ActiveFinding.target_id == Finding.target_id,
+                ActiveFinding.status != "superseded",
+            ).exists(),
+        )
         .distinct()
-    )).all():
-        if (tid, target_id) in active_pairs:
-            continue
+    )
+    for tid, _target_id in discarded_rows.all():
         discarded_map[tid] = discarded_map.get(tid, 0) + 1
-    # 待注册(pending_input)目标数：与 pending_map/archived_map 同构，一次聚合避免 N+1
+
     pending_input_map: dict[str, int] = {}
     pi_rows = await session.execute(
         select(Target.task_id, func.count())
@@ -693,7 +836,7 @@ async def list_tasks(request: Request, session: AsyncSession = Depends(get_sessi
     )
     for tid, cnt in pi_rows.all():
         pending_input_map[tid] = cnt
-    # 批量查询每个任务的目标状态计数，计算处置进度（避免 N+1）
+
     target_status_map: dict[str, dict[str, int]] = {}
     ts_rows = await session.execute(
         select(Target.task_id, Target.status, func.count())
@@ -701,18 +844,56 @@ async def list_tasks(request: Request, session: AsyncSession = Depends(get_sessi
     )
     for tid, status, cnt in ts_rows.all():
         target_status_map.setdefault(tid, {})[status] = cnt
+
     def _calc_progress(tid: str) -> int:
         sm = target_status_map.get(tid, {})
-        total = sum(sm.get(s, 0) for s in ("queued", "assigned", "scanning", "done", "dead", "skipped", "pending_input"))
+        total = sum(sm.get(s, 0) for s in (
+            "queued", "assigned", "scanning", "done", "dead", "skipped", "pending_input",
+        ))
         resolved = sm.get("done", 0) + sm.get("dead", 0) + sm.get("skipped", 0)
         return round(resolved / total * 100) if total else 0
+
     observer = _is_observer(request)
-    return [_task_to_dto(t, pending_user_review=pending_map.get(t.id, 0),
-                        pending_archived=archived_map.get(t.id, 0),
-                        pending_input=pending_input_map.get(t.id, 0),
-                        observer=observer,
-                        progress_pct=_calc_progress(t.id),
-                        pending_discarded=discarded_map.get(t.id, 0)) for t in tasks]
+    pricing = resolve_pricing() if not observer else {}
+    usage_by_task = {} if observer else usage_by_task_model()
+    cost_by_task: dict[str, float] = {}
+    if not observer:
+        for tid, models in usage_by_task.items():
+            cost_by_task[tid] = _task_cost_from_models(
+                _attach_model_costs(models, pricing)
+            )
+
+    items: list[TaskListItem] = []
+    for r in task_rows:
+        tid = r.id
+        # 站点任务：列表用 fofa_query；若空则回填第一条 manual URL 作展示
+        scope_q = "" if observer else (r.fofa_query or "")
+        if not observer and not scope_q and r.target_source == "site":
+            manuals = r.manual_targets or []
+            if isinstance(manuals, list) and manuals:
+                scope_q = str(manuals[0] or "")
+        items.append(TaskListItem(
+            id=tid,
+            name=_observer_task_name(r.name, tid) if observer else r.name,
+            status=r.status,
+            src_type=r.src_type,
+            target_source=r.target_source,
+            engine=r.engine or "",
+            fofa_query=scope_q,
+            concurrency=r.concurrency,
+            deepen_cap=clamp_deepen_cap(getattr(r, "deepen_cap", None)),
+            llm_cost=0.0 if observer else cost_by_task.get(tid, 0.0),
+            created_at=to_cst_iso(r.created_at) or "",
+            updated_at=to_cst_iso(r.updated_at) or "",
+            pending_user_review=pending_map.get(tid, 0),
+            pending_archived=archived_map.get(tid, 0),
+            pending_discarded=discarded_map.get(tid, 0),
+            pending_input=pending_input_map.get(tid, 0),
+            retest_active=bool(r.retest_state),
+            progress_pct=_calc_progress(tid),
+            is_top=bool(getattr(r, "is_top", False)),
+        ))
+    return TaskListResponse(items=items, total=len(items))
 
 
 class TaskTopRequest(BaseModel):
@@ -1084,9 +1265,15 @@ async def task_board(
     request: Request,
     session: AsyncSession = Depends(get_session),
     verbose: bool = Query(False),
+    include_events: bool = Query(False),
+    light: bool = Query(False, description="轻量轮询：只返回活态 workers，不算 stats"),
 ):
-    """实时看板快照：在跑 worker 活态 + 目标进度 + 最近事件（用于刷新后恢复）。"""
-    from app.db.models import TaskEvent
+    """实时看板快照：在跑 worker 活态 + 目标进度。
+
+    活动流默认不随看板轮询下发（避免每次刷新扫 task_events）。
+    历史事件走 GET /events 分页；需要兼容旧前端时传 include_events=1。
+    light=1：供前端轮询，跳过 _compute_stats / usage / site_collab（stats 已由 getTask 带上）。
+    """
     task = await session.get(Task, task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
@@ -1123,45 +1310,13 @@ async def task_board(
             "started_at": e.get("started_at", ""),
         } for e in live_escalations]
 
-    stats = await _compute_stats(session, task_id)
-
-    # 最近重要事件（倒序，给前端做历史回放；多取一些再过滤噪音）
-    fetch_limit = 500 if verbose else 200
-    event_cap = 120 if verbose else 60
-    ev_rows = (await session.execute(
-        select(TaskEvent).where(TaskEvent.task_id == task_id)
-        .order_by(TaskEvent.id.desc()).limit(fetch_limit)
-    )).scalars().all()
-    events = []
-    for e in ev_rows:
-        if not _stream_event_visible(e.kind or "", e.level or "info", verbose=verbose):
-            continue
-        payload = e.payload or {}
-        events.append({
-            "agent": e.agent, "kind": e.kind, "level": e.level,
-            "message": "" if observer else e.message,
-            "ts": to_cst_iso(e.ts),
-            "target_id": "" if observer else (payload.get("target_id") or ""),
-            **({} if observer else {k: payload.get(k) for k in (
-                "url", "method", "command", "text", "title", "verdict", "round", "tool", "error"
-            ) if k in payload}),
-        })
-        if len(events) >= event_cap:
-            break
-
-    # 单站协作态势（仅 site 任务）：三阶段路线流水线，不含敏感数据，观察者也可看。
-    site_overview = None
-    if task.target_source == "site":
-        site_overview = await _compute_site_collab(session, task_id)
-
-    # 重测状态摘要（供前端展示）
+    # 重测状态摘要（轻量也需要，供前端黄框）
     retest_summary = None
     if task.retest_state:
         rs = task.retest_state
         remaining = len(rs.get("remaining_ids", []))
         total = rs.get("total", 0) or remaining
         unreachable_count = len(rs.get("unreachable_ids", []))
-        # 当有 current_id 时查目标 host
         current_target = None
         cid = rs.get("current_id")
         if cid:
@@ -1181,6 +1336,33 @@ async def task_board(
             "sleep_round": rs.get("sleep_round", 0),
         }
 
+    if light:
+        return {
+            "task_status": task.status,
+            "live_workers": live,
+            "live_escalations": live_escalations,
+            "fofa_config": _observer_fofa_config() if observer else _public_fofa_config(task),
+            "retest_summary": retest_summary,
+            "light": True,
+        }
+
+    stats = await _compute_stats(session, task_id)
+
+    events = []
+    if include_events:
+        page = await _fetch_stream_events(
+            session, task_id,
+            limit=120 if verbose else 60,
+            verbose=verbose,
+            observer=observer,
+        )
+        events = page["items"]
+
+    # 单站协作态势（仅 site 任务）：三阶段路线流水线，不含敏感数据，观察者也可看。
+    site_overview = None
+    if task.target_source == "site":
+        site_overview = await _compute_site_collab(session, task_id)
+
     return {
         "task_status": task.status,
         "live_workers": live,
@@ -1199,6 +1381,28 @@ async def task_board(
         "site_collab": site_overview,
         "retest_summary": retest_summary,
     }
+
+
+@router.get("/{task_id}/events")
+async def task_events(
+    task_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    limit: int = Query(40, ge=1, le=100),
+    before_id: int | None = Query(None, ge=1),
+    verbose: bool = Query(False),
+):
+    """活动流分页：最新在前。before_id 取更早的一页。"""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    return await _fetch_stream_events(
+        session, task_id,
+        limit=limit,
+        before_id=before_id,
+        verbose=verbose,
+        observer=_is_observer(request),
+    )
 
 
 @router.post("/{task_id}/targets/{target_id}/skip")
@@ -1226,7 +1430,8 @@ async def target_trace(
     target_id: str,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    limit: int = Query(200, ge=1, le=500),
+    limit: int = Query(80, ge=1, le=200),
+    before_id: int | None = Query(None, ge=1),
 ):
     """单个目标的 worker 执行轨迹（落库的细粒度事件，刷新后可回看）。"""
     if _is_observer(request):
@@ -1234,30 +1439,19 @@ async def target_trace(
     tgt = await session.get(Target, target_id)
     if not tgt or tgt.task_id != task_id:
         raise HTTPException(404, "目标不存在或不属于该任务")
+    safe_limit = max(1, min(int(limit or 80), 200))
+    clauses = [
+        _target_payload_clause(task_id, target_id, before_id=before_id),
+        TaskEvent.agent == "worker",
+    ]
     rows = (await session.execute(
         select(TaskEvent)
-        .where(TaskEvent.task_id == task_id, TaskEvent.agent == "worker")
+        .where(*clauses)
         .order_by(TaskEvent.id.desc())
-        .limit(min(limit * 3, 1500))
+        .limit(safe_limit + 1)
     )).scalars().all()
-    events = []
-    for e in rows:
-        payload = e.payload or {}
-        if payload.get("target_id") != target_id:
-            continue
-        events.append({
-            "agent": e.agent,
-            "kind": e.kind,
-            "level": e.level,
-            "message": e.message,
-            "ts": to_cst_iso(e.ts),
-            "target_id": target_id,
-            **{k: payload.get(k) for k in (
-                "url", "method", "command", "text", "title", "verdict", "round", "tool", "error"
-            ) if k in payload},
-        })
-        if len(events) >= limit:
-            break
+    has_more = len(rows) > safe_limit
+    events = [_public_stream_event(e) for e in rows[:safe_limit]]
     events.reverse()  # 时间正序，便于 round-by-round 阅读
     return {
         "target_id": target_id,
@@ -1265,6 +1459,8 @@ async def target_trace(
         "url": tgt.url or "",
         "status": tgt.status,
         "events": events,
+        "has_more": has_more,
+        "limit": safe_limit,
     }
 
 
@@ -1278,19 +1474,29 @@ async def cancel_escalation(task_id: str, finding_id: str):
 
 
 @router.get("/{task_id}/targets")
-async def list_targets(task_id: str, request: Request, status: str | None = None, limit: int = 200,
-                       session: AsyncSession = Depends(get_session)):
+async def list_targets(
+    task_id: str,
+    request: Request,
+    status: str | None = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+):
     """目标库查询。status 过滤：
-       不传=全部 / queued+assigned+scanning=在挖 / dead=硬骨头库 / skipped=低分跳过 / done=已完成。"""
+       不传=全部 / alive=在挖 / dead=硬骨头库 / skipped=低分跳过 / done=已完成。
+       支持 limit/offset 分页。"""
     q = select(Target).where(Target.task_id == task_id)
     if status == "alive":
         q = q.where(Target.status.in_(["queued", "assigned", "scanning"]))
     elif status:
         q = q.where(Target.status == status)
-    q = q.order_by(Target.priority_score.desc(), Target.created_at.desc()).limit(min(limit, 1000))
+    q = q.order_by(Target.priority_score.desc(), Target.created_at.desc())
+    q = q.offset(offset).limit(limit + 1)
     rows = (await session.execute(q)).scalars().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
     observer = _is_observer(request)
-    return [{
+    items = [{
         "id": t.id, "url": _observer_url(t.url, t.host) if observer else t.url,
         "host": _observer_host(t.host) if observer else t.host,
         "ip": _observer_ip(t.ip) if observer else t.ip,
@@ -1304,13 +1510,14 @@ async def list_targets(task_id: str, request: Request, status: str | None = None
         "last_error": "" if observer else t.last_error,
         "created_at": to_cst_iso(t.created_at),
     } for t in rows]
+    return {"items": items, "has_more": has_more, "limit": limit, "offset": offset}
 
 
 # ===== Target 明细 =====
 @router.get("/{task_id}/targets/{target_id}/detail")
 async def target_detail(task_id: str, target_id: str, request: Request,
                         session: AsyncSession = Depends(get_session)):
-    """Target 明细：基本信息 + findings 列表 + 该目标最近事件。"""
+    """Target 明细：基本信息 + findings 列表。事件历史走 /events 按需分页。"""
     tgt = await session.get(Target, target_id)
     if not tgt or tgt.task_id != task_id:
         raise HTTPException(404, "目标不存在")
@@ -1324,23 +1531,6 @@ async def target_detail(task_id: str, target_id: str, request: Request,
         .order_by(Finding.created_at.desc())
     )).all()
     findings = [_finding_dict(f, r, compact=True) for f, r in f_rows]
-
-    # 该目标最近事件：从最近 200 条事件中筛 payload 含 target_id 的
-    ev_rows = (await session.execute(
-        select(TaskEvent).where(TaskEvent.task_id == task_id)
-        .order_by(TaskEvent.id.desc()).limit(200)
-    )).scalars().all()
-    events = []
-    for e in ev_rows:
-        payload = e.payload or {}
-        if payload.get("target_id") == target_id:
-            events.append({
-                "agent": e.agent, "kind": e.kind, "level": e.level,
-                "message": "" if observer else e.message,
-                "ts": to_cst_iso(e.ts),
-            })
-            if len(events) >= 30:
-                break
 
     # 已有 findings 计数（用于前端判断是否可重挖）
     finding_count = await session.scalar(
@@ -1371,8 +1561,34 @@ async def target_detail(task_id: str, target_id: str, request: Request,
             "created_at": to_cst_iso(tgt.created_at),
         },
         "findings": findings,
-        "events": events,
+        "events": [],
     }
+
+
+@router.get("/{task_id}/targets/{target_id}/events")
+async def target_events(
+    task_id: str,
+    target_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    limit: int = Query(20, ge=1, le=100),
+    before_id: int | None = Query(None, ge=1),
+):
+    """单个目标的事件历史，按需分页。"""
+    tgt = await session.get(Target, target_id)
+    if not tgt or tgt.task_id != task_id:
+        raise HTTPException(404, "目标不存在")
+    observer = _is_observer(request)
+    safe_limit = max(1, min(int(limit or 20), 100))
+    rows = (await session.execute(
+        select(TaskEvent)
+        .where(_target_payload_clause(task_id, target_id, before_id=before_id))
+        .order_by(TaskEvent.id.desc())
+        .limit(safe_limit + 1)
+    )).scalars().all()
+    has_more = len(rows) > safe_limit
+    items = [_public_stream_event(e, observer=observer) for e in rows[:safe_limit]]
+    return {"items": items, "has_more": has_more, "limit": safe_limit}
 
 
 # ===== 单 Target 重挖 =====
@@ -2001,19 +2217,12 @@ async def target_assistant_stream(task_id: str, target_id: str, req: TargetAssis
 
     # 获取目标事件历史作为上下文
     ev_rows = (await session.execute(
-        select(TaskEvent).where(TaskEvent.task_id == task_id)
-        .order_by(TaskEvent.id.desc()).limit(50)
+        select(TaskEvent)
+        .where(_target_payload_clause(task_id, target_id))
+        .order_by(TaskEvent.id.desc())
+        .limit(15)
     )).scalars().all()
-    events = []
-    for e in ev_rows:
-        payload = e.payload or {}
-        if payload.get("target_id") == target_id:
-            events.append({
-                "agent": e.agent, "kind": e.kind, "level": e.level,
-                "message": e.message, "ts": to_cst_iso(e.ts),
-            })
-            if len(events) >= 15:
-                break
+    events = [_public_stream_event(e) for e in ev_rows]
 
     persisted = _sanitize_assistant_messages(tgt.assistant_messages)
     llm_req = TargetAssistantRequest(message=msg, history=persisted[-_TARGET_ASSISTANT_HISTORY_TURNS:])

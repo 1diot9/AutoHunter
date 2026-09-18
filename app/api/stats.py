@@ -1,6 +1,6 @@
 """日历统计 API：按日期聚合产出 + Token 成本。
 
-产出统计从 findings/reviews 表按 CST 日期聚合；
+产出统计从 findings/reviews 表按 CST 日期对应的 UTC 半开区间过滤（可走 created_at 索引）；
 Token 成本从 token_usage_daily 表读取，按 pricing 配置实时计算。
 """
 from __future__ import annotations
@@ -8,11 +8,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Finding, Killsweep, Review
 from app.db.session import engine, get_session
+from app.llm.usage import apply_cache_reconcile
 from app.settings_service import resolve_pricing
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
@@ -20,10 +21,38 @@ router = APIRouter(prefix="/api/stats", tags=["stats"])
 CST = timezone(timedelta(hours=8))
 
 
-def _cst_date_from_utc(col) -> str:
-    """SQL: UTC naive 时间列 -> CST 日期字符串。"""
-    # SQLite: datetime(col, '+8 hours') 把 UTC 加 8 小时得 CST，再 DATE() 取日期
-    return func.date(func.datetime(col, "+8 hours"))
+def _cst_day_utc_range(date_str: str) -> tuple[datetime, datetime]:
+    """CST 日历日 YYYY-MM-DD → UTC naive 半开区间 [start, end)。
+
+    DB 存 UTC naive；CST 00:00 = 前一天 UTC 16:00。
+    """
+    y, m, d = map(int, date_str.split("-"))
+    start_cst = datetime(y, m, d, tzinfo=CST)
+    end_cst = start_cst + timedelta(days=1)
+    start_utc = start_cst.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = end_cst.astimezone(timezone.utc).replace(tzinfo=None)
+    return start_utc, end_utc
+
+
+def _month_utc_range(month: str) -> tuple[datetime, datetime] | None:
+    """YYYY-MM → 该月 CST 起止对应的 UTC naive 半开区间。"""
+    try:
+        year, mon = map(int, month.split("-"))
+        start_cst = datetime(year, mon, 1, tzinfo=CST)
+        if mon == 12:
+            end_cst = datetime(year + 1, 1, 1, tzinfo=CST)
+        else:
+            end_cst = datetime(year, mon + 1, 1, tzinfo=CST)
+    except (ValueError, IndexError):
+        return None
+    return (
+        start_cst.astimezone(timezone.utc).replace(tzinfo=None),
+        end_cst.astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
+
+def _in_utc_range(col, start: datetime, end: datetime):
+    return and_(col >= start, col < end)
 
 
 def _calc_cost(prompt_tokens: int, completion_tokens: int,
@@ -32,7 +61,6 @@ def _calc_cost(prompt_tokens: int, completion_tokens: int,
     price_in = float(pricing.get("input", 0) or 0)
     price_out = float(pricing.get("output", 0) or 0)
     price_cache = float(pricing.get("cache_hit", 0) or 0)
-    # 缓存命中部分按缓存价计费，非缓存输入按输入价
     non_cache_input = max(0, prompt_tokens - cache_hit_tokens)
     cost = (
         non_cache_input * price_in / 1_000_000
@@ -47,13 +75,13 @@ async def pool_stats():
     """数据库连接池实时状态（不需要 DB session，不消耗连接）。"""
     pool = engine.pool
     return {
-        "pool_size": pool.size(),          # 基础容量
-        "max_overflow": pool._max_overflow,  # 最大溢出
-        "checkedout": pool.checkedout(),   # 当前在用连接数
-        "checkedin": pool.checkedin(),     # 空闲可用连接数
-        "overflow": pool.overflow(),       # 当前溢出连接数
-        "total_capacity": pool.size() + pool._max_overflow,  # 总上限
-        "timeout": pool._timeout,          # 获取连接超时(秒)
+        "pool_size": pool.size(),
+        "max_overflow": pool._max_overflow,
+        "checkedout": pool.checkedout(),
+        "checkedin": pool.checkedin(),
+        "overflow": pool.overflow(),
+        "total_capacity": pool.size() + pool._max_overflow,
+        "timeout": pool._timeout,
     }
 
 
@@ -66,78 +94,61 @@ async def daily_stats(
     if not date:
         date = datetime.now(CST).strftime("%Y-%m-%d")
 
-    # 1) 产出统计：findings 按 CST 日期聚合
-    # findings.created_at 存 UTC naive，用 SQL 转换
-    cst_date_expr = _cst_date_from_utc(Finding.created_at)
+    start_utc, end_utc = _cst_day_utc_range(date)
+    day_f = _in_utc_range(Finding.created_at, start_utc, end_utc)
+    day_ks = _in_utc_range(Killsweep.created_at, start_utc, end_utc)
 
-    # 当日 findings 总数
-    findings_total_q = select(func.count(Finding.id)).where(cst_date_expr == date)
-    findings_total = (await session.execute(findings_total_q)).scalar() or 0
-
-    # 当日 findings 按 status 分布
+    # findings：总数 + status 分布一次 GROUP BY
     status_q = (
         select(Finding.status, func.count(Finding.id))
-        .where(cst_date_expr == date)
+        .where(day_f)
         .group_by(Finding.status)
     )
-    status_counts = {(row[0]): row[1] for row in (await session.execute(status_q)).all()}
+    status_counts = {row[0]: row[1] for row in (await session.execute(status_q)).all()}
+    findings_total = sum(status_counts.values())
     pending_review = status_counts.get("pending_review", 0)
     reviewed = status_counts.get("reviewed", 0)
 
-    # 当日 reviews 按 verdict 分布（需 join findings 取 created_at 日期）
-    review_verdict_q = (
-        select(Review.verdict, func.count(Review.id))
+    # reviews：verdict + user_status + submitted 一次 GROUP BY（join findings 用区间）
+    review_agg_q = (
+        select(Review.verdict, Review.user_status, Review.submitted, func.count(Review.id))
         .join(Finding, Review.finding_id == Finding.id)
-        .where(_cst_date_from_utc(Finding.created_at) == date)
-        .group_by(Review.verdict)
+        .where(day_f)
+        .group_by(Review.verdict, Review.user_status, Review.submitted)
     )
-    verdict_counts = {row[0]: row[1] for row in (await session.execute(review_verdict_q)).all()}
+    verdict_counts: dict[str, int] = {}
+    user_status_counts: dict[str, int] = {}
+    submitted_count = 0
+    for verdict, user_status, submitted, cnt in (await session.execute(review_agg_q)).all():
+        if verdict:
+            verdict_counts[verdict] = verdict_counts.get(verdict, 0) + cnt
+        if verdict == "accepted" and user_status:
+            user_status_counts[user_status] = user_status_counts.get(user_status, 0) + cnt
+        if verdict == "accepted" and submitted:
+            submitted_count += cnt
 
-    # 当日 reviews 按 user_status 分布（仅 accepted 的才进用户复审流程）
-    user_status_q = (
-        select(Review.user_status, func.count(Review.id))
-        .join(Finding, Review.finding_id == Finding.id)
-        .where(_cst_date_from_utc(Finding.created_at) == date)
-        .where(Review.verdict == "accepted")
-        .group_by(Review.user_status)
-    )
-    user_status_counts = {row[0]: row[1] for row in (await session.execute(user_status_q)).all()}
-
-    # 当日已提交数（仅 accepted 的）
-    submitted_q = (
-        select(func.count(Review.id))
-        .join(Finding, Review.finding_id == Finding.id)
-        .where(_cst_date_from_utc(Finding.created_at) == date)
-        .where(Review.verdict == "accepted")
-        .where(Review.submitted == True)  # noqa: E712
-    )
-    submitted_count = (await session.execute(submitted_q)).scalar() or 0
-
-    # 当日通杀列（is_killsweep=True）
     ks_q = (
         select(func.count(Killsweep.id))
-        .where(_cst_date_from_utc(Killsweep.created_at) == date)
+        .where(day_ks)
         .where(Killsweep.is_killsweep == True)  # noqa: E712
     )
     killsweep_count = (await session.execute(ks_q)).scalar() or 0
 
-    # 当日 AI 未采纳（verdict in ignored/deepen + user_status=pending，排除 superseded）
     archived_q = (
         select(func.count(Finding.id))
         .join(Review, Review.finding_id == Finding.id)
-        .where(_cst_date_from_utc(Finding.created_at) == date)
+        .where(day_f)
         .where(Review.verdict.in_(["ignored", "deepen"]))
         .where(Review.user_status == "pending")
         .where(Finding.status != "superseded")
     )
     archived_count = (await session.execute(archived_q)).scalar() or 0
 
-    # 各分类对应的 task_id 集合：供前端点击日历统计卡片后筛选任务列表
-    # user_reviews 三状态共用一次查询，按 user_status 分桶收集 distinct task_id
+    # task_ids：accepted 三状态一次扫
     user_status_tasks_q = (
         select(Review.user_status, Review.task_id)
         .join(Finding, Review.finding_id == Finding.id)
-        .where(_cst_date_from_utc(Finding.created_at) == date)
+        .where(day_f)
         .where(Review.verdict == "accepted")
     )
     user_status_task_ids = {"pending": set(), "passed": set(), "rejected": set()}
@@ -146,31 +157,28 @@ async def daily_stats(
         if status in user_status_task_ids and tid:
             user_status_task_ids[status].add(tid)
 
-    # 已提交对应的 task_id 集合
     submitted_tasks_q = (
         select(Review.task_id)
         .join(Finding, Review.finding_id == Finding.id)
-        .where(_cst_date_from_utc(Finding.created_at) == date)
+        .where(day_f)
         .where(Review.verdict == "accepted")
         .where(Review.submitted == True)  # noqa: E712
         .distinct()
     )
     submitted_task_ids = [r[0] for r in (await session.execute(submitted_tasks_q)).all() if r[0]]
 
-    # 通杀列对应的 task_id 集合
     ks_tasks_q = (
         select(Killsweep.task_id)
-        .where(_cst_date_from_utc(Killsweep.created_at) == date)
+        .where(day_ks)
         .where(Killsweep.is_killsweep == True)  # noqa: E712
         .distinct()
     )
     killsweep_task_ids = [r[0] for r in (await session.execute(ks_tasks_q)).all() if r[0]]
 
-    # AI 未采纳对应的 task_id 集合
     archived_tasks_q = (
         select(Finding.task_id)
         .join(Review, Review.finding_id == Finding.id)
-        .where(_cst_date_from_utc(Finding.created_at) == date)
+        .where(day_f)
         .where(Review.verdict.in_(["ignored", "deepen"]))
         .where(Review.user_status == "pending")
         .where(Finding.status != "superseded")
@@ -178,7 +186,6 @@ async def daily_stats(
     )
     archived_task_ids = [r[0] for r in (await session.execute(archived_tasks_q)).all() if r[0]]
 
-    # 2) Token 成本：从 token_usage_daily 表读取，按模型合并（跨任务聚合）
     token_q = text(
         "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cache_hit_tokens), "
         "SUM(cache_miss_tokens), SUM(requests) "
@@ -195,6 +202,16 @@ async def daily_stats(
     total_requests = 0
     for row in token_rows:
         model, pt, ct, cht, cmt, req = row
+        usage_row = apply_cache_reconcile({
+            "prompt_tokens": pt or 0,
+            "completion_tokens": ct or 0,
+            "cache_hit_tokens": cht or 0,
+            "cache_miss_tokens": cmt or 0,
+        })
+        pt = usage_row["prompt_tokens"]
+        ct = usage_row["completion_tokens"]
+        cht = usage_row["cache_hit_tokens"]
+        cmt = usage_row["cache_miss_tokens"]
         pricing = pricing_config.get(model, {}) if model else {}
         cost = _calc_cost(pt, ct, cht, pricing)
         by_model.append({
@@ -233,7 +250,6 @@ async def daily_stats(
         },
         "killsweep": killsweep_count,
         "archived": archived_count,
-        # 各分类对应的 task_id 列表：前端点击日历统计卡片后按 task_id 过滤任务列表
         "task_ids": {
             "pending": sorted(user_status_task_ids.get("pending", set())),
             "passed": sorted(user_status_task_ids.get("passed", set())),
@@ -262,58 +278,60 @@ async def daily_overview(
     if not month:
         month = datetime.now(CST).strftime("%Y-%m")
 
-    # 解析月份范围
-    try:
-        year, mon = map(int, month.split("-"))
-        month_start = datetime(year, mon, 1, tzinfo=CST)
-        if mon == 12:
-            month_end = datetime(year + 1, 1, 1, tzinfo=CST)
-        else:
-            month_end = datetime(year, mon + 1, 1, tzinfo=CST)
-    except (ValueError, IndexError):
+    rng = _month_utc_range(month)
+    if rng is None:
         return {"month": month, "days": []}
+    start_utc, end_utc = rng
+    month_f = _in_utc_range(Finding.created_at, start_utc, end_utc)
 
-    # 1) 产出统计：findings 按 CST 日期聚合
-    cst_date_expr = _cst_date_from_utc(Finding.created_at)
+    # SQLite：按 CST 日期分组 — 用 datetime(+8h) 仅用于 GROUP BY 标签，过滤已走索引区间
+    cst_day = func.date(func.datetime(Finding.created_at, "+8 hours"))
+
     findings_q = (
-        select(cst_date_expr.label("d"), func.count(Finding.id))
-        .where(cst_date_expr >= month_start.strftime("%Y-%m-%d"))
-        .where(cst_date_expr < month_end.strftime("%Y-%m-%d"))
-        .group_by(cst_date_expr)
+        select(cst_day.label("d"), func.count(Finding.id))
+        .where(month_f)
+        .group_by(cst_day)
     )
     findings_by_day = {row[0]: row[1] for row in (await session.execute(findings_q)).all()}
 
-    # reviews accepted/submitted 按 CST 日期
     accepted_q = (
-        select(cst_date_expr.label("d"), func.count(Review.id))
+        select(cst_day.label("d"), func.count(Review.id))
         .join(Finding, Review.finding_id == Finding.id)
         .where(Review.verdict == "accepted")
-        .where(cst_date_expr >= month_start.strftime("%Y-%m-%d"))
-        .where(cst_date_expr < month_end.strftime("%Y-%m-%d"))
-        .group_by(cst_date_expr)
+        .where(month_f)
+        .group_by(cst_day)
     )
     accepted_by_day = {row[0]: row[1] for row in (await session.execute(accepted_q)).all()}
 
     submitted_q = (
-        select(cst_date_expr.label("d"), func.count(Review.id))
+        select(cst_day.label("d"), func.count(Review.id))
         .join(Finding, Review.finding_id == Finding.id)
         .where(Review.submitted == True)  # noqa: E712
-        .where(cst_date_expr >= month_start.strftime("%Y-%m-%d"))
-        .where(cst_date_expr < month_end.strftime("%Y-%m-%d"))
-        .group_by(cst_date_expr)
+        .where(month_f)
+        .group_by(cst_day)
     )
     submitted_by_day = {row[0]: row[1] for row in (await session.execute(submitted_q)).all()}
 
-    # 2) Token 成本：按日期+模型聚合，用 pricing 实时计算
     pricing_config = resolve_pricing()
+    # 月范围字符串：CST 月起止
+    try:
+        year, mon = map(int, month.split("-"))
+        month_start = f"{year:04d}-{mon:02d}-01"
+        if mon == 12:
+            month_end = f"{year + 1:04d}-01-01"
+        else:
+            month_end = f"{year:04d}-{mon + 1:02d}-01"
+    except (ValueError, IndexError):
+        return {"month": month, "days": []}
+
     token_model_q = text(
         "SELECT date, model, prompt_tokens, completion_tokens, cache_hit_tokens "
         "FROM token_usage_daily "
         "WHERE date >= :start AND date < :end"
     )
     token_model_rows = (await session.execute(token_model_q, {
-        "start": month_start.strftime("%Y-%m-%d"),
-        "end": month_end.strftime("%Y-%m-%d"),
+        "start": month_start,
+        "end": month_end,
     })).all()
 
     cost_by_day: dict[str, float] = {}
@@ -325,7 +343,6 @@ async def daily_overview(
         cost_by_day[d] = round(cost_by_day.get(d, 0) + cost, 4)
         requests_by_day[d] = requests_by_day.get(d, 0) + 1
 
-    # 合并所有日期
     all_dates = set(findings_by_day.keys()) | set(accepted_by_day.keys()) | set(submitted_by_day.keys()) | set(cost_by_day.keys())
     days = []
     for d in sorted(all_dates):
