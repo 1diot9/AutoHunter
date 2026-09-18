@@ -15,16 +15,18 @@ Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
-engine = create_async_engine(
-    DATABASE_URL, echo=False, future=True,
-    # 默认 QueuePool 只有 pool_size=5 + max_overflow=10 = 15 条连接。
-    # orchestrator 高并发时（12 worker × 心跳/落库/情报 + 4 reviewer +
-    # 3 killsweep + 2 escalate + API/WebSocket），同时存活的 session 远超 15，
-    # 导致连接获取超时。SQLite 是文件级 DB，连接创建开销极低，可以放心调大。
-    pool_size=30,
-    max_overflow=60,
-    pool_timeout=60,
-)
+# aiosqlite 默认 NullPool，不接受 pool_size/max_overflow；用 StaticPool 复用同连接，
+# 或省略池参数。SQLite 文件级锁仍是瓶颈，连接数本身开销极低。
+try:
+    engine = create_async_engine(
+        DATABASE_URL, echo=False, future=True,
+        pool_size=30,
+        max_overflow=60,
+        pool_timeout=60,
+    )
+except TypeError:
+    # SQLAlchemy 2.0+ 对 sqlite+aiosqlite 强制 NullPool 时会拒收 pool_* 参数
+    engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # 每条物理连接建立时统一设置 PRAGMA（init_db 的一次性 PRAGMA 只作用于建库那条连接，
@@ -170,6 +172,13 @@ _SECONDARY_INDEXES = [
     # 看板历史回放：WHERE task_id=? ORDER BY id DESC LIMIT N。
     ("ix_task_events_task_id_id",
      "CREATE INDEX IF NOT EXISTS ix_task_events_task_id_id ON task_events(task_id, id)"),
+    # 活动流按 kind 过滤分页：WHERE task_id=? AND kind IN (...) ORDER BY id DESC。
+    ("ix_task_events_task_kind_id",
+     "CREATE INDEX IF NOT EXISTS ix_task_events_task_kind_id ON task_events(task_id, kind, id)"),
+    # 单目标轨迹 / 明细：json_extract(payload, '$.target_id')。
+    ("ix_task_events_task_payload_target_id",
+     "CREATE INDEX IF NOT EXISTS ix_task_events_task_payload_target_id "
+     "ON task_events(task_id, json_extract(payload, '$.target_id'), id)"),
     # 人工知识库：按 enabled+doc_type 过滤 + hit_count 排序
     ("ix_knowledge_enabled_type",
      "CREATE INDEX IF NOT EXISTS ix_knowledge_enabled_type ON knowledge_docs(enabled, doc_type)"),
@@ -181,6 +190,13 @@ _SECONDARY_INDEXES = [
      "CREATE INDEX IF NOT EXISTS ix_targets_is_top_updated ON targets(is_top, updated_at)"),
     ("ix_tasks_is_top_created",
      "CREATE INDEX IF NOT EXISTS ix_tasks_is_top_created ON tasks(is_top, created_at)"),
+    # 日历 / 日统计按 created_at 区间过滤
+    ("ix_findings_created_at",
+     "CREATE INDEX IF NOT EXISTS ix_findings_created_at ON findings(created_at)"),
+    ("ix_killsweeps_created_at",
+     "CREATE INDEX IF NOT EXISTS ix_killsweeps_created_at ON killsweeps(created_at)"),
+    ("ix_reviews_created_via_finding",
+     "CREATE INDEX IF NOT EXISTS ix_reviews_finding_id ON reviews(finding_id)"),
 ]
 
 # 废弃的残留列：老 schema 里是 NOT NULL 无默认值，新代码不再写入会导致 INSERT 失败。

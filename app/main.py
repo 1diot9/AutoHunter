@@ -33,6 +33,7 @@ from app.agent_runtime import (
     REVIEW_MAX_CONCURRENCY,
     WORKER_MAX_CONCURRENCY,
 )
+from app.heartbeat import start_heartbeat, stop_heartbeat
 from app.api import backup, findings, intel, knowledge, runtime_logs, settings, stats, stream, tasks, update, vulns
 from app.api import assets as assets_api
 from app.backup import run_periodic_backup
@@ -44,6 +45,7 @@ from app.security import SECURITY_HEADERS, auth_enabled, protected_path, request
 from app.waf import WAF_BLOCK_MODE, inspect_request, waf_headers
 from app.workdir_cleanup import run_periodic_cleanup
 from app.memory import run_periodic_memory_reclaim
+from app.maintenance.cleanup import run_periodic_event_prune
 
 # Vite 构建产物目录（多阶段构建拷贝到此）
 WEB_DIR = Path(__file__).resolve().parent.parent / "web" / "dist"
@@ -114,6 +116,8 @@ async def _loop_lag_monitor() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 心跳线程先于 DB 初始化启动：init_db 较慢时看门狗仍能看到进程活着。
+    start_heartbeat()
     _install_diagnostics(asyncio.get_running_loop())
     default_executor = ThreadPoolExecutor(
         max_workers=DEFAULT_THREAD_POOL_SIZE,
@@ -124,6 +128,7 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(run_periodic_cleanup())
     memory_task = asyncio.create_task(run_periodic_memory_reclaim())
     backup_task = asyncio.create_task(run_periodic_backup())
+    event_prune_task = asyncio.create_task(run_periodic_event_prune())
     await init_db()
     await init_settings_cache()
     DIAG_LOG.info(
@@ -155,13 +160,15 @@ async def lifespan(app: FastAPI):
         cleanup_task.cancel()
         memory_task.cancel()
         backup_task.cancel()
-        for t in (lag_monitor, cleanup_task, memory_task, backup_task):
+        event_prune_task.cancel()
+        for t in (lag_monitor, cleanup_task, memory_task, backup_task, event_prune_task):
             try:
                 await t
             except asyncio.CancelledError:
                 pass
         await manager.shutdown()
         default_executor.shutdown(wait=False, cancel_futures=True)
+        stop_heartbeat()
 
 
 app = FastAPI(title="AutoHunter", version="0.1", lifespan=lifespan)

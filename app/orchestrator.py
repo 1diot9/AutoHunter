@@ -17,7 +17,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, urlunparse
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -128,7 +128,7 @@ _WORKER_TRACE_KINDS = frozenset({
     "tool_exception", "tool_js_analyze", "tool_decode", "tool_waf_advice",
     "tool_fofa_lookup", "tool_session_set",
     "tool_autopoc_search", "tool_autopoc_read", "tool_autopoc_run",
-    "llm_round_start", "llm_error", "llm_soft_retry", "llm_interrupt",
+    "llm_error", "llm_soft_retry", "llm_interrupt",
     "finding_submitted", "finding_duplicate", "finding_invalid",
     "auth_status", "finish_blocked",
 })
@@ -489,6 +489,12 @@ class TaskRunner:
         self._llm_provider_retry_after: dict[str, float] = {}
         # 全池不可用是任务级条件；冷却期间不要让其它 queued 目标逐个启动再回队。
         self._llm_pool_retry_after: float = 0
+        # 心跳：内存标记 + 批量 flush，避免每 worker 每 30s 单独 commit
+        self._heartbeat_marks: dict[str, datetime] = {}
+        self._heartbeat_flusher: asyncio.Task | None = None
+        # 事件落库缓冲：WS 立即推送，DB 批量 commit
+        self._event_buffer: list[TaskEvent] = []
+        self._event_flush_task: asyncio.Task | None = None
 
     def live_workers(self) -> list[dict]:
         return list(self._live.values())
@@ -606,16 +612,67 @@ class TaskRunner:
             msg = str(safe.get("error") or safe.get("message") or kind)[:300]
         else:
             msg = str(safe.get("message") or kind)[:200]
+        self._enqueue_event(TaskEvent(
+            task_id=task_id, agent="worker", kind=kind, level="info",
+            message=msg,
+            payload={"target_id": target_id, **safe},
+        ))
+
+    def _enqueue_event(self, row: TaskEvent) -> None:
+        self._event_buffer.append(row)
+        if len(self._event_buffer) >= 24:
+            self._schedule_event_flush(immediate=True)
+        else:
+            self._schedule_event_flush(immediate=False)
+
+    def _schedule_event_flush(self, *, immediate: bool = False) -> None:
+        t = self._event_flush_task
+        if t and not t.done():
+            if immediate:
+                # 已有定时 flush，满批时再起一个立即 flush
+                try:
+                    asyncio.get_running_loop().create_task(self._flush_event_buffer())
+                except RuntimeError:
+                    pass
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _delayed():
+            if not immediate:
+                await asyncio.sleep(0.15)
+            await self._flush_event_buffer()
+
+        self._event_flush_task = loop.create_task(_delayed())
+
+    async def _flush_event_buffer(self) -> None:
+        if not self._event_buffer:
+            return
+        batch = self._event_buffer[:]
+        self._event_buffer.clear()
         try:
             async with SessionLocal() as session:
-                session.add(TaskEvent(
-                    task_id=task_id, agent="worker", kind=kind, level="info",
-                    message=msg,
-                    payload={"target_id": target_id, **safe},
-                ))
+                session.add_all(batch)
                 await session.commit()
         except Exception:
-            logger.debug("persist worker trace failed task=%s kind=%s", task_id[:8], kind, exc_info=True)
+            logger.debug(
+                "TaskRunner[%s] event buffer flush failed n=%d",
+                self.task_id, len(batch), exc_info=True,
+            )
+            # 失败时尽量不丢：塞回缓冲前端，下轮再试
+            self._event_buffer[0:0] = batch
+
+    async def _log(self, session: AsyncSession, agent: str, kind: str, message: str, level: str = "info", **payload):
+        # WS 立刻推送；DB 入队批量落库，避免每条事件一次 commit
+        await bus.publish(self.task_id, {"agent": agent, "kind": kind, "level": level,
+                                         "message": message, "ts": _now_iso(), **payload})
+        self._enqueue_event(TaskEvent(
+            task_id=self.task_id, agent=agent, kind=kind, level=level,
+            message=message, payload=payload,
+        ))
+        _ = session  # 保留签名兼容现有调用点
 
     def diagnostic_snapshot(self) -> dict:
         return {
@@ -644,14 +701,6 @@ class TaskRunner:
                 for item in list(self._live.values())[:10]
             ],
         }
-
-    async def _log(self, session: AsyncSession, agent: str, kind: str, message: str, level: str = "info", **payload):
-        session.add(TaskEvent(task_id=self.task_id, agent=agent, kind=kind, level=level,
-                              message=message, payload=payload))
-        await session.commit()
-        # ts 统一用带 UTC 标识的 ISO 字符串（…+00:00），前端 new Date 才能正确转本地时区。
-        await bus.publish(self.task_id, {"agent": agent, "kind": kind, "level": level,
-                                         "message": message, "ts": _now_iso(), **payload})
 
     @staticmethod
     def _llm_payload(llm: LLMClient, model_role: str) -> dict:
@@ -2070,6 +2119,13 @@ class TaskRunner:
         self._cancel_review_tasks(reason)
         self._cancel_killsweep_tasks(reason)
         self._cancel_escalation_tasks(reason)
+        await self._flush_event_buffer()
+        await self._flush_heartbeats()
+        if self._heartbeat_flusher and not self._heartbeat_flusher.done():
+            self._heartbeat_flusher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._heartbeat_flusher
+        self._heartbeat_flusher = None
 
     async def _cancel_active_workers(self, reason: str) -> None:
         target_ids = list(self._active_workers.keys())
@@ -3122,26 +3178,65 @@ class TaskRunner:
                             target_id[:8], exc_info=True)
 
     async def _heartbeat_target(self, target_id: str) -> None:
+        """内存标记心跳；由 flusher 批量 UPDATE，避免每 worker 单独 commit。"""
+        self._ensure_heartbeat_flusher()
         timeout_ref = WORKER_IDLE_TIMEOUT if WORKER_IDLE_TIMEOUT > 0 else WORKER_WALL_TIMEOUT
         interval = max(5.0, min(TARGET_HEARTBEAT_INTERVAL, max(5.0, timeout_ref / 4)))
         while True:
             await asyncio.sleep(interval)
-            # 关键：心跳循环绝不能因一次瞬时 DB 异常而整条死掉——否则该 target
-            # 停止续心跳，会被 _reclaim_stale 误判成幽灵回收/或在 finally 里把一次
-            # 本已成功的 worker 结果连累成 error。单次失败就跳过，下一拍再试。
-            try:
-                async with SessionLocal() as session:
-                    tgt = await session.get(Target, target_id)
-                    if not tgt or tgt.status not in ("assigned", "scanning"):
-                        return
-                    tgt.heartbeat_at = _now()
-                    await session.commit()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.debug("TaskRunner[%s] heartbeat tick failed target=%s (will retry)",
-                             self.task_id, target_id[:8], exc_info=True)
-                continue
+            if target_id not in self._active_workers:
+                self._heartbeat_marks.pop(target_id, None)
+                return
+            self._heartbeat_marks[target_id] = _now()
+
+    def _ensure_heartbeat_flusher(self) -> None:
+        t = self._heartbeat_flusher
+        if t and not t.done():
+            return
+        try:
+            self._heartbeat_flusher = asyncio.get_running_loop().create_task(
+                self._flush_heartbeats_loop()
+            )
+        except RuntimeError:
+            pass
+
+    async def _flush_heartbeats_loop(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(TARGET_HEARTBEAT_INTERVAL)
+            await self._flush_heartbeats()
+        await self._flush_heartbeats()
+
+    async def _flush_heartbeats(self) -> None:
+        if not self._heartbeat_marks:
+            return
+        snapshot = dict(self._heartbeat_marks)
+        self._heartbeat_marks.clear()
+        ids = [tid for tid in snapshot if tid in self._active_workers]
+        if not ids:
+            return
+        ts = _now()
+        try:
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(Target)
+                    .where(
+                        Target.id.in_(ids),
+                        Target.status.in_(("assigned", "scanning")),
+                    )
+                    .values(heartbeat_at=ts)
+                )
+                await session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "TaskRunner[%s] heartbeat flush failed n=%d",
+                self.task_id, len(ids), exc_info=True,
+            )
+            # 失败时把仍活跃的 id 塞回，下轮再刷
+            for tid in ids:
+                if tid in self._active_workers:
+                    self._heartbeat_marks.setdefault(tid, ts)
 
     async def _harvest_intel(self, session, task_id: str, tgt, verdict: str,
                              findings: list, reported_intel: list | None = None) -> None:

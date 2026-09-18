@@ -145,7 +145,11 @@ def get_workdir_stats() -> dict:
         if sized < _STATS_SIZE_DIRS:
             total_size += _dir_size(entry)
             sized += 1
-        mtime = _activity_mtime(entry)
+        # 统计页用目录自身 mtime，避免每个子目录 rglob 扫盘
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            mtime = 0.0
         if mtime < oldest_mtime:
             oldest_mtime = mtime
             oldest_name = entry.name
