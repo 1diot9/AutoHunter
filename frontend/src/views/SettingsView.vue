@@ -1456,8 +1456,15 @@ async function runCleanup() {
             <div class="settings-grid">
               <label class="full">API Key
                 <input v-model="engineForm[eng.name].key" type="password"
-                  :placeholder="engineForm[eng.name]?.key_set ? '已配置，留空不修改' : `${eng.display_name} Key`" />
+                  :placeholder="engineForm[eng.name]?.key_set ? '已配置，留空不修改' : (
+                    eng.name === 'censys' ? 'Platform Personal Access Token，或旧版 API_ID:SECRET' :
+                    eng.name === 'quake' ? 'X-QuakeToken（个人中心 API Token）' :
+                    `${eng.display_name} Key`
+                  )" />
               </label>
+              <p v-if="eng.name === 'censys'" class="field-hint full">
+                新账号用 Censys Platform 的 Personal Access Token；仅旧 Legacy Search 才填 <code>API_ID:SECRET</code>。
+              </p>
               <label class="full">API 端点（可选）
                 <input v-model="engineForm[eng.name].base_url"
                   :placeholder="eng.name === 'fofa' ? 'https://fofa.info' : '留空用官方默认'" />
@@ -1495,36 +1502,6 @@ async function runCleanup() {
             </label>
             <p class="field-hint full">分页与搜集方式对当前选用的测绘引擎生效。</p>
           </div>
-
-          <div class="engine-keys">
-            <h4 class="engine-keys-title">各引擎 API Key</h4>
-            <p class="field-hint">按需配置；未配 Key 的引擎在任务里选中时无法搜资产。密钥留空表示不修改。</p>
-            <div v-for="eng in form.available_engines" :key="eng.name" class="engine-key-card">
-              <div class="engine-key-head">
-                <strong>{{ form.engines[eng.name]?.display_name || eng.display_name || eng.name }}</strong>
-                <i :class="{ on: form.engines[eng.name]?.key_set }">
-                  {{ form.engines[eng.name]?.key_set ? "已配置" : "未配置" }}
-                </i>
-              </div>
-              <div class="settings-grid" v-if="form.engines[eng.name]">
-                <label class="full">API Key
-                  <input v-model="form.engines[eng.name].key" type="password"
-                    :placeholder="form.engines[eng.name]?.key_set ? '已配置，留空不修改' : (
-                      eng.name === 'censys' ? 'Platform Personal Access Token，或旧版 API_ID:SECRET' :
-                      eng.name === 'quake' ? 'X-QuakeToken（个人中心 API Token）' :
-                      ((eng.display_name || eng.name) + ' API Key')
-                    )" />
-                </label>
-                <p v-if="eng.name === 'censys'" class="field-hint full">
-                  新账号用 Censys Platform 的 Personal Access Token；仅旧 Legacy Search 才填 <code>API_ID:SECRET</code>。
-                </p>
-                <label class="full">API 端点（可选）
-                  <input v-model="form.engines[eng.name].base_url"
-                    :placeholder="eng.name === 'fofa' ? 'https://fofa.info' : '留空用官方默认'" />
-                </label>
-              </div>
-            </div>
-          </div>
         </fieldset>
 
         <fieldset v-show="settingsTab === 'runtime'" class="settings-block">
@@ -1543,7 +1520,7 @@ async function runCleanup() {
           </div>
         </fieldset>
 
-        <fieldset class="settings-block">
+        <fieldset v-show="settingsTab === 'llm'" class="settings-block">
           <legend>
             <span>模型计价</span>
             <small>按百万 Token 计费（元），用于日历成本统计</small>
@@ -1568,7 +1545,7 @@ async function runCleanup() {
           <p class="field-hint full">成本 = (输入Token - 缓存命中) × 输入价 + 输出Token × 输出价 + 缓存命中 × 缓存价，单位均为元/百万Token。留空表示该模型不计费。</p>
         </fieldset>
 
-        <fieldset class="settings-block">
+        <fieldset v-show="settingsTab === 'runtime'" class="settings-block">
           <legend>
             <span>SSH 代理池</span>
             <small>WAF 封 IP 时交叉检测 + 失败目标重测</small>
@@ -1599,7 +1576,6 @@ async function runCleanup() {
           </div>
         </fieldset>
 
-        <fieldset class="settings-block">
         <fieldset v-show="settingsTab === 'data'" class="settings-block">
           <legend>
             <span>数据备份</span>
@@ -1762,7 +1738,6 @@ async function runCleanup() {
           </div>
         </fieldset>
 
-        <div class="settings-actions">
         <fieldset v-if="updateState.supported" v-show="settingsTab === 'update'" class="settings-block update-section">
           <legend>
             <span>版本更新</span>

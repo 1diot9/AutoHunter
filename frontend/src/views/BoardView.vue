@@ -2123,6 +2123,7 @@ function fmtTime(iso) {
             <b>{{ poolStats.checkedout }}/{{ poolStats.total_capacity }}</b>
             <span class="pool-bar"><i :style="{ width: poolPct + '%' }"></i></span>
             <small v-if="poolStats.overflow > 0">+{{ poolStats.overflow }}溢出</small>
+          </span>
           <span class="runtime-chip" :title="engineUsage.last_query || ''">
             <i>测绘</i>
             <b>{{ engineUsage.count || 0 }}</b>
@@ -2221,6 +2222,7 @@ function fmtTime(iso) {
       <div class="metric-card clickable" @click="openTargetPanel" title="点击查看目标列表">
         <span v-if="pendingInputCount" class="metric-badge pending-badge" @click.stop="openTargetPanel(); targetFilter = 'pending_input'; loadTargetList()" title="待注册目标">{{ pendingInputCount }}</span>
         <span class="metric-k">TARGETS</span><b>{{ totalTargets }}</b><em>目标总数</em>
+      </div>
       <div class="metric-card">
         <span class="metric-k">SITES</span><b>{{ totalHosts || totalTargets }}</b><em>独立网站 · {{ totalTargets }} 条目标</em>
       </div>
