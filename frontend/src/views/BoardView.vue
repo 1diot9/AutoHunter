@@ -861,42 +861,24 @@ const collabPhases = computed(() => {
 
 async function loadBoard() {
   const id = props.id;
-  const b = await api.board(id);
-  if (id !== props.id) return;
-  // 浅比较：字段未变则不替换数组，避免 worker-card 全列重渲染
-  const nextWorkers = b.live_workers || [];
-  if (!workersSigEqual(nextWorkers, liveWorkers.value)) {
-    liveWorkers.value = nextWorkers;
-  }
-  liveEscalations.value = b.live_escalations || [];
-  siteCollab.value = b.site_collab || null;
-  retestSummary.value = b.retest_summary || null;
-  if (task.value) {
-    if (b.task_status) task.value.status = b.task_status;
-    if (b.stats) task.value.stats = b.stats;
-    if (b.fofa_config) task.value.fofa_config = b.fofa_config;
-    if (b.model_config_data) task.value.model_config_data = b.model_config_data;
-    if (b.llm_usage) task.value.llm_usage = b.llm_usage;
-    if (b.llm_usage_by_model) task.value.llm_usage_by_model = b.llm_usage_by_model;
-  }
-  if (!events.value.length && b.events?.length) {
-    const existingByKey = new Map(events.value.map((e) => [streamEventStableKey(e), e]));
-    events.value = b.events
-      .filter(isImportantEvent)
-      .map((e) => normalizeTimedEvent(e, existingByKey))
-      .filter(Boolean);
   try {
     const b = await api.board(id);
     if (id !== props.id) return;
-    liveWorkers.value = b.live_workers || [];
+    // 浅比较：字段未变则不替换数组，避免 worker-card 全列重渲染
+    const nextWorkers = b.live_workers || [];
+    if (!workersSigEqual(nextWorkers, liveWorkers.value)) {
+      liveWorkers.value = nextWorkers;
+    }
     liveEscalations.value = b.live_escalations || [];
     siteCollab.value = b.site_collab || null;
+    retestSummary.value = b.retest_summary || null;
     if (task.value) {
       if (b.task_status) task.value.status = b.task_status;
       if (b.stats) task.value.stats = b.stats;
       if (b.fofa_config) task.value.fofa_config = b.fofa_config;
       if (b.model_config_data) task.value.model_config_data = b.model_config_data;
       if (b.llm_usage) task.value.llm_usage = b.llm_usage;
+      if (b.llm_usage_by_model) task.value.llm_usage_by_model = b.llm_usage_by_model;
       if (b.engine_usage) task.value.engine_usage = b.engine_usage;
     }
     if (!events.value.length && b.events?.length) {
