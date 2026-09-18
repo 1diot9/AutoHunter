@@ -20,5 +20,7 @@ services:
     volumes:
       - ./data:/app/data       # SQLite + 证据持久化（bind mount，数据在项目 data/ 目录）
       - ./work:/work            # worker 临时工作区
-      - ~/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro   # SSH 代理免密私钥（WAF IP 封禁复测用，只读）
+      # 宿主机 SSH 目录（只读）。Windows 绑定挂载权限是 0777，OpenSSH 会拒用，
+      # 启动脚本会把私钥复制到 /root/.ssh 并 chmod 600。
+      - ~/.ssh:/run/host-ssh:ro
     restart: unless-stopped      # 崩溃自动重启，从 DB 恢复任务状态

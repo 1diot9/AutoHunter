@@ -80,6 +80,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 更新 nuclei 模板（失败不阻断构建）
 RUN nuclei -update-templates -silent || true
 
+# SSH 客户端：WAF IP 封禁时代理复测依赖 ssh -i
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /root/.ssh /run/host-ssh \
+    && chmod 700 /root/.ssh
+
 COPY . .
 # Windows 检出/解压可能带 CRLF；入口脚本带 \r 时容器会报 no such file or directory。
 RUN find /app/scripts -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
