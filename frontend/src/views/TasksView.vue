@@ -20,7 +20,7 @@ const router = useRouter();
 // ===== 任务置顶：选中态 / 操作中态 / 批量栏 =====
 const selected = ref(new Set());       // 勾选的任务 id
 const toggling = ref(new Set());       // 正在置顶/取消置顶中的任务 id（按钮禁用）
-const pageIds = computed(() => tasks.value.map((t) => t.id));
+const pageIds = computed(() => pagedTasks.value.map((t) => t.id));
 const allChecked = computed(() =>
   pageIds.value.length > 0 && pageIds.value.every((id) => selected.value.has(id))
 );
@@ -479,14 +479,6 @@ watch(hasRunning, () => syncPoller());
       <span class="hint">调整搜索词或筛选条件</span>
     </div>
     <div v-else class="task-list">
-      <div v-for="t in pagedTasks" :key="t.id" class="task-card" :class="{
-          live: t.status === 'running' && !t.retest_active,
-          retest: t.status === 'running' && t.retest_active,
-        }"
-        @click="router.push(`/task/${t.id}`)">
-        <div class="task-card-main">
-          <div class="tc-title">
-            <span v-if="t.status === 'running'" class="pulse" :class="{ warn: t.retest_active }"></span>
       <div v-if="writable" class="pin-batch-bar">
         <label class="pin-sel-all">
           <input type="checkbox" :checked="allChecked"
@@ -498,15 +490,19 @@ watch(hasRunning, () => syncPoller());
         <button class="btn-pin" type="button" :disabled="!someChecked" @click="batchTop(true)">批量置顶</button>
         <button class="btn-ghost" type="button" :disabled="!someChecked" @click="batchTop(false)">批量取消置顶</button>
       </div>
-      <div v-for="t in tasks" :key="t.id" class="task-card"
-        :class="{ live: t.status === 'running', pinned: t.is_top }"
+      <div v-for="t in pagedTasks" :key="t.id" class="task-card" :class="{
+          live: t.status === 'running' && !t.retest_active,
+          retest: t.status === 'running' && t.retest_active,
+          pinned: t.is_top,
+        }"
         @click="router.push(`/task/${t.id}`)">
         <div class="task-card-main">
           <div class="tc-title">
             <input v-if="writable" class="row-check" type="checkbox" :checked="selected.has(t.id)"
                    @click.stop @change="toggleRowChecked(t.id, $event.target.checked)" />
             <span v-if="t.is_top" class="pin-mark" aria-hidden="true">★</span>
-            <span v-if="t.status === 'running'" class="pulse"></span><b>{{ t.name }}</b>
+            <span v-if="t.status === 'running'" class="pulse" :class="{ warn: t.retest_active }"></span>
+            <b>{{ t.name }}</b>
           </div>
           <span v-if="t.pending_user_review > 0" class="review-dot"
                 :title="`${t.pending_user_review} 个漏洞待复审`">{{ t.pending_user_review }}</span>
@@ -517,7 +513,8 @@ watch(hasRunning, () => syncPoller());
           <div class="task-card-meta">
             <span class="badge" :class="t.status">{{ STATUS_LABEL[t.status] || t.status }}</span>
             <span class="meta">{{ taskModeLabel(t) }} · {{ targetSourceLabel(t) }} · 并发 {{ t.concurrency }} · 深挖 ×{{ t.deepen_cap ?? 2 }}</span>
-            <span v-if="t.llm_cost > 0" class="task-cost-badge">¥{{ t.llm_cost.toFixed(2) }}</span></div>
+            <span v-if="t.llm_cost > 0" class="task-cost-badge">¥{{ t.llm_cost.toFixed(2) }}</span>
+          </div>
           <div class="meta task-query">{{ taskScopeText(t) }}</div>
           <div v-if="t.progress_pct > 0 || t.status === 'running' || t.status === 'paused' || t.status === 'stopped'" class="task-progress-row">
             <span class="task-progress-track"><i :style="{ width: (t.progress_pct || 0) + '%' }" :class="{ done: t.progress_pct >= 100 }"></i></span>
@@ -527,16 +524,17 @@ watch(hasRunning, () => syncPoller());
         <div class="task-card-side">
           <time class="meta task-time">{{ t.created_at.slice(0, 19).replace("T", " ") }}</time>
           <div v-if="writable" class="task-actions">
-           <button class="mini-action primary" type="button"
+            <button class="mini-action primary" type="button"
               :disabled="busyTaskIds.includes(t.id) || t.status === 'running'"
-             @click.stop="ctl(t, 'start')">启动</button>
-           <button class="mini-action" type="button"
+              @click.stop="ctl(t, 'start')">启动</button>
+            <button class="mini-action" type="button"
               :disabled="busyTaskIds.includes(t.id) || t.status !== 'running'"
-             @click.stop="ctl(t, 'pause')">暂停</button>
+              @click.stop="ctl(t, 'pause')">暂停</button>
             <button class="mini-action pin" type="button" :class="{ on: t.is_top }"
                     :disabled="toggling.has(t.id)" @click.stop="toggleTop(t)">
               {{ toggling.has(t.id) ? "…" : (t.is_top ? "取消置顶" : "置顶") }}
-            </button><button class="mini-action" type="button" @click.stop="openEdit(t)">编辑参数</button>
+            </button>
+            <button class="mini-action" type="button" @click.stop="openEdit(t)">编辑参数</button>
             <button class="mini-action danger" type="button" @click.stop="askDelete(t)">删除</button>
           </div>
           <span class="task-chevron" aria-hidden="true">›</span>
