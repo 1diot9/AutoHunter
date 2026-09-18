@@ -32,7 +32,7 @@ from app.llm.health import (
     provider_retry_after_seconds,
     snapshot as health_snapshot,
 )
-from app.llm.usage import record_usage
+from app.llm.usage import record_usage, reconcile_cache_tokens
 
 logger = logging.getLogger("autohunter.llm")
 
@@ -879,6 +879,114 @@ def _provider_health_rank(provider: LLMConfig, health: dict[str, dict[str, Any]]
     return 0
 
 
+_USAGE_FIELD_NAMES = (
+    "prompt_tokens", "input_tokens", "completion_tokens", "output_tokens",
+    "total_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens", "cached_tokens",
+    "prompt_tokens_details", "input_tokens_details",
+)
+
+
+def _coerce_usage_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_mapping(obj: Any) -> dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    dumped: dict[str, Any] = {}
+    for meth in ("model_dump", "to_dict"):
+        fn = getattr(obj, meth, None)
+        if not callable(fn):
+            continue
+        try:
+            result = fn()
+        except TypeError:
+            try:
+                result = fn(mode="python")
+            except Exception:
+                result = None
+        except Exception:
+            result = None
+        if isinstance(result, dict):
+            dumped = result
+            break
+    if not dumped:
+        dict_fn = getattr(obj, "dict", None)
+        if callable(dict_fn):
+            try:
+                result = dict_fn()
+                if isinstance(result, dict):
+                    dumped = result
+            except Exception:
+                dumped = {}
+    extra = getattr(obj, "model_extra", None) or getattr(obj, "__pydantic_extra__", None)
+    if isinstance(extra, dict):
+        dumped = {**dumped, **extra}
+    if dumped:
+        return dumped
+    out: dict[str, Any] = {}
+    for key in _USAGE_FIELD_NAMES:
+        if hasattr(obj, key):
+            out[key] = getattr(obj, key)
+    return out
+
+
+def _first_usage_int(data: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return _coerce_usage_int(data[key])
+    return None
+
+
+def _details_cached_tokens(details: Any) -> int | None:
+    mapping = _usage_mapping(details)
+    if not mapping:
+        return None
+    return _first_usage_int(mapping, "cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens")
+
+
+def parse_completion_usage(usage: Any) -> dict[str, int]:
+    """从 OpenAI / DeepSeek / Anthropic usage 抽出 prompt/completion/cache 计数。"""
+    data = _usage_mapping(usage)
+    prompt = _coerce_usage_int(data.get("prompt_tokens") or data.get("input_tokens"))
+    completion = _coerce_usage_int(data.get("completion_tokens") or data.get("output_tokens"))
+    total = _coerce_usage_int(data.get("total_tokens")) or (prompt + completion)
+    hit = _first_usage_int(data, "prompt_cache_hit_tokens", "cache_read_input_tokens", "cached_tokens")
+    details_hit = _details_cached_tokens(data.get("prompt_tokens_details"))
+    if details_hit is None:
+        details_hit = _details_cached_tokens(data.get("input_tokens_details"))
+    if hit is None:
+        hit = details_hit
+    miss = _first_usage_int(data, "prompt_cache_miss_tokens")
+    cache_reported = (
+        _first_usage_int(
+            data,
+            "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+            "cache_read_input_tokens", "cache_creation_input_tokens",
+            "cached_tokens",
+        ) is not None
+        or details_hit is not None
+        or miss is not None
+        or hit is not None
+    )
+    hit, miss = reconcile_cache_tokens(
+        prompt, hit or 0, miss or 0, cache_reported=cache_reported,
+    )
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "cache_hit_tokens": hit,
+        "cache_miss_tokens": miss,
+    }
+
+
 class LLMClient:
     def __init__(
         self,
@@ -1671,35 +1779,13 @@ class LLMClient:
         usage = getattr(resp, "usage", None)
         if not usage:
             return
-        # DeepSeek 在 usage 顶层给 prompt_cache_hit_tokens/prompt_cache_miss_tokens；
-        # 部分 OpenAI 兼容网关走 prompt_tokens_details.cached_tokens。两种都抓。
-        cache_hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
-        cache_miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
-        if not cache_hit:
-            details = getattr(usage, "prompt_tokens_details", None)
-            if details is not None:
-                cache_hit = getattr(details, "cached_tokens", 0) or 0
-        record_usage(
-            self.usage_key,
-            self.config.model,
-            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-            total_tokens=getattr(usage, "total_tokens", 0) or 0,
-            cache_hit_tokens=cache_hit,
-            cache_miss_tokens=cache_miss,
-        )
+        parsed = parse_completion_usage(usage)
+        if not parsed["prompt_tokens"] and not parsed["completion_tokens"] and not parsed["total_tokens"]:
+            return
+        record_usage(self.usage_key, self.config.model, **parsed)
 
     def _record_messages_usage(self, data: dict[str, Any]) -> None:
-        usage = data.get("usage") or {}
-        # anthropic messages 协议：cache_read_input_tokens / cache_creation_input_tokens。
-        cache_hit = usage.get("cache_read_input_tokens") or usage.get("prompt_cache_hit_tokens") or 0
-        cache_miss = usage.get("cache_creation_input_tokens") or usage.get("prompt_cache_miss_tokens") or 0
-        record_usage(
-            self.usage_key,
-            self.config.model,
-            prompt_tokens=usage.get("input_tokens") or usage.get("prompt_tokens") or 0,
-            completion_tokens=usage.get("output_tokens") or usage.get("completion_tokens") or 0,
-            total_tokens=usage.get("total_tokens") or 0,
-            cache_hit_tokens=cache_hit,
-            cache_miss_tokens=cache_miss,
-        )
+        parsed = parse_completion_usage(data.get("usage") or {})
+        if not parsed["prompt_tokens"] and not parsed["completion_tokens"] and not parsed["total_tokens"]:
+            return
+        record_usage(self.usage_key, self.config.model, **parsed)

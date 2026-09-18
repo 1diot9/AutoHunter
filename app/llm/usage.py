@@ -93,6 +93,43 @@ def _today_cst() -> str:
     return datetime.now(CST).strftime("%Y-%m-%d")
 
 
+def reconcile_cache_tokens(
+    prompt_tokens: int,
+    cache_hit: int,
+    cache_miss: int = 0,
+    *,
+    cache_reported: bool = False,
+) -> tuple[int, int]:
+    """把缓存命中/未命中对齐到 prompt_tokens。
+
+    命中率必须用 hit / prompt。很多网关只回 cached_tokens，不回 miss；
+    Anthropic 的 cache_creation 是写缓存，也不是未命中。有命中字段或明确
+    报过缓存时，未命中 = prompt - hit。
+    """
+    prompt = max(0, int(prompt_tokens or 0))
+    hit = max(0, int(cache_hit or 0))
+    miss = max(0, int(cache_miss or 0))
+    if prompt:
+        hit = min(hit, prompt)
+        if hit > 0 or cache_reported:
+            miss = prompt - hit
+        elif miss > prompt:
+            miss = prompt
+    return hit, miss
+
+
+def apply_cache_reconcile(row: dict[str, Any]) -> dict[str, Any]:
+    """就地补全一行用量里缺的 miss，供读旧数据时修正虚假 100% 命中率。"""
+    hit, miss = reconcile_cache_tokens(
+        row.get("prompt_tokens", 0),
+        row.get("cache_hit_tokens", 0),
+        row.get("cache_miss_tokens", 0),
+    )
+    row["cache_hit_tokens"] = hit
+    row["cache_miss_tokens"] = miss
+    return row
+
+
 def record_usage(task_id: str | None, model: str, prompt_tokens: int = 0,
                  completion_tokens: int = 0, total_tokens: int = 0,
                  cache_hit_tokens: int = 0, cache_miss_tokens: int = 0) -> None:
@@ -101,8 +138,10 @@ def record_usage(task_id: str | None, model: str, prompt_tokens: int = 0,
     prompt = max(0, int(prompt_tokens or 0))
     completion = max(0, int(completion_tokens or 0))
     total = max(0, int(total_tokens or 0)) or (prompt + completion)
-    cache_hit = max(0, int(cache_hit_tokens or 0))
-    cache_miss = max(0, int(cache_miss_tokens or 0))
+    cache_hit, cache_miss = reconcile_cache_tokens(
+        prompt, cache_hit_tokens, cache_miss_tokens,
+        cache_reported=bool(cache_hit_tokens or cache_miss_tokens),
+    )
 
     # 1) 内存更新（快速，向后兼容看板轮询）
     key = (task_id, model)
@@ -161,7 +200,7 @@ def usage_snapshot(task_id: str | None, model: str = "",
                 ).fetchone()
             if row and row[0] is not None:
                 pt, ct, cht, cmt, req = row
-                return {
+                return apply_cache_reconcile({
                     "prompt_tokens": pt or 0,
                     "completion_tokens": ct or 0,
                     "total_tokens": (pt or 0) + (ct or 0),
@@ -170,7 +209,7 @@ def usage_snapshot(task_id: str | None, model: str = "",
                     "requests": req or 0,
                     "model": model,
                     "updated_at": time(),
-                }
+                })
         except Exception as e:
             logger.debug("usage_snapshot DB 读取失败，回退内存: %s", e)
     # 回退到内存
@@ -195,7 +234,7 @@ def usage_snapshot(task_id: str | None, model: str = "",
     agg["model"] = model or last_model or agg["model"]
     agg["updated_at"] = latest_ts
     if agg["requests"] or agg["total_tokens"]:
-        return agg
+        return apply_cache_reconcile(agg)
     if persisted and (persisted.get("requests") or persisted.get("total_tokens") or persisted.get("prompt_tokens")):
         out = _empty(model)
         for key in ("prompt_tokens", "completion_tokens", "total_tokens",
@@ -207,8 +246,8 @@ def usage_snapshot(task_id: str | None, model: str = "",
         if persisted.get("model"):
             out["model"] = str(persisted.get("model") or model)
         out["updated_at"] = persisted.get("updated_at")
-        return out
-    return agg
+        return apply_cache_reconcile(out)
+    return apply_cache_reconcile(agg)
 
 
 def usage_snapshot_by_model(task_id: str | None) -> list[dict[str, Any]]:
@@ -230,7 +269,7 @@ def usage_snapshot_by_model(task_id: str | None) -> list[dict[str, Any]]:
                 result = []
                 for row in rows:
                     mdl, pt, ct, cht, cmt, req = row
-                    result.append({
+                    result.append(apply_cache_reconcile({
                         "model": mdl or "",
                         "prompt_tokens": pt or 0,
                         "completion_tokens": ct or 0,
@@ -239,13 +278,52 @@ def usage_snapshot_by_model(task_id: str | None) -> list[dict[str, Any]]:
                         "cache_miss_tokens": cmt or 0,
                         "requests": req or 0,
                         "updated_at": time(),
-                    })
+                    }))
                 return result
         except Exception as e:
             logger.debug("usage_snapshot_by_model DB 读取失败，回退内存: %s", e)
     # 回退到内存
     with _USAGE_LOCK:
-        return [dict(v) for k, v in _USAGE.items() if k[0] == task_id]
+        return [apply_cache_reconcile(dict(v)) for k, v in _USAGE.items() if k[0] == task_id]
+
+
+def usage_by_task_model() -> dict[str, list[dict[str, Any]]]:
+    """一次扫表：所有任务按模型聚合的用量（供任务列表批量算成本）。
+
+    返回 {task_id: [{model, prompt_tokens, ...}, ...]}。
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    conn = _get_db_conn()
+    if conn is not None:
+        try:
+            with _DB_LOCK:
+                rows = conn.execute(
+                    "SELECT task_id, model, SUM(prompt_tokens), SUM(completion_tokens), "
+                    "SUM(cache_hit_tokens), SUM(cache_miss_tokens), SUM(requests) "
+                    "FROM token_usage_daily GROUP BY task_id, model"
+                ).fetchall()
+            for row in rows:
+                tid, mdl, pt, ct, cht, cmt, req = row
+                if not tid:
+                    continue
+                out.setdefault(tid, []).append(apply_cache_reconcile({
+                    "model": mdl or "",
+                    "prompt_tokens": pt or 0,
+                    "completion_tokens": ct or 0,
+                    "total_tokens": (pt or 0) + (ct or 0),
+                    "cache_hit_tokens": cht or 0,
+                    "cache_miss_tokens": cmt or 0,
+                    "requests": req or 0,
+                    "updated_at": time(),
+                }))
+            if out:
+                return out
+        except Exception as e:
+            logger.debug("usage_by_task_model DB 读取失败，回退内存: %s", e)
+    with _USAGE_LOCK:
+        for (tid, _mdl), v in _USAGE.items():
+            out.setdefault(tid, []).append(apply_cache_reconcile(dict(v)))
+    return out
 
 
 def _empty(model: str = "") -> dict[str, Any]:
