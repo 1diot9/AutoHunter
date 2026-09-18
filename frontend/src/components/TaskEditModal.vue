@@ -55,7 +55,6 @@ const form = reactive({
   intent_mode: "",
   manual_targets: "",
   src_rules: "",
-  cas_sso_config: "",
   base_url: "",
   api_key: "",
   key_ref: "",
@@ -140,7 +139,6 @@ function fill(task) {
   form.intent_mode = fofaCfg.intent_mode || "";
   form.manual_targets = (task.manual_targets || []).join("\n");
   form.src_rules = task.src_rules || "";
-  form.cas_sso_config = task.cas_sso_config || "";
   form.base_url = modelCfg.base_url || "";
   form.api_key = "";
   form.key_ref = modelCfg.key_ref || "";
@@ -275,7 +273,6 @@ async function save() {
     manual_targets: form.manual_targets.split("\n").map((s) => s.trim()).filter(Boolean),
     auth_bindings: showAuthBindings.value ? exportAuthBindings() : [],
     src_rules: form.src_rules,
-    cas_sso_config: form.cas_sso_config,
     concurrency: parseInt(form.concurrency) || 3,
     enable_worker_fofa_lookup: form.enable_worker_fofa_lookup,
     enable_killsweep_fofa_search: form.enable_killsweep_fofa_search,
@@ -456,9 +453,6 @@ async function save() {
         <p class="hint">关闭后可避免 Worker/通杀 Agent 自主调用 FOFA 消耗点数</p>
       </details>
 
-      <label>CAS SSO 统一认证凭证（任务级，可留空）
-        <textarea v-model="form.cas_sso_config" rows="4" placeholder="填写后，本任务每个 Worker 在测试前都会收到这些凭证，可用于需要登录的目标。&#10;例：&#10;登录入口：https://cas.xxx.edu.cn/cas/login&#10;账号：2023xxxx&#10;密码：xxxxxx&#10;或 Cookie/Token：CASTGC=TGT-xxxx"></textarea>
-      </label>
       <label>SRC 规则（可选，叠加在内置标准上，不替换）
         <textarea v-model="form.src_rules" rows="3" placeholder="例：本校不收弱口令；重点收越权与未授权。"></textarea>
       </label>

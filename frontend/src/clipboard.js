@@ -30,7 +30,10 @@ export async function copyText(text) {
 
 export function isLlmErrorEvent(ev = {}) {
   const k = String(ev.kind || "");
-  if (k.startsWith("llm_") || k === "worker_auto_finish" || k === "quota_stop") return true;
+  if (
+    k === "llm_error" || k === "llm_soft_retry" || k === "llm_interrupt"
+    || k === "llm_provider_failed" || k === "quota_stop"
+  ) return true;
   const text = `${ev.message || ""} ${ev._text || ""} ${ev.error || ""}`;
   return k === "target_requeued" && /LLM|额度|配额|不可用/.test(text);
 }

@@ -211,6 +211,21 @@ function formatTokens(n) {
   return String(v);
 }
 
+function cacheHitRate(hit, miss, prompt) {
+  const p = Number(prompt || 0);
+  const h = Number(hit || 0);
+  const m = Number(miss || 0);
+  if (p <= 0) return null;
+  if (h <= 0 && m <= 0) return null;
+  const capped = Math.min(Math.max(h, 0), p);
+  return Number(((capped / p) * 100).toFixed(1));
+}
+
+function formatCacheHitLabel(hit, miss, prompt) {
+  const rate = cacheHitRate(hit, miss, prompt);
+  return rate === null ? formatTokens(hit) : `${rate}%`;
+}
+
 watch([viewYear, viewMonth], () => loadOverview());
 
 onMounted(async () => {
@@ -287,7 +302,9 @@ onMounted(async () => {
           <div class="dcp-token-summary">
             <span>输入 {{ formatTokens(detail.token_usage.total_prompt_tokens) }}</span>
             <span>输出 {{ formatTokens(detail.token_usage.total_completion_tokens) }}</span>
-            <span>缓存命中 {{ formatTokens(detail.token_usage.total_cache_hit_tokens) }}</span>
+            <span
+              :title="`命中 ${formatTokens(detail.token_usage.total_cache_hit_tokens)} / 输入 ${formatTokens(detail.token_usage.total_prompt_tokens)}`"
+            >缓存命中 {{ formatCacheHitLabel(detail.token_usage.total_cache_hit_tokens, 0, detail.token_usage.total_prompt_tokens) }}</span>
             <span>请求 {{ detail.token_usage.total_requests }}</span>
           </div>
           <div v-if="detail.token_usage.by_model.length" class="dcp-model-list">

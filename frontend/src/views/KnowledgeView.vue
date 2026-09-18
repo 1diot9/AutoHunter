@@ -2,6 +2,8 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { api, canWrite } from "../api.js";
 
+defineOptions({ name: "KnowledgeView" });
+
 const stats = ref({ total: 0, enabled: 0, by_type: {}, by_processing: {} });
 const rows = ref([]);
 const initialLoading = ref(true);

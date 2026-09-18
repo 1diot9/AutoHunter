@@ -20,6 +20,8 @@ const page = ref(0);
 const pageSize = 100;
 const hasMore = ref(false);
 let searchTimer = null;
+let lastLoadedAt = 0;
+const STALE_MS = 30000;
 const writable = computed(() => canWrite());
 
 const KIND_META = {
@@ -60,6 +62,7 @@ async function loadList() {
 async function reload() {
   page.value = 0;
   await Promise.all([loadStats(), loadList(), previewCurator()]);
+  lastLoadedAt = Date.now();
 }
 
 function nextPage() {
@@ -160,6 +163,7 @@ watch(searchDraft, (v) => {
 
 onMounted(reload);
 onActivated(() => {
+  if (rows.value.length && lastLoadedAt && (Date.now() - lastLoadedAt) < STALE_MS) return;
   if (rows.value.length) reload();
 });
 </script>

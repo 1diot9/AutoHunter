@@ -267,13 +267,19 @@ async function uploadBackup(file, includeWork) {
 }
 
 export const api = {
-  listTasks: () => req("GET", "/api/tasks"),
+  listTasks: async () => {
+    const res = await req("GET", "/api/tasks");
+    // 兼容新 {items,total} 与旧裸数组
+    if (Array.isArray(res)) return res;
+    return res?.items || [];
+  },
   createTask: (data) => req("POST", "/api/tasks", data),
   getTask: (id) => req("GET", `/api/tasks/${id}`),
   updateTask: (id, data) => req("PATCH", `/api/tasks/${id}`, data),
   // 删除任务：必须带 full 令牌（作为二次身份校验，独立于当前登录令牌）。
   deleteTask: (id, token) => req("DELETE", `/api/tasks/${id}`, undefined, false, sanitizeToken(token)),
   board: (id, opts = {}) => req("GET", `/api/tasks/${id}/board${qs(opts)}`),
+  taskEvents: (id, opts = {}) => req("GET", `/api/tasks/${id}/events${qs(opts)}`),
   hardTargets: (status, q, opts = {}) => req("GET", `/api/tasks/hard-targets${qs({ status, q, ...opts })}`),
   start: (id) => req("POST", `/api/tasks/${id}/start`),
   pause: (id) => req("POST", `/api/tasks/${id}/pause`),
@@ -281,8 +287,11 @@ export const api = {
   resetProgress: (id) => req("POST", `/api/tasks/${id}/reset`),
   resetFailedTargets: (id) => req("POST", `/api/tasks/${id}/reset-failed`),
   collectTargets: (id) => req("POST", `/api/tasks/${id}/collect-targets`),
-  targets: (id, status, limit) => req("GET", `/api/tasks/${id}/targets${qs({ status, limit })}`),
+  targets: (id, status, limit, opts = {}) =>
+    req("GET", `/api/tasks/${id}/targets${qs({ status, limit, ...opts })}`),
   targetDetail: (taskId, targetId) => req("GET", `/api/tasks/${taskId}/targets/${targetId}/detail`),
+  targetEvents: (taskId, targetId, opts = {}) =>
+    req("GET", `/api/tasks/${taskId}/targets/${targetId}/events${qs(opts)}`),
   redigTarget: (taskId, targetId) => req("POST", `/api/tasks/${taskId}/targets/${targetId}/redig`),
   provideCredentials: (taskId, targetId, data) => req("POST", `/api/tasks/${taskId}/targets/${targetId}/credentials`, data),
   skipTarget: (taskId, targetId) => req("POST", `/api/tasks/${taskId}/targets/${targetId}/skip`),
@@ -296,7 +305,7 @@ export const api = {
   // 任务置顶：单条 / 批量，仅 full 令牌可写（后端中间件拦 observer/readonly）。
   taskTop: (id, isTop) => req("PATCH", `/api/tasks/${id}/top`, { is_top: !!isTop }),
   taskBatchTop: (ids, isTop) => req("PATCH", "/api/tasks/batch/top", { ids, is_top: !!isTop }),
-  reviewQueue: (id, q) => req("GET", `/api/tasks/${id}/review-queue${qs({ q })}`),submitList: (id, submitted, q, opts = {}) =>
+  submitList: (id, submitted, q, opts = {}) =>
     req("GET", `/api/tasks/${id}/submit-list${qs({ submitted, q, ...opts })}`),
   rejectedList: (id, q, opts = {}) => req("GET", `/api/tasks/${id}/rejected${qs({ q, ...opts })}`),
   archivedList: (id, q, opts = {}) => req("GET", `/api/tasks/${id}/archived${qs({ q, ...opts })}`),
@@ -306,8 +315,10 @@ export const api = {
   restoreDiscarded: (id) => req("POST", `/api/results/${id}/restore-discarded`),
   listTaskHosts: (taskId, opts = {}) =>
     req("GET", `/api/tasks/${taskId}/hosts${qs(opts)}`),
-  skipTarget: (taskId, targetId) => req("POST", `/api/tasks/${taskId}/targets/${targetId}/skip`),targetTrace: (taskId, targetId, limit = 200) =>
-    req("GET", `/api/tasks/${taskId}/targets/${targetId}/trace${qs({ limit })}`),
+  targetTrace: (taskId, targetId, limitOrOpts = 80) => {
+    const opts = typeof limitOrOpts === "number" ? { limit: limitOrOpts } : (limitOrOpts || {});
+    return req("GET", `/api/tasks/${taskId}/targets/${targetId}/trace${qs(opts)}`);
+  },
   injectDirective: (taskId, targetId, directive) =>
     req("POST", `/api/tasks/${taskId}/targets/${targetId}/directive`, { directive }),
   cancelEscalation: (taskId, findingId) =>

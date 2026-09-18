@@ -6,6 +6,8 @@ import { useAuthBindings } from "../composables/useAuthBindings.js";
 import LlmModelPicker from "../components/LlmModelPicker.vue";
 import LlmPoolEditor from "../components/LlmPoolEditor.vue";
 
+defineOptions({ name: "CreateView" });
+
 const router = useRouter();
 const adv = ref(false);
 const form = reactive({
@@ -18,7 +20,6 @@ const form = reactive({
   intent_mode: "",
   manual_targets: "",
   src_rules: "",
-  cas_sso_config: "",
   // inherit | single | pool
   model_mode: "inherit",
   base_url: "", api_key: "", key_ref: "", model: "", protocol: "auto", prompt_version: "legacy",
@@ -278,7 +279,6 @@ async function submit() {
     manual_targets: form.manual_targets.split("\n").map((s) => s.trim()).filter(Boolean),
     auth_bindings: showAuthBindings.value ? exportAuthBindings() : [],
     src_rules: form.src_rules,
-    cas_sso_config: form.cas_sso_config,
     concurrency: parseInt(form.concurrency) || 3,
     enable_worker_fofa_lookup: form.enable_worker_fofa_lookup,
     enable_killsweep_fofa_search: form.enable_killsweep_fofa_search,
@@ -544,9 +544,6 @@ onMounted(async () => {
           <p class="create-mini">深挖次数是同一目标被打回的上限（人工 + AI 审核 + 自动），0 表示关闭回炉。</p>
           <label class="checkbox-row"><input type="checkbox" v-model="form.enable_worker_fofa_lookup" /> Worker 挖掘时 fofa_lookup</label>
           <label class="checkbox-row"><input type="checkbox" v-model="form.enable_killsweep_fofa_search" /> 通杀分析时 fofa_search</label>
-          <label>CAS SSO 统一认证凭证（可留空）
-            <textarea v-model="form.cas_sso_config" rows="3" placeholder="登录入口 / 账号密码 / Cookie"></textarea>
-          </label>
         </details>
       </div>
 

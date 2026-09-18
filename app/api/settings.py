@@ -509,8 +509,8 @@ async def test_ssh(session: AsyncSession = Depends(get_session)):
         if not r["ok"]:
             all_ok = False
 
-    summary = "; ".join(
-        f"[{r['type']}] {r['server']}: {'OK' if r['ok'] else r['message']}" for r in results
+    summary = "\n".join(
+        f"[{r['type']}] {r['server']}: {'连通正常' if r['ok'] else r['message']}" for r in results
     )
     return {"ok": all_ok, "message": summary, "details": results}
 

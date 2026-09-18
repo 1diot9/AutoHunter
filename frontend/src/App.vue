@@ -16,9 +16,12 @@ import { applyUi, commitDefaultThemeGen, loadUiPrefs, markUiMigrated, peekDefaul
 const route = useRoute();
 const KEEP_ALIVE_VIEWS = [
   "TasksView",
+  "CreateView",
+  "SettingsView",
   "VulnsView",
   "IntelView",
   "HardTargetsView",
+  "KnowledgeView",
   "RuntimeLogsView",
 ];
 

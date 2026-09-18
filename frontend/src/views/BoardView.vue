@@ -71,9 +71,20 @@ const discardedHasMore = ref(false);
 const discardedLoading = ref(false);
 const DISCARDED_PAGE_SIZE = 50;
 const bulkWorking = ref(false);
+const cardDownloadingId = ref(null);
 const SUBMIT_PAGE_SIZE = 120;
 const EXPORT_PAGE_SIZE = 80;
 const STREAM_DETAIL_CAP = 40;
+const STREAM_PAGE_SIZE = 40;
+const TRACE_PAGE_SIZE = 80;
+const TARGET_EVENT_PAGE_SIZE = 20;
+const streamLoading = ref(false);
+const streamHasMore = ref(false);
+const streamLoaded = ref(false);
+const traceHasMore = ref(false);
+const traceLoadingMore = ref(false);
+const targetEventsLoading = ref(false);
+const targetEventsHasMore = ref(false);
 let ws = null, poll = null, boardPoll = null, searchTimer = null, poolPoll = null;
 let wsReconnectTimer = null, wsReconnectAttempt = 0, wsIntentionalClose = false;
 let eventRefreshTimer = null, eventRefreshPending = null;
@@ -98,6 +109,8 @@ const liveTraceByTarget = ref({});
 const targetPanelOpen = ref(false);
 const targetList = ref([]);
 const targetListLoading = ref(false);
+const targetListHasMore = ref(false);
+const TARGET_PAGE_SIZE = 100;
 const targetFilter = ref("");  // all / alive / done / dead / skipped / queued
 const targetSearch = ref("");  // 搜索关键词
 const filteredTargetList = computed(() => {
@@ -166,6 +179,7 @@ async function loadQueue(opts = {}) {
   queueLoading.value = true;
   try {
     const res = await api.reviewQueue(id, undefined, {
+      compact: true,
       limit: REVIEW_PAGE_SIZE,
       offset,
     });
@@ -232,6 +246,7 @@ async function loadRejected(opts = {}) {
   rejectedLoading.value = true;
   try {
     const res = await api.rejectedList(id, undefined, {
+      compact: true,
       limit: REJECTED_PAGE_SIZE,
       offset,
     });
@@ -255,6 +270,7 @@ async function loadArchived(opts = {}) {
   archivedLoading.value = true;
   try {
     const res = await api.archivedList(id, undefined, {
+      compact: true,
       limit: ARCHIVED_PAGE_SIZE,
       offset,
     });
@@ -278,6 +294,7 @@ async function loadDiscarded(opts = {}) {
   discardedLoading.value = true;
   try {
     const res = await api.discardedList(id, undefined, {
+      compact: true,
       limit: DISCARDED_PAGE_SIZE,
       offset,
     });
@@ -341,23 +358,28 @@ function scheduleEventRefresh(ev) {
 
 async function refreshFromEvent(ev) {
   const k = ev.kind || "";
-  const jobs = [loadBoard()];
-  if ((k.includes("finding") || k.includes("review")) && shouldRefreshTab("review")) {
+  // 统计数字变化才拉完整 board；worker 活态用 light
+  const needStats = k.includes("finding") || k.includes("review") || k.includes("submit")
+    || k.includes("killsweep") || k.includes("target_done") || k.includes("retest");
+  const jobs = [loadBoard({ light: !needStats })];
+  // 只刷新当前可见 tab，不刷所有已访问 tab
+  const cur = tab.value;
+  if ((k.includes("finding") || k.includes("review")) && cur === "review") {
     jobs.push(loadTabData("review"));
   }
-  if ((k.includes("finding") || k.includes("review")) && shouldRefreshTab("rejected")) {
+  if ((k.includes("finding") || k.includes("review")) && cur === "rejected") {
     jobs.push(loadTabData("rejected"));
   }
-  if ((k.includes("finding") || k.includes("review")) && shouldRefreshTab("archived")) {
+  if ((k.includes("finding") || k.includes("review")) && cur === "archived") {
     jobs.push(loadTabData("archived"));
   }
-  if ((k.includes("finding") || k.includes("review")) && shouldRefreshTab("discarded")) {
+  if ((k.includes("finding") || k.includes("review")) && cur === "discarded") {
     jobs.push(loadTabData("discarded"));
   }
-  if ((k.includes("submit") || k.includes("review")) && shouldRefreshTab("submit")) {
+  if ((k.includes("submit") || k.includes("review")) && cur === "submit") {
     jobs.push(loadTabData("submit"));
   }
-  if (k.includes("killsweep") && shouldRefreshTab("killsweep")) {
+  if (k.includes("killsweep") && cur === "killsweep") {
     jobs.push(loadTabData("killsweep"));
   }
   await Promise.all(jobs);
@@ -395,6 +417,11 @@ function resetTaskState(full = true) {
   liveWorkers.value = [];
   liveEscalations.value = [];
   boardReady.value = false;
+  streamLoading.value = false;
+  streamHasMore.value = false;
+  streamLoaded.value = false;
+  traceHasMore.value = false;
+  targetEventsHasMore.value = false;
   liveTraceByTarget.value = {};
   expandedEventKeys.value = new Set();
   streamDetailLoading.value = {};
@@ -428,6 +455,7 @@ async function bootstrapTask() {
     } catch {
       /* 任务壳已出；看板失败不阻断 WS，避免活态停更 */
     }
+    ensureStreamEvents();
     wsIntentionalClose = false;
     connectWs();
   } finally {
@@ -562,7 +590,7 @@ function prependStreamEvent(item) {
   const shouldPreserveScroll = !!el && el.scrollTop > 4;
   const beforeHeight = el?.scrollHeight || 0;
   events.value.unshift(item);
-  if (events.value.length > 200) events.value.length = 200;
+  if (events.value.length > 400) events.value.length = 400;
   if (!shouldPreserveScroll) return;
   nextTick(() => {
     if (!eventLogRef.value) return;
@@ -573,20 +601,21 @@ function prependStreamEvent(item) {
 function pushLiveTrace(ev) {
   const tid = ev.target_id;
   if (!tid || !TRACE_KINDS.has(ev.kind || "")) return;
-  const map = { ...liveTraceByTarget.value };
-  const list = [...(map[tid] || [])];
-  // 兜底：万一某条实时事件没带 ts，落地为「收到时刻」的固定时间，
-  // 避免缺失时间导致所有行都显示当前时间、且每次刷新一起变。
+  // 按 target_id 原地更新，避免每次浅拷贝整个 map 触发全量依赖重算
+  const prev = liveTraceByTarget.value[tid] || [];
+  const list = prev.slice();
   const item = { ...ev, ts: ev.ts || new Date().toISOString(), _text: fmtEvent(ev) || ev.kind, _uid: ++_traceUid };
-  // 近端去重：同一事件的落库/实时两个副本只会挨得很近，扫最近若干条即可。
   const key = traceDedupKey(item);
   for (let i = list.length - 1, floor = Math.max(0, list.length - 60); i >= floor; i--) {
     if (traceDedupKey(list[i]) === key) return;
   }
   list.push(item);
   if (list.length > 300) list.splice(0, list.length - 300);
-  map[tid] = list;
-  liveTraceByTarget.value = map;
+  liveTraceByTarget.value = { ...liveTraceByTarget.value, [tid]: list };
+  // 展开明细缓存失效
+  for (const k of Object.keys(detailsCache)) {
+    if (k.includes(tid)) delete detailsCache[k];
+  }
   if (traceOpen.value && traceWorker.value?.target_id === tid) {
     traceEvents.value = [...list].reverse();
   }
@@ -605,12 +634,115 @@ function isEventExpanded(key) {
   return expandedEventKeys.value.has(key);
 }
 
-function detailsForTarget(targetId) {
+function numericRound(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
+}
+
+function targetDetailEvents(targetId) {
   const list = liveTraceByTarget.value[targetId] || [];
-  const details = list.filter((e) => DETAIL_KINDS.has(e.kind || ""));
-  // 最新在前，截断
-  const ordered = [...details].reverse();
-  return ordered.slice(0, STREAM_DETAIL_CAP);
+  return list.filter((e) => DETAIL_KINDS.has(e.kind || ""));
+}
+
+function roundAtOrBefore(details, ts) {
+  let found = null;
+  const t = ts || 0;
+  for (const d of details) {
+    const r = numericRound(d.round);
+    if (r == null) continue;
+    if (evEpoch(d) <= t + 1500) found = r;
+  }
+  return found;
+}
+
+function eventLooksCurrent(ev) {
+  const ts = evEpoch(ev);
+  if (!ts) return targetIsLive(ev?.target_id);
+  return Date.now() - ts < 45_000;
+}
+
+// 活动流行内只展开「这一条所属的那一轮」，避免把整个 worker 调用日志挂到每一条里程碑下。
+function resolveFocusRound(ev) {
+  if (!ev?.target_id) return null;
+  const explicit = numericRound(ev.round);
+  if (explicit != null) return explicit;
+  const kind = ev.kind || "";
+  if (kind === "worker_start") return 1;
+  if (kind === "worker_resume") {
+    const nxt = (numericRound(ev.rounds_done) || 0) + 1;
+    if (nxt > 0) return nxt;
+  }
+  const details = targetDetailEvents(ev.target_id);
+  const byTime = roundAtOrBefore(details, evEpoch(ev));
+  if (byTime != null) return byTime;
+  if (eventLooksCurrent(ev) && targetIsLive(ev.target_id)) {
+    const live = liveWorkers.value.find((w) => w.target_id === ev.target_id);
+    const liveRound = numericRound(live?.round);
+    if (liveRound != null) return liveRound;
+  }
+  return null;
+}
+
+const detailsCache = Object.create(null);
+
+function detailsForEvent(ev) {
+  const tid = ev?.target_id;
+  if (!tid) return [];
+  const round = resolveFocusRound(ev);
+  if (round == null) return [];
+  const cacheKey = `${tid}:${round}:${(liveTraceByTarget.value[tid] || []).length}`;
+  if (detailsCache[cacheKey]) return detailsCache[cacheKey];
+  const scoped = targetDetailEvents(tid).filter((e) => (
+    numericRound(e.round) === round && e.kind !== "llm_round_start"
+  ));
+  const out = [...scoped].reverse().slice(0, STREAM_DETAIL_CAP);
+  detailsCache[cacheKey] = out;
+  return out;
+}
+
+function streamRoundLabel(ev) {
+  const round = resolveFocusRound(ev);
+  return round != null ? `第 ${round} 轮` : "当前轮";
+}
+
+function streamDetailEmptyText(ev) {
+  const label = streamRoundLabel(ev);
+  if (targetIsLive(ev.target_id)) {
+    return `暂无${label}的工具/思考细节（worker 运行中，稍等产出）`;
+  }
+  return `暂无${label}的工具/思考细节（worker 已结束，明细可能已归档）`;
+}
+
+function workerStubFromEvent(ev) {
+  const tid = ev?.target_id;
+  if (!tid) return null;
+  const live = liveWorkers.value.find((w) => w.target_id === tid);
+  if (live) return live;
+  const raw = ev.target || ev.host || ev.url || "";
+  const host = raw
+    ? String(raw).replace(/^https?:\/\//i, "").split("/")[0]
+    : tid;
+  return {
+    target_id: tid,
+    host,
+    url: ev.url || ev.target || "",
+    round: numericRound(ev.round) || resolveFocusRound(ev) || 0,
+    started_at: ev._displayTs || ev.ts || "",
+    action: ev._text || ev.message || "",
+    findings: 0,
+  };
+}
+
+function openTraceFromEvent(ev) {
+  const w = workerStubFromEvent(ev);
+  if (w) openWorkerTrace(w);
+}
+
+function hasDetailsForRound(targetId, round) {
+  if (round == null) return false;
+  return (liveTraceByTarget.value[targetId] || []).some((e) => (
+    DETAIL_KINDS.has(e.kind || "") && numericRound(e.round) === round
+  ));
 }
 
 async function toggleEventExpand(ev, i) {
@@ -625,11 +757,12 @@ async function toggleEventExpand(ev, i) {
   next.add(key);
   expandedEventKeys.value = next;
   const tid = ev.target_id;
-  if ((liveTraceByTarget.value[tid] || []).some((e) => DETAIL_KINDS.has(e.kind || ""))) return;
+  const focusRound = resolveFocusRound(ev);
+  if (hasDetailsForRound(tid, focusRound)) return;
   if (streamDetailLoading.value[tid]) return;
   streamDetailLoading.value = { ...streamDetailLoading.value, [tid]: true };
   try {
-    const res = await api.targetTrace(props.id, tid, 120);
+    const res = await api.targetTrace(props.id, tid, TRACE_PAGE_SIZE);
     const rows = (res.events || []).map((e) => ({
       ...e,
       _text: fmtEvent(e) || e.message || e.kind,
@@ -859,10 +992,11 @@ const collabPhases = computed(() => {
   return phases.map((p) => ({ ...p, routes: groupedCollabRoutes(p.routes) }));
 });
 
-async function loadBoard() {
+async function loadBoard(opts = {}) {
   const id = props.id;
+  const light = !!opts.light;
   try {
-    const b = await api.board(id);
+    const b = await api.board(id, light ? { light: 1 } : {});
     if (id !== props.id) return;
     // 浅比较：字段未变则不替换数组，避免 worker-card 全列重渲染
     const nextWorkers = b.live_workers || [];
@@ -870,8 +1004,8 @@ async function loadBoard() {
       liveWorkers.value = nextWorkers;
     }
     liveEscalations.value = b.live_escalations || [];
-    siteCollab.value = b.site_collab || null;
-    retestSummary.value = b.retest_summary || null;
+    if (b.site_collab !== undefined) siteCollab.value = b.site_collab || null;
+    if (b.retest_summary !== undefined) retestSummary.value = b.retest_summary || null;
     if (task.value) {
       if (b.task_status) task.value.status = b.task_status;
       if (b.stats) task.value.stats = b.stats;
@@ -881,15 +1015,113 @@ async function loadBoard() {
       if (b.llm_usage_by_model) task.value.llm_usage_by_model = b.llm_usage_by_model;
       if (b.engine_usage) task.value.engine_usage = b.engine_usage;
     }
-    if (!events.value.length && b.events?.length) {
-      const existingByKey = new Map(events.value.map((e) => [streamEventStableKey(e), e]));
-      events.value = b.events
-        .filter(isImportantEvent)
-        .map((e) => normalizeTimedEvent(e, existingByKey))
-        .filter(Boolean);
-    }
   } finally {
     if (id === props.id) boardReady.value = true;
+  }
+}
+
+function isNarrowBoard() {
+  return typeof window !== "undefined" && window.matchMedia("(max-width: 640px)").matches;
+}
+
+function shouldLoadStream() {
+  if (tab.value !== "board") return false;
+  if (isNarrowBoard()) return boardPanel.value === "stream";
+  return true;
+}
+
+function oldestEventId(list) {
+  let min = null;
+  for (const e of list || []) {
+    const id = Number(e?.id);
+    if (!Number.isFinite(id)) continue;
+    if (min == null || id < min) min = id;
+  }
+  return min;
+}
+
+function mergeStreamRows(rows, { append = false } = {}) {
+  const incoming = (rows || [])
+    .filter((e) => isImportantEvent(e) || e.level === "error" || e.level === "warn")
+    .map((e) => normalizeTimedEvent(e, new Map(events.value.map((x) => [streamEventStableKey(x), x]))))
+    .filter(Boolean);
+  const combined = append ? [...events.value, ...incoming] : [...incoming, ...events.value];
+  const seen = new Set();
+  const seenIds = new Set();
+  const out = [];
+  for (const e of combined) {
+    if (e.id != null && seenIds.has(e.id)) continue;
+    const k = streamEventStableKey(e);
+    if (seen.has(k)) continue;
+    if (e.id != null) seenIds.add(e.id);
+    seen.add(k);
+    out.push(e);
+  }
+  if (!append) out.sort((a, b) => evEpoch(b) - evEpoch(a));
+  events.value = out;
+}
+
+async function loadStreamEvents({ reset = false } = {}) {
+  if (!props.id) return;
+  if (streamLoading.value) return;
+  if (!reset && streamLoaded.value && !streamHasMore.value) return;
+  const id = props.id;
+  streamLoading.value = true;
+  try {
+    const beforeId = reset ? undefined : oldestEventId(events.value);
+    const res = await api.taskEvents(id, {
+      limit: STREAM_PAGE_SIZE,
+      before_id: beforeId,
+    });
+    if (id !== props.id) return;
+    mergeStreamRows(res.items || res.events || [], { append: !reset && streamLoaded.value });
+    streamHasMore.value = !!res.has_more;
+    streamLoaded.value = true;
+  } catch {
+    if (reset) streamLoaded.value = false;
+  } finally {
+    if (id === props.id) streamLoading.value = false;
+  }
+}
+
+function ensureStreamEvents() {
+  if (!shouldLoadStream() || streamLoaded.value || streamLoading.value) return;
+  loadStreamEvents({ reset: true });
+}
+
+const STREAM_ROW_EST = 36;
+const STREAM_OVERSCAN = 40;
+const streamScrollTop = ref(0);
+const streamViewportH = ref(480);
+
+const visibleStreamRange = computed(() => {
+  const total = events.value.length;
+  if (total <= STREAM_OVERSCAN * 2 + 20) {
+    return { start: 0, end: total, topPad: 0, bottomPad: 0 };
+  }
+  const start = Math.max(0, Math.floor(streamScrollTop.value / STREAM_ROW_EST) - STREAM_OVERSCAN);
+  const visible = Math.ceil(streamViewportH.value / STREAM_ROW_EST) + STREAM_OVERSCAN * 2;
+  const end = Math.min(total, start + visible);
+  return {
+    start,
+    end,
+    topPad: start * STREAM_ROW_EST,
+    bottomPad: Math.max(0, (total - end) * STREAM_ROW_EST),
+  };
+});
+const windowedEvents = computed(() => {
+  const { start, end } = visibleStreamRange.value;
+  return events.value.slice(start, end).map((ev, i) => ({ ev, i: start + i }));
+});
+
+function onStreamScroll(ev) {
+  const el = ev.target;
+  if (!el) return;
+  streamScrollTop.value = el.scrollTop;
+  streamViewportH.value = el.clientHeight;
+  if (streamLoading.value || !streamHasMore.value) return;
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 48) {
+    loadStreamEvents({ reset: false });
   }
 }
 
@@ -958,7 +1190,7 @@ function syncPollers() {
   clearInterval(poolPoll);
  const running = task.value?.status === "running";
  // 运行态 5s、空闲 12s；实时性由 WebSocket 事件刷新兜底，轮询可更慢
- boardPoll = setInterval(loadBoard, running ? 5000 : 12000);
+ boardPoll = setInterval(() => loadBoard({ light: true }), running ? 5000 : 12000);
  poll = setInterval(() => refreshAll({
    background: true,
    includeTask: false,
@@ -999,11 +1231,16 @@ watch(() => task.value?.status, () => {
 });
 
 watch(tab, (t) => {
-  // 已加载过的 tab 直接用内存数据；未打开过的列表按需补拉一次。
-  // 数据新鲜度由 WebSocket 事件后台刷新 + 后台轮询(refreshAll)保证。
-  if (t === "board") return;
+  if (t === "board") {
+    ensureStreamEvents();
+    return;
+  }
   if (loadedTabs.value.has(t)) return;
   loadTabData(t);
+});
+
+watch(boardPanel, () => {
+  ensureStreamEvents();
 });
 
  watch(searchDraft, (v) => {
@@ -1053,22 +1290,32 @@ function closeTargetPanel() {
   targetDetailData.value = null;
 }
 
-async function loadTargetList() {
+async function loadTargetList(opts = {}) {
+  const reset = opts.reset !== false;
   targetListLoading.value = true;
   try {
     const status = targetFilter.value === "alive" ? "alive" :
                    targetFilter.value === "all" || !targetFilter.value ? null : targetFilter.value;
-    targetList.value = await api.targets(props.id, status, 500);
+    const offset = reset ? 0 : targetList.value.length;
+    const res = await api.targets(props.id, status, TARGET_PAGE_SIZE, { offset });
+    const rows = Array.isArray(res) ? res : (res.items || []);
+    targetList.value = reset ? rows : [...targetList.value, ...rows];
+    targetListHasMore.value = !Array.isArray(res) && !!res.has_more;
   } catch (e) {
     toast("加载目标列表失败");
   } finally {
     targetListLoading.value = false;
   }
 }
+async function loadMoreTargets() {
+  if (targetListLoading.value || !targetListHasMore.value) return;
+  await loadTargetList({ reset: false });
+}
 
 async function openTargetDetail(tid) {
   targetDetailLoading.value = true;
   targetDetailData.value = null;
+  targetEventsHasMore.value = false;
   // 重置注册助手状态
   targetAssistantText.value = "";
   targetAssistantBusy.value = false;
@@ -1079,10 +1326,38 @@ async function openTargetDetail(tid) {
     targetAssistantMessages.value = (saved?.length)
       ? saved
       : [{ role: "assistant", content: TARGET_ASSISTANT_WELCOME }];
+    loadTargetEvents(tid, { reset: true });
   } catch (e) {
     toast("加载目标详情失败");
   } finally {
     targetDetailLoading.value = false;
+  }
+}
+
+async function loadTargetEvents(tid, { reset = false } = {}) {
+  if (!tid || targetEventsLoading.value) return;
+  if (!reset && !targetEventsHasMore.value) return;
+  targetEventsLoading.value = true;
+  try {
+    const beforeId = reset ? undefined : oldestEventId(targetDetailData.value?.events || []);
+    const res = await api.targetEvents(props.id, tid, {
+      limit: TARGET_EVENT_PAGE_SIZE,
+      before_id: beforeId,
+    });
+    if (targetDetailData.value?.target?.id !== tid) return;
+    const rows = res.items || [];
+    const existing = reset ? [] : (targetDetailData.value.events || []);
+    const seen = new Set(existing.map((e) => e.id).filter((id) => id != null));
+    const extra = rows.filter((e) => e.id == null || !seen.has(e.id));
+    targetDetailData.value = {
+      ...targetDetailData.value,
+      events: [...existing, ...extra],
+    };
+    targetEventsHasMore.value = !!res.has_more;
+  } catch {
+    /* 空态即可 */
+  } finally {
+    targetEventsLoading.value = false;
   }
 }
 
@@ -1337,7 +1612,8 @@ async function skipTarget(w) {
 
 async function openWorkerTrace(w) {
   if (!w?.target_id) return;
-  traceWorker.value = w;
+  const liveWorker = liveWorkers.value.find((x) => x.target_id === w.target_id);
+  traceWorker.value = liveWorker || { ...w };
   traceOpen.value = true;
   directiveText.value = "";
   const live = liveTraceByTarget.value[w.target_id] || [];
@@ -1347,8 +1623,16 @@ async function openWorkerTrace(w) {
     traceEvents.value = [];
   }
   traceLoading.value = true;
+  traceHasMore.value = false;
   try {
-    const res = await api.targetTrace(props.id, w.target_id, 200);
+    const res = await api.targetTrace(props.id, w.target_id, { limit: TRACE_PAGE_SIZE });
+    if (traceWorker.value && (res.host || res.url)) {
+      traceWorker.value = {
+        ...traceWorker.value,
+        host: traceWorker.value.host || res.host || "",
+        url: traceWorker.value.url || res.url || "",
+      };
+    }
     const rows = (res.events || []).map((e) => ({ ...e, _text: fmtEvent(e) || e.message || e.kind }));
     // 落库轨迹 + 内存实时轨迹合并去重（秒级内容键，抹平两副本的毫秒 ts 差异）
     const seen = new Set();
@@ -1366,10 +1650,44 @@ async function openWorkerTrace(w) {
       ...liveTraceByTarget.value,
       [w.target_id]: merged,                            // 缓存保持时间正序，供实时追加
     };
+    traceHasMore.value = !!res.has_more;
   } catch (e) {
     if (!traceEvents.value.length) toast(`加载轨迹失败：${e?.message || e}`);
   } finally {
     traceLoading.value = false;
+  }
+}
+
+async function loadMoreTrace() {
+  const w = traceWorker.value;
+  if (!w?.target_id || traceLoadingMore.value || !traceHasMore.value) return;
+  const oldest = oldestEventId(liveTraceByTarget.value[w.target_id] || traceEvents.value);
+  if (oldest == null) {
+    traceHasMore.value = false;
+    return;
+  }
+  traceLoadingMore.value = true;
+  try {
+    const res = await api.targetTrace(props.id, w.target_id, {
+      limit: TRACE_PAGE_SIZE,
+      before_id: oldest,
+    });
+    const rows = (res.events || []).map((e) => ({
+      ...e,
+      _text: fmtEvent(e) || e.message || e.kind,
+      _uid: e._uid ?? ++_traceUid,
+    }));
+    const seen = new Set((liveTraceByTarget.value[w.target_id] || []).map(traceDedupKey));
+    const extra = rows.filter((e) => !seen.has(traceDedupKey(e)));
+    const merged = [...extra, ...(liveTraceByTarget.value[w.target_id] || [])];
+    merged.sort((a, b) => evEpoch(a) - evEpoch(b));
+    liveTraceByTarget.value = { ...liveTraceByTarget.value, [w.target_id]: merged };
+    traceEvents.value = [...merged].reverse();
+    traceHasMore.value = !!res.has_more;
+  } catch (e) {
+    toast(`加载更早轨迹失败：${e?.message || e}`);
+  } finally {
+    traceLoadingMore.value = false;
   }
 }
 
@@ -1576,15 +1894,51 @@ function downloadFile(filename, content, mime) {
   URL.revokeObjectURL(a.href);
 }
 
+async function fetchAllReviewReports() {
+  const reports = [];
+  let offset = 0;
+  for (;;) {
+    const res = await api.reviewQueue(props.id, undefined, {
+      compact: false,
+      limit: EXPORT_PAGE_SIZE,
+      offset,
+    });
+    const rows = Array.isArray(res) ? res : (res.items || []);
+    reports.push(...rows);
+    if (Array.isArray(res) || !res.has_more) break;
+    offset += rows.length;
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  }
+  return reports;
+}
+
+async function downloadReviewArtifact(finding, kind) {
+  if (!finding?.id || cardDownloadingId.value) return;
+  cardDownloadingId.value = finding.id;
+  try {
+    // 列表走 compact，缺 description/steps/poc/raw_request 等正文；下载前拉完整 finding。
+    const full = await api.finding(finding.id);
+    if (kind === "md") {
+      downloadFile(`${reportSlug(full)}.md`, buildReportMd(full), "text/markdown;charset=utf-8");
+      toast(`已下载 ${full.title?.slice(0, 20) || "报告"}.md`);
+    } else {
+      downloadFile(`${reportSlug(full)}.py`, buildReportPy(full), "text/x-python;charset=utf-8");
+      toast(`已下载 ${full.title?.slice(0, 20) || "PoC"}.py`);
+    }
+  } catch (e) {
+    toast(`下载失败：${e.message || e}`);
+  } finally {
+    cardDownloadingId.value = null;
+  }
+}
+
 /** 复审队列：单项下载 MD */
 function downloadReviewMd(finding) {
-  downloadFile(`${reportSlug(finding)}.md`, buildReportMd(finding), "text/markdown;charset=utf-8");
-  toast(`已下载 ${finding.title?.slice(0, 20) || "报告"}.md`);
+  return downloadReviewArtifact(finding, "md");
 }
 /** 复审队列：单项下载 py 脚本 */
 function downloadReviewPy(finding) {
-  downloadFile(`${reportSlug(finding)}.py`, buildReportPy(finding), "text/x-python;charset=utf-8");
-  toast(`已下载 ${finding.title?.slice(0, 20) || "PoC"}.py`);
+  return downloadReviewArtifact(finding, "py");
 }
 
 /** 复审队列：批量导出全部 MD（合并为一个文件） */
@@ -1593,11 +1947,12 @@ async function exportReviewAllMd() {
   bulkWorking.value = true;
   try {
     toast("正在生成复审队列 Markdown...");
-    // 复审队列数据已在内存中，直接使用
-    const reports = queue.value;
+    const reports = await fetchAllReviewReports();
     const md = reports.map((f) => buildReportMd(f)).join("\n\n---\n\n");
     downloadFile(`autohunter-${props.id.slice(0, 8)}-review.md`, md, "text/markdown;charset=utf-8");
     toast(`已导出 ${reports.length} 份复审报告`);
+  } catch (e) {
+    toast(`导出失败：${e.message || e}`);
   } finally {
     bulkWorking.value = false;
   }
@@ -1609,7 +1964,7 @@ async function exportReviewAllPy() {
   bulkWorking.value = true;
   try {
     toast("正在生成复审队列 PoC 脚本...");
-    const reports = queue.value;
+    const reports = await fetchAllReviewReports();
     const scripts = reports.map((f, i) => {
       const sep = "# " + "=".repeat(70);
       const title = (f.review?.user_edits?.title || f.title || "").slice(0, 60);
@@ -1617,6 +1972,8 @@ async function exportReviewAllPy() {
     }).join("\n\n\n");
     downloadFile(`autohunter-${props.id.slice(0, 8)}-review-poc.py`, scripts, "text/x-python;charset=utf-8");
     toast(`已导出 ${reports.length} 份 PoC 脚本`);
+  } catch (e) {
+    toast(`导出失败：${e.message || e}`);
   } finally {
     bulkWorking.value = false;
   }
@@ -1907,11 +2264,13 @@ const engineSourceHint = computed(() => {
 });
 const cacheHitRate = computed(() => {
   const u = tokenUsage.value || {};
+  const prompt = Number(u.prompt_tokens || 0);
   const hit = Number(u.cache_hit_tokens || 0);
   const miss = Number(u.cache_miss_tokens || 0);
-  const base = hit + miss || Number(u.prompt_tokens || 0);
-  if (!base) return null;
-  return Math.round((hit / base) * 100);
+  if (prompt <= 0) return null;
+  if (hit <= 0 && miss <= 0) return null;
+  const capped = Math.min(Math.max(hit, 0), prompt);
+  return Number(((capped / prompt) * 100).toFixed(1));
 });
 const isEnterpriseTask = computed(() => task.value?.src_type === "enterprise");
 const taskModeName = computed(() => isEnterpriseTask.value ? "企业SRC" : "EduSRC");
@@ -1955,10 +2314,13 @@ function stringifyForSearch(v) {
   return buildSearchText(v);
 }
 function buildSearchText(v) {
-  const parts = [];
-  try { parts.push(JSON.stringify(v ?? "", null, 0)); }
-  catch { parts.push(String(v ?? "")); }
-  return parts.join("\n").toLowerCase();
+  // 只用轻字段建索引，禁止 JSON.stringify 整份 finding（含 POC/报文）
+  const parts = [
+    v?.title, v?.vuln_type, v?.target_url, v?.owner, v?.status,
+    v?.review?.verdict, v?.review?.user_status, v?.review?.effective_severity,
+    v?.host, v?.url, v?.name,
+  ];
+  return parts.filter(Boolean).join("\n").toLowerCase();
 }
 function withSearchCache(v) {
   return { ...v, _searchText: buildSearchText(v) };
@@ -2087,7 +2449,10 @@ function fmtTime(iso) {
             <i>Token</i>
             <b>{{ formatTokenCount(tokenUsage.total_tokens) }}</b>
             <small>输入 {{ formatTokenCount(tokenUsage.prompt_tokens) }} / 输出 {{ formatTokenCount(tokenUsage.completion_tokens) }}</small>
-            <small v-if="cacheHitRate !== null">缓存命中 {{ cacheHitRate }}%（命中价约 1/10）</small>
+            <small
+              v-if="cacheHitRate !== null"
+              :title="`命中 ${formatTokenCount(tokenUsage.cache_hit_tokens)} / 输入 ${formatTokenCount(tokenUsage.prompt_tokens)}`"
+            >缓存命中 {{ cacheHitRate }}%</small>
           </span>
           <span class="runtime-chip">
             <i>请求</i>
@@ -2344,16 +2709,19 @@ function fmtTime(iso) {
       <div class="board-col board-panel" :class="{ 'board-panel-hidden': boardPanel !== 'stream' }">
         <div class="col-head">
           <span>Activity Stream</span>
-          <small>点击带目标的行展开细节</small>
+          <small>点击带目标的行展开当前轮</small>
         </div>
-        <div ref="eventLogRef" class="event-log">
-          <div v-if="!boardReady && !events.length" class="board-hydrate" aria-hidden="true">
+        <div ref="eventLogRef" class="event-log" @scroll="onStreamScroll">
+          <div v-if="(streamLoading || !boardReady) && !events.length" class="board-hydrate" aria-hidden="true">
             <div v-for="n in 6" :key="n" class="skeleton-line"></div>
           </div>
           <div v-else-if="!events.length" class="empty sm">等待事件…</div>
-          <template v-for="(ev, i) in events" :key="eventExpandKey(ev, i)">
+          <template v-else>
+            <div v-if="visibleStreamRange.topPad" :style="{ height: visibleStreamRange.topPad + 'px' }" aria-hidden="true"></div>
+            <template v-for="{ ev, i } in windowedEvents" :key="eventExpandKey(ev, i)">
             <div
               :class="[evClass(ev), { expandable: canExpandEvent(ev), open: isEventExpanded(eventExpandKey(ev, i)) }]"
+              style="content-visibility: auto; contain-intrinsic-size: auto 36px"
               @click="toggleEventExpand(ev, i)"
             >
               <span v-if="canExpandEvent(ev)" class="ev-toggle" aria-hidden="true">
@@ -2377,11 +2745,11 @@ function fmtTime(iso) {
               class="ev-details"
             >
               <div v-if="streamDetailLoading[ev.target_id]" class="ev-detail-row muted">加载细节…</div>
-              <div v-else-if="!detailsForTarget(ev.target_id).length" class="ev-detail-row muted">
-                {{ targetIsLive(ev.target_id) ? "暂无工具/思考细节（worker 运行中，稍等产出）" : "该 worker 已结束，工具/思考明细已归档清理（仅保留关键节点）" }}
+              <div v-else-if="!detailsForEvent(ev).length" class="ev-detail-row muted">
+                {{ streamDetailEmptyText(ev) }}
               </div>
               <div
-                v-for="(d, di) in detailsForTarget(ev.target_id)"
+                v-for="(d, di) in detailsForEvent(ev)"
                 :key="di"
                 class="ev-detail-row"
               >
@@ -2397,8 +2765,25 @@ function fmtTime(iso) {
                 >复制</button>
                 <span class="ev-detail-time">{{ evTime(d) }}</span>
               </div>
+              <div class="ev-detail-foot">
+                <span class="ev-detail-round-label">{{ streamRoundLabel(ev) }}</span>
+                <button
+                  type="button"
+                  class="ev-trace-link"
+                  @click.stop="openTraceFromEvent(ev)"
+                >查看完整轨迹</button>
+              </div>
             </div>
+            </template>
+            <div v-if="visibleStreamRange.bottomPad" :style="{ height: visibleStreamRange.bottomPad + 'px' }" aria-hidden="true"></div>
           </template>
+          <button
+            v-if="streamHasMore"
+            type="button"
+            class="stream-more"
+            :disabled="streamLoading"
+            @click="loadStreamEvents({ reset: false })"
+          >{{ streamLoading ? "加载中…" : "加载更早记录" }}</button>
         </div>
       </div>
     </div>
@@ -2424,8 +2809,12 @@ function fmtTime(iso) {
           <div class="meta rr-time">发现 {{ fmtLocalTime(f.created_at) }}<template v-if="f.llm_model"> · 模型 {{ f.llm_model }}</template></div>
         </div>
         <div class="rr-actions" @click.stop>
-          <button class="rr-dl" title="下载 Markdown" @click="downloadReviewMd(f)">MD</button>
-          <button class="rr-dl" title="下载 PoC 脚本" @click="downloadReviewPy(f)">PY</button>
+          <button class="rr-dl" title="下载 Markdown" :disabled="cardDownloadingId === f.id" @click="downloadReviewMd(f)">
+            {{ cardDownloadingId === f.id ? "…" : "MD" }}
+          </button>
+          <button class="rr-dl" title="下载 PoC 脚本" :disabled="cardDownloadingId === f.id" @click="downloadReviewPy(f)">
+            {{ cardDownloadingId === f.id ? "…" : "PY" }}
+          </button>
         </div>
         <span class="score">{{ f.review?.score ?? "-" }}</span>
       </div>
@@ -2740,6 +3129,13 @@ function fmtTime(iso) {
               </div>
               <span class="tp-score" v-if="t.priority_score > 0">★{{ Math.round(t.priority_score) }}</span>
             </div>
+            <button
+              v-if="targetListHasMore && !targetSearch.trim()"
+              type="button"
+              class="load-more"
+              :disabled="targetListLoading"
+              @click="loadMoreTargets"
+            >{{ targetListLoading ? "加载中…" : "加载更多目标" }}</button>
           </div>
         </template>
 
@@ -2921,17 +3317,26 @@ function fmtTime(iso) {
             <div v-else class="empty sm">该目标暂无漏洞记录</div>
 
             <!-- 事件历史 -->
-            <div class="tp-section-head" v-if="targetDetailData.events?.length">
-              <span>事件历史 ({{ targetDetailData.events.length }})</span>
+            <div class="tp-section-head">
+              <span>事件历史{{ targetDetailData.events?.length ? ` (${targetDetailData.events.length})` : "" }}</span>
+              <small v-if="targetEventsLoading">加载中</small>
             </div>
             <div v-if="targetDetailData.events?.length" class="tp-events">
-              <div v-for="(e, i) in targetDetailData.events" :key="i" class="tp-event">
+              <div v-for="(e, i) in targetDetailData.events" :key="e.id || i" class="tp-event">
                 <span class="tp-event-agent">{{ AGENT_LABEL[e.agent] || e.agent }}</span>
                 <span class="tp-event-kind">{{ e.kind }}</span>
                 <span class="tp-event-msg" v-if="e.message">{{ e.message }}</span>
                 <span class="tp-event-ts">{{ fmtTime(e.ts) }}</span>
               </div>
             </div>
+            <div v-else-if="!targetEventsLoading" class="empty sm">暂无事件记录</div>
+            <button
+              v-if="targetEventsHasMore"
+              type="button"
+              class="stream-more"
+              :disabled="targetEventsLoading"
+              @click="loadTargetEvents(targetDetailData.target.id)"
+            >{{ targetEventsLoading ? "加载中…" : "加载更早事件" }}</button>
           </template>
         </template>
       </div>
@@ -2991,6 +3396,13 @@ function fmtTime(iso) {
                 </span>
               </div>
             </TransitionGroup>
+            <button
+              v-if="traceHasMore"
+              type="button"
+              class="stream-more"
+              :disabled="traceLoadingMore"
+              @click="loadMoreTrace"
+            >{{ traceLoadingMore ? "加载中…" : "加载更早轨迹" }}</button>
           </div>
         </div>
       </aside>

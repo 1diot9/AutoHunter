@@ -1870,6 +1870,20 @@ main {
 .test-result.fail {
   color: #e05260;
 }
+.ssh-settings-test {
+  align-items: flex-start;
+  flex-direction: column;
+}
+.ssh-test-result {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+}
+.ssh-test-result .test-result {
+  overflow-wrap: anywhere;
+}
 .engine-config-item {
   padding: 14px 0;
   border-bottom: 1px solid var(--border);
@@ -2700,6 +2714,18 @@ main {
   padding: 10px; font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 12px;
 }
 .board-grid .event-log { max-height: 470px; }
+.stream-more {
+  margin-top: 6px;
+  width: 100%;
+  min-height: 32px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+.stream-more:hover:not(:disabled) { color: var(--ink); border-color: var(--faint); }
+.stream-more:disabled { opacity: .6; }
 .ev { display: flex; align-items: baseline; gap: 10px; padding: 6px 8px; border-radius: var(--radius-sm); border: 1px solid transparent; }
 .ev:hover { background: var(--surface); border-color: var(--border-soft); }
 .ev.error { color: var(--danger); }
@@ -2780,6 +2806,27 @@ main {
 .ev-detail-kind { color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ev-detail-msg { min-width: 0; word-break: break-word; }
 .ev-detail-time { color: var(--faint); white-space: nowrap; font-size: 10.5px; }
+.ev-detail-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+  padding: 4px 4px 0;
+}
+.ev-detail-round-label { font-size: 11px; color: var(--faint); }
+.ev-trace-link {
+  margin: 0;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--accent-ink);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.ev-trace-link:hover { border-color: var(--accent); color: var(--ink); }
 @media (max-width: 640px) {
   .ev-detail-row { grid-template-columns: 32px 1fr auto; }
   .ev-detail-kind { display: none; }
@@ -3011,6 +3058,7 @@ main {
   cursor: pointer; transition: all .15s ease; font-family: "IBM Plex Mono", monospace;
 }
 .rr-dl:hover { background: var(--info-bg); color: var(--info); border-color: var(--info); }
+.rr-dl:disabled { opacity: .55; cursor: wait; }
 .score {
   min-width: 42px; text-align: center; color: var(--ink);
   background: var(--surface); border: 1px solid var(--border-soft); border-radius: 9px;

@@ -56,6 +56,8 @@ async function toggleTop(t) {
     await api.taskTop(t.id, next);
     const cur = tasks.value.find((x) => x.id === t.id);
     if (cur) cur.is_top = next;
+    // 置顶后跳到第一页，避免卡片被筛到页外看起来像没生效。
+    if (next) page.value = 0;
     toast(next ? "已置顶" : "已取消置顶");
   } catch (e) {
     alert(`置顶失败：${e?.message || e}`);
@@ -76,6 +78,7 @@ async function batchTop(isTop) {
     const fail = res?.failed_ids ?? [];
     const idSet = new Set(ids);
     tasks.value.forEach((t) => { if (idSet.has(t.id)) t.is_top = isTop; });
+    if (isTop) page.value = 0;
     toast(`成功${isTop ? "置顶" : "取消置顶"} ${ok} 个任务${fail.length ? `，${fail.length} 个失败` : ""}`);
     selected.value = new Set();
   } catch (e) {
@@ -83,6 +86,8 @@ async function batchTop(isTop) {
   }
 }
 let pollTimer = null;
+let lastLoadAt = 0;
+const LOAD_STALE_MS = 20000;
 
 // 搜索与排序
 const searchQuery = ref("");
@@ -139,10 +144,16 @@ const filteredTasks = computed(() => {
     list = list.filter((t) => idSet.has(t.id));
   }
   const sorted = [...list];
+  // 置顶优先（与后端 list_tasks 的 is_top DESC 对齐）；次级排序仍走创建时间 / 拼音。
+  // 任务列表是全量拉取后再前端分页，这里如果不按 is_top 排，置顶标记会亮、卡片却不挪位置。
+  const byPinThen = (secondary) => (a, b) => {
+    const pin = Number(!!b.is_top) - Number(!!a.is_top);
+    return pin || secondary(a, b);
+  };
   if (sortBy.value === "pinyin") {
-    sorted.sort((a, b) => _pinyinCollator.compare(a.name || "", b.name || ""));
+    sorted.sort(byPinThen((a, b) => _pinyinCollator.compare(a.name || "", b.name || "")));
   } else {
-    sorted.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+    sorted.sort(byPinThen((a, b) => (b.created_at || "").localeCompare(a.created_at || "")));
   }
   return sorted;
 });
@@ -188,7 +199,7 @@ function targetSourceLabel(t) {
 }
 function taskScopeText(t) {
   if (t?.target_source === "site") {
-    return t.fofa_query || t.manual_targets?.[0] || "单站协作";
+    return t.fofa_query || "单站协作";
   }
   return t?.fofa_query || "手动清单";
 }
@@ -200,14 +211,25 @@ function syncPoller() {
   pollTimer = null;
   // 有运行中任务时加快刷新；否则慢轮询，仍能感知远端状态变化。
   const ms = hasRunning.value ? 5000 : 15000;
-  pollTimer = setInterval(() => load({ background: true }), ms);
+  pollTimer = setInterval(() => {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    load({ background: true });
+  }, ms);
 }
 
 async function load(opts = {}) {
   const background = !!opts.background;
+  const force = !!opts.force;
+  if (!force && background && lastLoadAt && (Date.now() - lastLoadAt) < LOAD_STALE_MS) {
+    syncPoller();
+    return;
+  }
   if (!tasks.value.length) initialLoading.value = true;
   else if (!background) refreshing.value = true;
-  try { tasks.value = await api.listTasks(); }
+  try {
+    tasks.value = await api.listTasks();
+    lastLoadAt = Date.now();
+  }
   finally {
     initialLoading.value = false;
     refreshing.value = false;
@@ -369,7 +391,9 @@ onUnmounted(() => {
   taskListState.hasSavedState = true;
 });
 onActivated(() => {
+  // 20s 内刚拉过则跳过，避免从看板返回再打全量列表
   if (tasks.value.length) load({ background: true });
+  else load({ force: true });
   syncPoller();
 });
 onDeactivated(() => {

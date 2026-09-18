@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { api } from "../api.js";
 import LlmModelPicker from "../components/LlmModelPicker.vue";
 import { copyText, formatLlmTestCopy } from "../clipboard.js";
@@ -16,6 +16,8 @@ import {
   resetUiLocal,
   saveUiPrefs,
 } from "../uiTheme.js";
+
+defineOptions({ name: "SettingsView" });
 
 const loading = ref(true);
 const saving = ref(false);
@@ -51,8 +53,8 @@ let healthPoll = null;
 let restartPoll = null;   // pollHealth 的重启轮询计时器（组件卸载时清理，防泄漏）
 
 // 连通性测试状态
-const testing = reactive({ llm: false, ssh: false });
-const testResult = reactive({ llm: null, ssh: null });
+const testing = reactive({ ssh: false });
+const testResult = reactive({ ssh: null });
 
 // 引擎连通性测试状态
 const engineTesting = reactive({});
@@ -62,7 +64,7 @@ async function runTest(type) {
   testing[type] = true;
   testResult[type] = null;
   try {
-    const fn = { llm: api.testLLM, ssh: api.testSSH }[type];
+    const fn = { ssh: api.testSSH }[type];
     const res = await fn();
     testResult[type] = res;
   } catch (e) {
@@ -967,19 +969,32 @@ onMounted(async () => {
   uiPrefs.value = loadUiPrefs();
   window.addEventListener("ah-ui-changed", onUiChanged);
   await load();
-  loadWorkdirStats();
+  // workdir 统计改为手动刷新，避免设置页打开时扫盘卡顿
   loadBackupStats();
   refreshProviderHealth().catch(() => {});
-  healthPoll = setInterval(() => refreshProviderHealth().catch(() => {}), 10000);
+  startHealthPoll();
   checkUpdate();
+});
+onActivated(() => {
+  startHealthPoll();
+});
+onDeactivated(() => {
+  clearInterval(healthPoll);
+  healthPoll = null;
 });
 onUnmounted(() => {
   window.removeEventListener("ah-ui-changed", onUiChanged);
   clearTimeout(uiSaveTimer);
   clearInterval(healthPoll);
+  healthPoll = null;
   clearInterval(restartPoll);
   clearTimeout(autoSaveTimer);
 });
+
+function startHealthPoll() {
+  clearInterval(healthPoll);
+  healthPoll = setInterval(() => refreshProviderHealth().catch(() => {}), 10000);
+}
 
 async function loadBackupStats() {
   backupLoading.value = true;
@@ -1385,14 +1400,6 @@ async function restoreBackup() {
               </li>
             </ul>
           </div>
-          <div class="settings-test">
-            <button type="button" class="test-btn" :disabled="testing.llm" @click="runTest('llm')">
-              {{ testing.llm ? "测试中…" : "测试连通" }}
-            </button>
-            <span v-if="testResult.llm" class="test-result" :class="testResult.llm.ok ? 'ok' : 'fail'">
-              {{ testResult.llm.ok ? "✓" : "✗" }} {{ testResult.llm.message }}
-            </span>
-          </div>
         </fieldset>
 
         <fieldset v-show="settingsTab === 'recon'" class="settings-block">
@@ -1518,13 +1525,25 @@ async function restoreBackup() {
             </label>
             <p class="field-hint full">容器内私钥路径。私钥文件需先通过 docker-compose 挂载进容器（一次性配置）。</p>
           </div>
-          <div class="settings-test">
+          <div class="settings-test ssh-settings-test">
             <button type="button" class="test-btn" :disabled="testing.ssh" @click="runTest('ssh')">
               {{ testing.ssh ? "测试中…" : "测试连通" }}
             </button>
-            <span v-if="testResult.ssh" class="test-result" :class="testResult.ssh.ok ? 'ok' : 'fail'">
-              {{ testResult.ssh.ok ? "✓" : "✗" }} {{ testResult.ssh.message }}
-            </span>
+            <div v-if="testResult.ssh" class="ssh-test-result">
+              <template v-if="testResult.ssh.details?.length">
+                <div
+                  v-for="(r, i) in testResult.ssh.details"
+                  :key="`${r.type}-${r.server}-${i}`"
+                  class="test-result"
+                  :class="r.ok ? 'ok' : 'fail'"
+                >
+                  {{ r.ok ? "✓" : "✗" }} [{{ r.type }}] {{ r.server }}: {{ r.ok ? "连通正常" : r.message }}
+                </div>
+              </template>
+              <div v-else class="test-result" :class="testResult.ssh.ok ? 'ok' : 'fail'">
+                {{ testResult.ssh.ok ? "✓" : "✗" }} {{ testResult.ssh.message }}
+              </div>
+            </div>
           </div>
         </fieldset>
 
