@@ -242,8 +242,8 @@ function downloadPy() {
   emit("toast", "已下载 PoC 脚本");
 }
 
-const TOOL_LABEL = { http_request: "HTTP 请求", run_shell: "执行命令" };
-const TOOL_LABEL = { http_request: "HTTP 请求", run_shell: "执行命令", propose_report_edits: "提出改稿" };function stepLabel(ev) {
+const TOOL_LABEL = { http_request: "HTTP 请求", run_shell: "执行命令", propose_report_edits: "提出改稿" };
+function stepLabel(ev) {
   if (ev.type === "thinking") return ev.text || "分析中…";
   if (ev.type === "tool_call") return `${TOOL_LABEL[ev.tool] || ev.tool}：${ev.summary || ""}`;
   if (ev.type === "tool_result") return `↳ ${ev.summary || "完成"}`;

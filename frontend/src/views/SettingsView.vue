@@ -596,7 +596,9 @@ async function load() {
     form.max_pages = s.fofa?.max_pages ?? 20;
     form.page_size = s.fofa?.page_size ?? 100;
     form.default_intent_mode = s.fofa?.default_intent_mode || "";
-    form.default_engine = s.defaults?.engine || "";    form.concurrency = s.defaults?.concurrency ?? 3;
+    form.default_engine = s.defaults?.engine || "fofa";
+    form.concurrency = s.defaults?.concurrency ?? 3;
+    form.deepen_cap = s.defaults?.deepen_cap ?? 2;
     form.skip_score_threshold = s.defaults?.skip_score_threshold ?? -10;
     form.worker_prompt_version = s.defaults?.worker_prompt_version || "legacy";
     form.proxy_ssh_servers = s.proxy?.ssh_servers || "";
@@ -606,6 +608,7 @@ async function load() {
     const engines = s.engines || {};
     const engineList = s.available_engines || [];
     availableEngines.value = engineList;
+    form.available_engines = engineList;
     for (const eng of engineList) {
       const name = eng.name;
       const ecfg = engines[name] || {};
@@ -614,6 +617,12 @@ async function load() {
         base_url: ecfg.base_url || "",
         key_set: !!ecfg.key_set,
       };
+    }
+    if (engineForm.fofa && !engineForm.fofa.key_set && s.fofa?.key_set) {
+      engineForm.fofa.key_set = true;
+    }
+    if (engineForm.fofa && !engineForm.fofa.base_url && s.fofa?.base_url) {
+      engineForm.fofa.base_url = s.fofa.base_url;
     }
     // 加载模型计价
     const pricing = s.pricing || {};
@@ -624,33 +633,9 @@ async function load() {
       cache_hit: cfg.cache_hit ?? "",
     }));
     // 如果当前模型不在计价列表中，自动添加一行
-    if (form.model && !pricingEntries.value.some(e => e.model === form.model)) {
+    if (form.model && !pricingEntries.value.some((e) => e.model === form.model)) {
       pricingEntries.value.unshift({ model: form.model, input: "", output: "", cache_hit: "" });
-    form.default_engine = s.defaults?.engine || "fofa";
-    form.available_engines = s.available_engines || [];
-    const engView = s.engines || {};
-    const nextEngines = {};
-    for (const meta of form.available_engines) {
-      const name = meta.name;
-      const cur = engView[name] || {};
-      nextEngines[name] = {
-        display_name: meta.display_name || cur.display_name || name,
-        key: "",
-        key_set: !!cur.key_set,
-        base_url: cur.base_url || "",
-      };
     }
-    if (nextEngines.fofa && !nextEngines.fofa.key_set && s.fofa?.key_set) {
-      nextEngines.fofa.key_set = true;
-    }
-    if (nextEngines.fofa && !nextEngines.fofa.base_url && s.fofa?.base_url) {
-      nextEngines.fofa.base_url = s.fofa.base_url;
-    }
-    form.engines = nextEngines;
-    form.concurrency = s.defaults?.concurrency ?? 3;
-    form.deepen_cap = s.defaults?.deepen_cap ?? 2;
-    form.skip_score_threshold = s.defaults?.skip_score_threshold ?? -10;
-    form.worker_prompt_version = s.defaults?.worker_prompt_version || "legacy";
     if (s.ui) {
       uiPrefs.value = saveUiPrefs(prefsFromApi(s.ui));
       await applyUi(uiPrefs.value);
@@ -870,6 +855,7 @@ function addPricingRow() {
 }
 function removePricingRow(idx) {
   pricingEntries.value.splice(idx, 1);
+}
 const settingsTab = ref("appearance");
 const uiPrefs = ref(loadUiPrefs());
 const wallpaperBusy = ref(false);
@@ -982,12 +968,10 @@ onMounted(async () => {
   window.addEventListener("ah-ui-changed", onUiChanged);
   await load();
   loadWorkdirStats();
+  loadBackupStats();
   refreshProviderHealth().catch(() => {});
   healthPoll = setInterval(() => refreshProviderHealth().catch(() => {}), 10000);
-  // 探测后端是否支持更新 API（原版不注册 → supported=false → 隐藏区块）
   checkUpdate();
-  loadWorkdirStats();
-  loadBackupStats();
 });
 onUnmounted(() => {
   window.removeEventListener("ah-ui-changed", onUiChanged);
@@ -1068,38 +1052,6 @@ async function restoreBackup() {
     toast(String(e.message || e).replace(/^\d+\s*/, ""));
   } finally {
     backupBusy.value = "";
-  }
-}
-
-async function loadWorkdirStats() {
-  workdirLoading.value = true;
-  try {
-    workdirStats.value = await api.workdirStats();
-    if (workdirStats.value) {
-      cleanupRetentionDays.value = workdirStats.value.retention_days || 7;
-    }
-  } catch (e) {
-    toast(String(e.message || e).replace(/^\d+\s*/, ""));
-  } finally {
-    workdirLoading.value = false;
-  }
-}
-
-async function runCleanup() {
-  workdirCleaning.value = true;
-  workdirResult.value = null;
-  try {
-    const res = await api.workdirCleanup(cleanupRetentionDays.value, cleanupDryRun.value);
-    workdirResult.value = res;
-    const prefix = res.dry_run ? "模拟清理" : "清理";
-    toast(`${prefix}完成：删除 ${res.deleted_dirs} 个目录，释放 ${res.freed_human}`);
-    if (!res.dry_run) {
-      await loadWorkdirStats();
-    }
-  } catch (e) {
-    toast(String(e.message || e).replace(/^\d+\s*/, ""));
-  } finally {
-    workdirCleaning.value = false;
   }
 }
 </script>
