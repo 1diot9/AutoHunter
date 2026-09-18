@@ -16,13 +16,17 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlparse
 
 import httpx
 
+from app.agents.prefilter import capped_resolution
 from app.config import worker_config
+from app.http_defaults import BROWSER_UA
+from app.memory import drop_file_cache, drop_tree_cache, trim_process_memory
 from app.tools import autopoc_bridge
 from app.tools.decoder import decode_transform as _decode_transform
-from app.tools.guard import CommandBlocked, check_command
+from app.tools.guard import CommandBlocked, NeedsConfirm, check_command, check_http_request
 from app.tools.js_analyzer import analyze_javascript as analyze_js_text
 from app.tools.js_analyzer import analyze_url as analyze_js_url
 from app.tools.waf_advisor import suggest_waf_bypass as _suggest_waf_bypass
@@ -46,6 +50,20 @@ _WORKDIR_MAX_BYTES = int(os.environ.get("WORKER_WORKDIR_MAX_BYTES", str(50 * 102
 _WORKDIR_RESCAN_EVERY = 32
 _SHELL_CAPTURE_MAX_BYTES = int(os.environ.get("WORKER_SHELL_CAPTURE_MAX_BYTES", str(512 * 1024)))
 _HTTP_MAX_BYTES = int(os.environ.get("WORKER_HTTP_MAX_BYTES", str(1024 * 1024)))
+_REFLECT_GUIDANCE = (
+    "本次未执行。请先反思：会不会删库、清缓存、覆盖已有文件导致改不回？"
+    "能改成 SRC_TEST_ 哨兵、ROLLBACK、或只证明接口存在就不要做破坏。"
+    "若确认是无害验证，再次调用并设 confirm_destructive=true，confirm_reason 写明原因。"
+)
+
+
+def _confirm_pause(exc: NeedsConfirm) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "needs_confirm": True,
+        "error": f"疑似不可逆操作，先停一下：{exc.reason}",
+        "guidance": _REFLECT_GUIDANCE,
+    }
 
 
 def _truncate(text: str, limit: Optional[int] = None) -> str:
@@ -101,6 +119,114 @@ def _normalize_headers(headers: Any) -> dict[str, str]:
     return out
 
 
+def _host_from_url(url: str) -> str:
+    raw = url or ""
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        return (urlparse(raw).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _cookie_host_ok(domain: str, host: str) -> bool:
+    d = (domain or "").lstrip(".").lower()
+    h = (host or "").lower()
+    if not h:
+        return False
+    if not d:
+        return True
+    return h == d or h.endswith("." + d)
+
+
+def _parse_cookie_header(raw: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        k, v = k.strip(), v.strip()
+        if k:
+            out[k] = v
+    return out
+
+
+def _pop_header(headers: dict[str, str], name: str) -> str:
+    for k in list(headers.keys()):
+        if k.lower() == name.lower():
+            return str(headers.pop(k) or "")
+    return ""
+
+
+def _normalize_files(files: Any, work_dir: Path) -> dict[str, Any] | None:
+    if not files or not isinstance(files, dict):
+        return None
+    root = work_dir.resolve()
+    out: dict[str, Any] = {}
+    for field, spec in files.items():
+        name = str(field)
+        if isinstance(spec, (bytes, bytearray)):
+            out[name] = (name, bytes(spec))
+            continue
+        if isinstance(spec, str):
+            if spec.startswith("@") or spec.startswith("file:"):
+                rel = spec[1:] if spec.startswith("@") else spec[5:]
+                data = _read_work_file(rel, root)
+                if data is None:
+                    continue
+                out[name] = (Path(rel).name or name, data)
+            else:
+                out[name] = (name, spec.encode("utf-8"))
+            continue
+        if isinstance(spec, dict):
+            filename = str(spec.get("filename") or spec.get("name") or name)
+            ctype = str(spec.get("content_type") or spec.get("contentType") or "application/octet-stream")
+            path = spec.get("path") or spec.get("file")
+            content = spec.get("content")
+            if content is None:
+                content = spec.get("data")
+            if content is None:
+                content = spec.get("value")
+            if path:
+                data = _read_work_file(str(path), root)
+                if data is None:
+                    continue
+                filename = str(spec.get("filename") or Path(str(path)).name or filename)
+                out[name] = (filename, data, ctype)
+            elif isinstance(content, (bytes, bytearray)):
+                out[name] = (filename, bytes(content), ctype)
+            elif content is not None:
+                out[name] = (filename, str(content).encode("utf-8"), ctype)
+            continue
+        if isinstance(spec, (list, tuple)) and spec:
+            filename = str(spec[0] or name)
+            raw = spec[1] if len(spec) > 1 else ""
+            ctype = str(spec[2]) if len(spec) > 2 else "application/octet-stream"
+            if isinstance(raw, (bytes, bytearray)):
+                out[name] = (filename, bytes(raw), ctype)
+            else:
+                out[name] = (filename, str(raw).encode("utf-8"), ctype)
+    return out or None
+
+
+def _read_work_file(path: str, root: Path) -> bytes | None:
+    p = Path(path)
+    if not p.is_absolute():
+        p = root / path
+    try:
+        resolved = p.resolve()
+        resolved.relative_to(root)
+    except Exception:
+        return None
+    if not resolved.is_file():
+        return None
+    try:
+        return resolved.read_bytes()[: 2 * 1024 * 1024]
+    except Exception:
+        return None
+
+
 class ToolExecutor:
     def __init__(
         self,
@@ -111,8 +237,10 @@ class ToolExecutor:
         fofa_key: str = "",
         fofa_base_url: str = "",
         engine: str = "fofa",
+        task_id: str = "",
     ):
         self.target = target
+        self.task_id = task_id or ""
         self.cancel_event = cancel_event or threading.Event()
         # 企业模式：对目标生产环境的破坏性命令做额外硬拦截。
         self.enterprise = enterprise
@@ -132,6 +260,7 @@ class ToolExecutor:
         # 每个 target 独立 executor 实例、session jar 相互隔离，不会串号。
         # 全模式启用（edu 用泄露凭证/用户凭证登录后同样必须带登录态深入）。
         self._session_cookies: dict[str, str] = {}
+        self._cookie_jar: list[dict[str, str]] = []
         self._session_headers: dict[str, str] = {}
         # 工作笔记：worker 用 update_notes 工具维护，每轮注入回 messages，
         # 解决"历史压缩后忘了自己发现过什么"的连续性断裂问题。
@@ -142,6 +271,8 @@ class ToolExecutor:
         self._workdir_bytes: int = self._dir_size()
         self._writes_since_scan: int = 0
         self._over_cap: bool = False   # 一旦确认超上限即置位：work_dir 只增不删，此后直接短路不再全扫
+        self._cookie_hub: Any = None
+        self._relogin_retrying = False
 
         # 代理模式：本地 IP 被目标 WAF 封禁后，http_request 透明改走 SSH 代理，
         # 保留同一 worker 的上下文与会话态（cookie jar 原地延续），无需重派。
@@ -170,9 +301,17 @@ class ToolExecutor:
         for proc in list(self._active_procs):
             self._kill_process_group(proc)
         self.close_http_client()
+        drop_tree_cache(self.work_dir, cap=80)
+        trim_process_memory()
 
     # ---- run_shell ----
-    def run_shell(self, command: str, timeout: Optional[int] = None) -> dict[str, Any]:
+    def run_shell(
+        self,
+        command: str,
+        timeout: Optional[int] = None,
+        confirm_destructive: Any = False,
+        confirm_reason: str = "",
+    ) -> dict[str, Any]:
         try:
             timeout = int(timeout) if timeout else worker_config.shell_timeout
         except (TypeError, ValueError):
@@ -180,7 +319,14 @@ class ToolExecutor:
         # 硬上限 + 下限：防 LLM 传超大/非法 timeout 长期占用 worker 槽位（DoS）。
         timeout = max(1, min(timeout, worker_config.shell_timeout_max))
         try:
-            check_command(command, enterprise=self.enterprise)
+            check_command(
+                command,
+                enterprise=self.enterprise,
+                confirm_destructive=confirm_destructive,
+                confirm_reason=confirm_reason,
+            )
+        except NeedsConfirm as e:
+            return _confirm_pause(e)
         except CommandBlocked as e:
             return {"ok": False, "blocked": True, "error": str(e)}
 
@@ -312,6 +458,7 @@ class ToolExecutor:
         log_file = self.work_dir / f"shell_{self._log_seq}.log"
         try:
             log_file.write_bytes(data)  # 与 write_text(encoding="utf-8") 字节数一致，便于精确计数
+            drop_file_cache(log_file)
         except Exception:
             return None
         self._workdir_bytes += len(data)
@@ -329,6 +476,7 @@ class ToolExecutor:
                 verify=False,
                 timeout=20,
                 follow_redirects=False,
+                headers={"User-Agent": BROWSER_UA},
                 limits=httpx.Limits(
                     max_keepalive_connections=8, max_connections=32, keepalive_expiry=30.0
                 ),
@@ -354,8 +502,11 @@ class ToolExecutor:
         headers: Optional[dict[str, str]] = None,
         data: Optional[str] = None,
         json_body: Optional[Any] = None,
+        files: Optional[Any] = None,
         follow_redirects: bool = False,
         timeout: int = 20,
+        confirm_destructive: Any = False,
+        confirm_reason: str = "",
     ) -> dict[str, Any]:
         if self.proxy_mode:
             return self._http_request_via_proxy(
@@ -366,34 +517,63 @@ class ToolExecutor:
         # 直接喂给 dict()/httpx 会抛 "dictionary update sequence element..." 崩掉整个 agent。
         # 这里统一规范化成 dict，容错所有 agent 的 http_request 调用。
         headers = _normalize_headers(headers)
-        # 会话保持：把已维持的 cookie/header 合并进本次请求（用户传的同名键优先）。
-        merged_headers, session_applied = self._apply_session(headers)
+        incoming_cookie = _pop_header(headers, "Cookie")
+        overlay = _parse_cookie_header(incoming_cookie)
+        files_norm = _normalize_files(files, self.work_dir)
+        hub = self._cookie_hub
+        if hub is not None and not self._relogin_retrying:
+            try:
+                hub.pull(self)
+            except Exception:
+                pass
+        try:
+            check_http_request(
+                method, url, data=data, json_body=json_body, files=files_norm,
+                confirm_destructive=confirm_destructive,
+                confirm_reason=confirm_reason,
+            )
+        except NeedsConfirm as e:
+            return {**_confirm_pause(e), "url": url}
+        except CommandBlocked as e:
+            return {"ok": False, "blocked": True, "error": str(e), "url": url}
+        merged_headers, session_applied = self._apply_session(headers, url, overlay)
 
         req: httpx.Request | None = None
         try:
-            # 用持久 cookie jar 的 Client：跟随重定向时 httpx 会自动把每一跳 Set-Cookie
-            # 存进 jar 并在后续跳转/同域请求里带上——这是走通 CAS/SSO 这类
-            # 「302 连环跳 + 每跳发新 Cookie（lt→CASTGC→ST ticket→JSESSIONID）」登录链的关键。
-            # 之前每次新建无 jar 的 Client + 只读最终 resp.cookies，会丢掉中间跳的 CASTGC/跨域
-            # JSESSIONID，导致「明明账号对却始终登不进、没法进系统深挖」。
-            # 持久复用的 client（连接池）；timeout/follow_redirects 逐请求覆盖。
             client = self._get_http_client()
-            # 每次请求前清空 jar 并仅灌入当前维持的 session cookie，保持与“每次新建 Client”
-            # 完全一致的会话语义，避免持久 jar 跨请求/跨 host 累积串号。
+            host = _host_from_url(url) or self._target_host()
             try:
                 client.cookies.clear()
             except Exception:
                 pass
-            for _ck, _cv in self._session_cookies.items():
+            self._fill_client_cookies(client, host, overlay)
+            send_kwargs: dict[str, Any] = {"headers": merged_headers, "timeout": timeout}
+            if files_norm:
+                form_data = None
+                if isinstance(data, str) and data and "=" in data:
+                    form_data = dict(parse_qsl(data, keep_blank_values=True))
+                send_kwargs["data"] = form_data
+                send_kwargs["files"] = files_norm
+            elif json_body is not None:
+                send_kwargs["json"] = json_body
+            else:
+                send_kwargs["content"] = data
+            req = client.build_request(method.upper(), url, **send_kwargs)
+            with capped_resolution():
+                resp = client.send(req, stream=True, follow_redirects=follow_redirects)
+            from app.tools.netguard import LOOPBACK_BLOCK_ERROR, is_loopback_target
+            final_url = str(getattr(resp, "url", "") or url)
+            if is_loopback_target(final_url):
                 try:
-                    client.cookies.set(_ck, _cv)
+                    resp.close()
                 except Exception:
                     pass
-            req = client.build_request(
-                method.upper(), url, headers=merged_headers, content=data, json=json_body,
-                timeout=timeout,
-            )
-            resp = client.send(req, stream=True, follow_redirects=follow_redirects)
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "error": LOOPBACK_BLOCK_ERROR,
+                    "url": url,
+                }
             body, truncated = self._read_limited_response(resp)
             # 吸收整条重定向链（resp.history 里每个中间 302 + 最终响应）的 Set-Cookie，
             # 而不是只读最终 resp.cookies；再兜底吸收 client.cookies jar 里的全部。
@@ -430,6 +610,27 @@ class ToolExecutor:
             result["session_applied"] = session_applied
         if session_updated:
             result["session_cookies_updated"] = session_updated
+        if hub is not None:
+            try:
+                hub.push(self)
+            except Exception:
+                pass
+            if not self._relogin_retrying:
+                try:
+                    if hub.maybe_relogin(self, result):
+                        self._relogin_retrying = True
+                        try:
+                            return self.http_request(
+                                url, method=method, headers=headers, data=data,
+                                json_body=json_body, files=files,
+                                follow_redirects=follow_redirects, timeout=timeout,
+                                confirm_destructive=confirm_destructive,
+                                confirm_reason=confirm_reason,
+                            )
+                        finally:
+                            self._relogin_retrying = False
+                except Exception:
+                    self._relogin_retrying = False
         return result
 
     # ---- 代理模式（IP 封禁时透明走 SSH 代理）----
@@ -704,75 +905,151 @@ class ToolExecutor:
         return resp_headers, redirect_chain, updated
 
     # ---- 会话状态管理（全模式）----
-    def _apply_session(self, headers: Optional[dict[str, str]]) -> tuple[dict[str, str], list[str]]:
-        """把维持的 session cookie/header 合并进请求头。返回 (合并后headers, 应用了哪些)。
+    def _target_host(self) -> str:
+        return _host_from_url(self.target)
 
-        合并规则：用户本次显式传入的头优先（不被 session 覆盖），保证可手动覆写。
-        会话为空时原样返回、零开销；全模式启用。
-        """
-        if not self._session_cookies and not self._session_headers:
-            return (dict(headers) if headers else {}), []
+    def _rebuild_cookie_map(self) -> None:
+        mapped: dict[str, str] = {}
+        for e in self._cookie_jar:
+            mapped[e["name"]] = e["value"]
+        self._session_cookies = mapped
+
+    def _put_cookie_entry(
+        self,
+        name: str,
+        value: str,
+        domain: str = "",
+        path: str = "/",
+        updated: Optional[list[str]] = None,
+    ) -> None:
+        name = str(name or "").strip()
+        if not name:
+            return
+        value = str(value)[:4096]
+        domain = (domain or "").lstrip(".").lower()
+        path = path or "/"
+        for e in self._cookie_jar:
+            if e["name"] == name and (e.get("domain") or "") == domain:
+                e["value"] = value
+                e["path"] = path
+                if updated is not None and name not in updated:
+                    updated.append(name)
+                self._rebuild_cookie_map()
+                return
+        if len(self._cookie_jar) >= _SESSION_MAX_COOKIES:
+            self._rebuild_cookie_map()
+            return
+        self._cookie_jar.append({"name": name, "value": value, "domain": domain, "path": path})
+        if updated is not None and name not in updated:
+            updated.append(name)
+        self._rebuild_cookie_map()
+
+    def _cookies_for_host(self, host: str, overlay: Optional[dict[str, str]] = None) -> dict[str, str]:
+        picked: dict[str, tuple[int, str]] = {}
+        for e in self._cookie_jar:
+            if not _cookie_host_ok(e.get("domain") or "", host):
+                continue
+            spec = len(e.get("domain") or "")
+            prev = picked.get(e["name"])
+            if prev is None or spec >= prev[0]:
+                picked[e["name"]] = (spec, e["value"])
+        out = {k: v[1] for k, v in picked.items()}
+        if overlay:
+            out.update(overlay)
+        return out
+
+    def _fill_client_cookies(
+        self,
+        client: httpx.Client,
+        host: str,
+        overlay: Optional[dict[str, str]] = None,
+    ) -> None:
+        for e in self._cookie_jar:
+            d = e.get("domain") or host
+            try:
+                client.cookies.set(
+                    e["name"], e["value"],
+                    domain=d,
+                    path=e.get("path") or "/",
+                )
+            except Exception:
+                pass
+        if overlay:
+            for k, v in overlay.items():
+                try:
+                    client.cookies.set(k, v, domain=host, path="/")
+                except Exception:
+                    pass
+
+    def _apply_session(
+        self,
+        headers: Optional[dict[str, str]],
+        url: str = "",
+        overlay: Optional[dict[str, str]] = None,
+    ) -> tuple[dict[str, str], list[str]]:
         try:
             merged: dict[str, str] = {}
             applied: list[str] = []
             for k, v in self._session_headers.items():
                 merged[k] = v
-            if self._session_cookies:
-                cookie_str = "; ".join(f"{k}={v}" for k, v in self._session_cookies.items())
-                merged["Cookie"] = cookie_str
-                applied.append(f"Cookie({len(self._session_cookies)})")
-            if self._session_headers:
-                applied.append(f"headers({len(self._session_headers)})")
-            # 用户本次传入的头覆盖 session（显式优先）。
             if headers:
                 for k, v in headers.items():
+                    if k.lower() == "cookie":
+                        continue
                     merged[k] = v
+            host = _host_from_url(url) or self._target_host()
+            jar_cookies = self._cookies_for_host(host, overlay)
+            if jar_cookies:
+                merged["Cookie"] = "; ".join(f"{k}={v}" for k, v in jar_cookies.items())
+                applied.append(f"Cookie({len(jar_cookies)})")
+            if self._session_headers:
+                applied.append(f"headers({len(self._session_headers)})")
+            if not any(k.lower() == "user-agent" for k in merged):
+                merged["User-Agent"] = BROWSER_UA
             return merged, applied
         except Exception:
-            return (dict(headers) if headers else {}), []
+            fallback = dict(headers) if headers else {}
+            if not any(k.lower() == "user-agent" for k in fallback):
+                fallback["User-Agent"] = BROWSER_UA
+            return fallback, []
 
-    def _put_cookie(self, name: str, value: str, updated: list[str]) -> None:
-        if name in self._session_cookies:
-            self._session_cookies[name] = value
-            if name not in updated:
-                updated.append(name)
-        elif len(self._session_cookies) < _SESSION_MAX_COOKIES:
-            self._session_cookies[name] = value
-            if name not in updated:
-                updated.append(name)
-
-    def _absorb_set_cookie(self, resp: httpx.Response) -> list[str]:
-        """从单个响应吸收 Set-Cookie 进 session jar（带数量上限防爆内存）。"""
-        try:
-            updated: list[str] = []
-            for name, value in resp.cookies.items():
-                self._put_cookie(name, value, updated)
-            return updated
-        except Exception:
-            return []
+    def _absorb_cookie_obj(self, ck: Any, fallback_host: str, updated: list[str]) -> None:
+        name = getattr(ck, "name", "") or ""
+        value = getattr(ck, "value", "") or ""
+        if not name:
+            return
+        domain = (getattr(ck, "domain", None) or fallback_host or "").lstrip(".")
+        path = getattr(ck, "path", None) or "/"
+        self._put_cookie_entry(name, value, domain=domain, path=path, updated=updated)
 
     def _absorb_redirect_chain(self, resp: httpx.Response, client: "httpx.Client") -> list[str]:
-        """吸收整条重定向链上每一跳的 Set-Cookie（CAS/SSO 登录链的关键）。
-
-        httpx 跟随重定向时，中间的每个 302 响应都在 resp.history 里。CAS 登录的
-        CASTGC / 跨域 JSESSIONID 往往就发在这些中间跳上；只读最终 resp.cookies 会漏。
-        再用 client.cookies jar 兜底（httpx 已把整条链的 cookie 归并进 jar）。
-        """
         updated: list[str] = []
         try:
             for hist in list(getattr(resp, "history", []) or []):
+                host = _host_from_url(str(getattr(hist, "url", "") or ""))
                 try:
-                    for name, value in hist.cookies.items():
-                        self._put_cookie(name, value, updated)
+                    for ck in hist.cookies.jar:
+                        self._absorb_cookie_obj(ck, host, updated)
+                except Exception:
+                    try:
+                        for name, value in hist.cookies.items():
+                            self._put_cookie_entry(name, value, domain=host, path="/", updated=updated)
+                    except Exception:
+                        pass
+            host = _host_from_url(str(getattr(resp, "url", "") or ""))
+            try:
+                for ck in resp.cookies.jar:
+                    self._absorb_cookie_obj(ck, host, updated)
+            except Exception:
+                try:
+                    for name, value in resp.cookies.items():
+                        self._put_cookie_entry(name, value, domain=host, path="/", updated=updated)
                 except Exception:
                     pass
-            for name, value in resp.cookies.items():
-                self._put_cookie(name, value, updated)
-            # 兜底：client jar 里可能还有 history/resp.cookies 没暴露出来的（不同域）。
             try:
                 for ck in client.cookies.jar:
-                    if ck.name and ck.value:
-                        self._put_cookie(ck.name, ck.value, updated)
+                    fb = (getattr(ck, "domain", None) or host or "").lstrip(".")
+                    self._absorb_cookie_obj(ck, fb, updated)
             except Exception:
                 pass
         except Exception:
@@ -785,29 +1062,41 @@ class ToolExecutor:
         headers: Optional[dict[str, str]] = None,
         clear: bool = False,
     ) -> dict[str, Any]:
-        """worker 显式设置/查看会话态：手动登记拿到的 token/cookie，后续自动携带。全模式可用。"""
         try:
             if clear:
                 self._session_cookies.clear()
+                self._cookie_jar.clear()
                 self._session_headers.clear()
+            host = self._target_host()
             if isinstance(cookies, dict):
                 for k, v in cookies.items():
                     if not isinstance(k, str):
                         continue
-                    if k in self._session_cookies or len(self._session_cookies) < _SESSION_MAX_COOKIES:
-                        self._session_cookies[k] = str(v)[:4096]
+                    self._put_cookie_entry(k, str(v)[:4096], domain=host, path="/")
             if isinstance(headers, dict):
                 for k, v in headers.items():
                     if not isinstance(k, str):
                         continue
+                    if k.lower() == "cookie":
+                        parsed = _parse_cookie_header(str(v))
+                        for ck, cv in parsed.items():
+                            self._put_cookie_entry(ck, cv, domain=host, path="/")
+                        continue
                     if k in self._session_headers or len(self._session_headers) < _SESSION_MAX_HEADERS:
                         self._session_headers[k] = str(v)[:4096]
-            return {
+            out = {
                 "ok": True,
                 "active_cookies": sorted(self._session_cookies.keys()),
                 "active_headers": sorted(self._session_headers.keys()),
                 "guidance": "已更新会话态，后续 http_request 会自动携带；继续以此据点深挖受限接口。",
             }
+            hub = self._cookie_hub
+            if hub is not None and not clear and (self._session_cookies or self._session_headers):
+                try:
+                    hub.push(self)
+                except Exception:
+                    pass
+            return out
         except Exception as e:
             return {"ok": False, "error": f"session_set 异常: {type(e).__name__}: {e}"}
 
@@ -845,6 +1134,7 @@ class ToolExecutor:
         return {
             "worker_notes": self._worker_notes or "",
             "session_cookies": dict(self._session_cookies or {}),
+            "session_cookie_jar": [dict(e) for e in self._cookie_jar],
             "session_headers": dict(self._session_headers or {}),
         }
 
@@ -854,14 +1144,29 @@ class ToolExecutor:
         worker_notes: str = "",
         session_cookies: dict | None = None,
         session_headers: dict | None = None,
+        session_cookie_jar: list | None = None,
     ) -> None:
-        """从上一轮 LLM 中断快照恢复笔记与会话态。"""
         if worker_notes:
             self._worker_notes = str(worker_notes).strip()[:4000]
+        if isinstance(session_cookie_jar, list) and session_cookie_jar:
+            self._cookie_jar = []
+            for raw in session_cookie_jar:
+                if not isinstance(raw, dict) or not raw.get("name"):
+                    continue
+                self._put_cookie_entry(
+                    str(raw.get("name")),
+                    str(raw.get("value") or "")[:4096],
+                    domain=str(raw.get("domain") or ""),
+                    path=str(raw.get("path") or "/"),
+                )
+            self._rebuild_cookie_map()
         cookies = session_cookies if isinstance(session_cookies, dict) else {}
         headers = session_headers if isinstance(session_headers, dict) else {}
         if cookies or headers:
-            self.session_set(cookies=cookies or None, headers=headers or None)
+            if not (isinstance(session_cookie_jar, list) and session_cookie_jar):
+                self.session_set(cookies=cookies or None, headers=headers or None)
+            elif headers:
+                self.session_set(headers=headers)
 
     # ---- decode_transform ----
     def decode_transform(self, value: str = "", mode: str = "auto") -> dict[str, Any]:
@@ -887,13 +1192,15 @@ class ToolExecutor:
         q = (query or "").strip()
         if not q:
             return {"ok": False, "kind": "arg_error", "error": "query 不能为空",
-                    "guidance": '传 FOFA 语法，如 ip="1.2.3.4" 或 host="example.com"。'}
+                    "guidance": f'传 {disp} 查询语法，如 ip="1.2.3.4" 或 host="example.com"。'}
         safe_size = max(1, min(int(size or 10), _FOFA_LOOKUP_MAX_SIZE))
         try:
             res = engine_search_sync(
                 engine_name, self.fofa_key, q,
                 page=1, page_size=safe_size, base_url=self.fofa_base_url or None,
             )
+            from app.engines.meter import record_engine_search
+            record_engine_search(self.task_id, "worker", q, engine_name)
         except Exception as e:
             return {"ok": False, "error": f"{disp} 调用失败: {type(e).__name__}: {e}"[:300],
                     "guidance": f"{disp} 不可用，改用 http_request 直接验证归属。"}
@@ -1004,13 +1311,52 @@ class ToolExecutor:
         if "client_signed_encrypted_api" in kinds:
             return (
                 base
-                + " 已命中「客户端签名+AES 加密请求体」链路：立刻提取 AppID/AppSecret/AES 口令，"
-                "按前端算法构造签名头并加密请求体，POST Admin/Client* 接口并解密响应取证；"
+                + " 已命中「客户端签名+AES 加密请求体」链路：立刻提取 ClientAppID/ClientAppSecret/AES 口令，"
+                "按前端算法构造请求。用 eval_javascript 跑登录页加密函数得到密文再 POST；"
                 "只发现密钥不算洞。"
             )
         if "frontend_secret_followup" in kinds:
             return base + " 发现高价值 secret：继续搜索签名/加密函数并伪造一次受限调用。"
         return base
+
+    def eval_javascript(self, code: str = "", timeout: int = 8) -> dict[str, Any]:
+        src = (code or "").strip()
+        if not src:
+            return {"ok": False, "kind": "arg_error", "error": "code 为空"}
+        if len(src) > 120_000:
+            src = src[:120_000]
+        t = max(1, min(int(timeout or 8), 20))
+        p = None
+        for bin_name in ("node", "nodejs"):
+            try:
+                p = subprocess.run(
+                    [bin_name, "-e", src],
+                    capture_output=True,
+                    timeout=t,
+                    cwd=str(self.work_dir),
+                    env={**os.environ, "NODE_PATH": str(self.work_dir)},
+                )
+                break
+            except FileNotFoundError:
+                continue
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "timed_out": True, "error": "eval_javascript 超时"}
+            except Exception as e:
+                return {"ok": False, "error": f"eval_javascript 异常: {type(e).__name__}: {e}"}
+        if p is None:
+            return {
+                "ok": False,
+                "error": "容器内无 node。用 run_shell 把加密改写成 python 计算，或 session_set 注入已有 Cookie。",
+            }
+        out = (p.stdout or b"").decode("utf-8", "replace")
+        err = (p.stderr or b"").decode("utf-8", "replace")
+        return {
+            "ok": p.returncode == 0,
+            "output": _truncate(out),
+            "stderr": _truncate(err, 1500),
+            "return_code": p.returncode,
+            "guidance": "把 stdout 的密文/签名填进 http_request 的 data/json_body；这不是浏览器，DOM/window 不可用。",
+        }
 
     # ---- suggest_waf_bypass（纯本地，不发网络）----
     def suggest_waf_bypass(

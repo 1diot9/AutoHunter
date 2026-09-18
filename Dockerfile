@@ -20,26 +20,56 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         nmap \
         python3-pip \
         jq dnsutils iputils-ping netcat-openbsd \
-        whatweb \
+        whatweb nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# sqlmap（git 安装，复用官方）
-RUN git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap \
-    && printf '#!/bin/sh\nexec python3 /opt/sqlmap/sqlmap.py "$@"\n' > /usr/local/bin/sqlmap \
-    && chmod +x /usr/local/bin/sqlmap
+# sqlmap：官方 PyPI 月度版。构建不依赖 git clone GitHub（国内常超时/失败），
+# 也比跟踪 master HEAD 稳。pip 会把 sqlmap 装到 PATH，无需再包一层 wrapper。
+RUN pip install --no-cache-dir sqlmap
 
 # ProjectDiscovery 工具：nuclei + httpx（从官方 release 拉二进制，避免装 Go）
+# 国内构建优先 ghfast / ghproxy，失败再直连 GitHub。zip 无效则失败，避免镜像 silently 缺工具。
 # TARGETARCH 由 buildkit 自动注入(arm64/amd64)
 ARG TARGETARCH
 RUN set -eux; \
     NUCLEI_VER=3.3.7; HTTPX_VER=1.6.9; \
     cd /tmp; \
-    wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VER}/nuclei_${NUCLEI_VER}_linux_${TARGETARCH}.zip" -O nuclei.zip; \
-    wget -q "https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VER}/httpx_${HTTPX_VER}_linux_${TARGETARCH}.zip" -O httpx.zip; \
     apt-get update && apt-get install -y --no-install-recommends unzip; \
+    fetch_zip() { \
+      dest="$1"; shift; \
+      for u in "$@"; do \
+        echo "GET $u"; \
+        if wget -q -T 45 -O "$dest" "$u" && unzip -tq "$dest" >/dev/null 2>&1; then \
+          return 0; \
+        fi; \
+        rm -f "$dest"; \
+      done; \
+      echo "ERROR: could not download valid $dest" >&2; \
+      return 1; \
+    }; \
+    fetch_zip nuclei.zip \
+      "https://ghfast.top/https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VER}/nuclei_${NUCLEI_VER}_linux_${TARGETARCH}.zip" \
+      "https://ghproxy.net/https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VER}/nuclei_${NUCLEI_VER}_linux_${TARGETARCH}.zip" \
+      "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VER}/nuclei_${NUCLEI_VER}_linux_${TARGETARCH}.zip"; \
+    fetch_zip httpx.zip \
+      "https://ghfast.top/https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VER}/httpx_${HTTPX_VER}_linux_${TARGETARCH}.zip" \
+      "https://ghproxy.net/https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VER}/httpx_${HTTPX_VER}_linux_${TARGETARCH}.zip" \
+      "https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VER}/httpx_${HTTPX_VER}_linux_${TARGETARCH}.zip"; \
     unzip -o nuclei.zip nuclei -d /usr/local/bin/; \
     unzip -o httpx.zip httpx -d /usr/local/bin/; \
     chmod +x /usr/local/bin/nuclei /usr/local/bin/httpx; \
+    mv /usr/local/bin/httpx /usr/local/bin/httpx.bin; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"' \
+      'for a in "$@"; do' \
+      '  case "$a" in' \
+      '    *User-Agent*|*user-agent*) exec /usr/local/bin/httpx.bin "$@" ;;' \
+      '  esac' \
+      'done' \
+      'exec /usr/local/bin/httpx.bin -H "User-Agent: $UA" "$@"' \
+      > /usr/local/bin/httpx; \
+    chmod +x /usr/local/bin/httpx; \
     rm -f /tmp/*.zip; \
     apt-get purge -y unzip; rm -rf /var/lib/apt/lists/*
 
@@ -51,6 +81,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN nuclei -update-templates -silent || true
 
 COPY . .
+# Windows 检出/解压可能带 CRLF；入口脚本带 \r 时容器会报 no such file or directory。
+RUN find /app/scripts -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
 
 # 拷入前端构建产物（覆盖空的 web/dist）
 COPY --from=frontend /web/dist /app/web/dist

@@ -127,6 +127,15 @@ def has_any_bindings(raw_list: Any) -> bool:
     return bool(normalize_bindings(raw_list))
 
 
+def has_login_material(auth_context: dict | None) -> bool:
+    ctx = dict(auth_context or {})
+    if ctx.get("username") and ctx.get("password"):
+        return True
+    if ctx.get("cookies") or ctx.get("headers"):
+        return True
+    return bool(ctx.get("kinds"))
+
+
 # ---- 匹配 ----
 
 def _norm_url(u: str) -> str:
@@ -317,7 +326,25 @@ class AuthAttemptResult:
         return self.as_event()
 
 
-_LOGIN_PATHS = ("/login", "/user/login", "/admin/login", "/account/login", "/signin")
+_LOGIN_PATHS = (
+    "/login", "/user/login", "/admin/login", "/account/login", "/signin",
+    "/cas/login", "/auth/login",
+)
+_NON_LOGIN_PATH = re.compile(
+    r"(?i)/(?:druid|actuator|nacos|\.env|\.git|swagger|api-docs|heapdump|metrics|webjars)(?:/|$|\.)"
+)
+
+
+def login_origin(url: str) -> str:
+    """登录只打站点根，不把 /druid /actuator 当登录页。"""
+    raw = _strip(url)
+    if not raw:
+        return ""
+    from app.urlnorm import ensure_scheme, safe_urlparse
+    p = safe_urlparse(ensure_scheme(raw))
+    if not p.netloc:
+        return ensure_scheme(raw)
+    return f"{p.scheme or 'http'}://{p.netloc}"
 
 
 def bootstrap_auth(executor: Any, auth_context: dict | None, base_url: str) -> AuthAttemptResult:
@@ -378,8 +405,10 @@ def bootstrap_auth(executor: Any, auth_context: dict | None, base_url: str) -> A
             header_names=sorted(headers.keys()) or list(getattr(executor, "_session_headers", {}).keys())[:20],
         )
 
-    # 3) 账密登录
-    login_res = try_user_login(executor, base_url, username, password, login_url)
+    # 3) 账密登录：始终打站点根，避免单站协作把 /druid 当登录页
+    login_res = try_user_login(
+        executor, login_origin(base_url) or base_url, username, password, login_url,
+    )
     status = "login_ok" if login_res.get("ok") else "login_fail"
     return AuthAttemptResult(
         used=True, matched=True, status=status, kinds=kinds,
@@ -403,13 +432,16 @@ def try_user_login(
         return {"ok": False, "reason": "无目标 URL"}
     from app.urlnorm import ensure_scheme, safe_urlparse
     base = ensure_scheme(base)  # 裸合法 IPv6 补方括号(http://[2001:db8::1])，避免登录候选 URL 非法
+    origin = login_origin(base) or base
     _p = safe_urlparse(base)
-    origin = f"{_p.scheme or 'http'}://{_p.netloc}" if _p.netloc else base
+    path = _p.path or "/"
 
     candidates: list[str] = []
     if login_url:
         candidates.append(login_url if "://" in login_url else urljoin(origin + "/", login_url.lstrip("/")))
-    candidates.append(base)
+    if not _NON_LOGIN_PATH.search(path):
+        candidates.append(origin if path in ("", "/") else base)
+    candidates.append(origin)
     for p in _LOGIN_PATHS:
         candidates.append(urljoin(origin + "/", p.lstrip("/")))
 
@@ -419,6 +451,13 @@ def try_user_login(
         if page_url in seen:
             continue
         seen.add(page_url)
+        try:
+            from app.urlnorm import safe_urlparse as _sup
+            cand_path = _sup(page_url).path or ""
+        except Exception:
+            cand_path = urlparse(page_url).path or ""
+        if _NON_LOGIN_PATH.search(cand_path):
+            continue
         get_r = executor.http_request(page_url, method="GET", follow_redirects=True, timeout=15)
         if not get_r.get("ok"):
             last_reason = f"打开登录页失败: {get_r.get('error') or get_r.get('status_code')}"
@@ -546,15 +585,16 @@ def format_auth_status_message(result: AuthAttemptResult | dict) -> str:
     status = d.get("status") or "?"
     bind = d.get("binding_target") or "-"
     reason = d.get("reason") or ""
+    via = "全局会话" if d.get("matched_by") == "shared" else f"绑定 {bind}"
     if status == "unused":
         return f"凭据未使用：{reason or '未匹配本目标'}"
     if status == "injected":
         names = ",".join(d.get("cookie_names") or d.get("header_names") or []) or kinds
-        return f"凭据[{kinds}] → 绑定 {bind} → 已注入 {names}"
+        return f"凭据[{kinds}] → {via} → 已注入 {names}"
     if status == "login_ok":
-        return f"凭据[{kinds}] → 绑定 {bind} → 登录成功：{reason}"
+        return f"凭据[{kinds}] → {via} → 登录成功：{reason}"
     if status == "login_fail":
-        return f"凭据[{kinds}] → 绑定 {bind} → 登录失败：{reason}"
+        return f"凭据[{kinds}] → {via} → 登录失败：{reason}"
     return f"凭据[{kinds}] → {status}：{reason}"
 
 

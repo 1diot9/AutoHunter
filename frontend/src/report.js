@@ -84,8 +84,9 @@ export function buildReportCoreMd(f) {
   const scope = eff(f, "affected_scope");
   const steps = eff(f, "steps") || [];
   const poc = eff(f, "poc");
-  // 归属单位：优先教育网离线库反查到的学校名
+  // 归属单位：优先 ip138 标记（高校/单位）> worker 判定的 owner
   const owner = (f.edu_school || "").trim() || f.owner || "-";
+  const proof = (f.owner_proof || "").trim();
 
   // 证据数据样本（worker 取样的小表格 / 工具输出 / 备注），有才渲染
   const ev = f.evidence || {};
@@ -114,7 +115,7 @@ export function buildReportCoreMd(f) {
 | **信度** | ${conf} |
 | **漏洞类型** | \`${f.vuln_type}\` |
 | **归属单位** | ${owner} |
-| **目标 URL** | ${f.target_url} |
+${proof ? `| **归属证明** | ${proof} |\n` : ""}| **目标 URL** | ${f.target_url} |
 
 ## 漏洞描述
 
@@ -157,7 +158,7 @@ ${chainBlock}`;
 
 export function buildEdusrcReportJson(f, content) {
   const categoryName = inferCategoryName(f);
-  // 归属单位：优先教育网离线库反查到的学校名 > worker 判定的 owner
+  // 归属单位：优先 ip138 标记 > worker 判定的 owner
   const eduSchool = (f.edu_school || "").trim();
   const owner = (eduSchool || f.owner || f.review?.user_edits?.owner || "").trim();
   const firmName = owner && owner !== "-" ? owner : "待填写单位";

@@ -10,17 +10,19 @@ from urllib.parse import urlsplit, urlunsplit
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import LLMConfig, ProxyConfig, llm_config
+from app.agents.deepen import clamp_deepen_cap
 from app.agents.prompts import normalize_worker_prompt_version
 from app.db.models import SystemSettings, Task, to_cst_iso
 from app.db.session import SessionLocal
 from app.engines import get_engine, list_engines, get_default_engine
 from app.llm.health import provider_ref, snapshot as llm_health_snapshot
+from app.ui_prefs import normalize_ui, public_ui
 
 SETTINGS_ID = "global"
 LLM_MODES = {"single", "pool"}
 LLM_PROTOCOLS = {"auto", "openai_chat", "anthropic_messages"}
 
-_cache: dict[str, Any] = {"llm": {}, "fofa": {}, "engines": {}, "defaults": {}, "proxy": {}, "pricing": {}}
+_cache: dict[str, Any] = {"llm": {}, "fofa": {}, "engines": {}, "defaults": {}, "proxy": {}, "pricing": {}, "ui": {}}
 
 
 # 统一脱敏占位：不再泄露密钥首尾字符，避免降低离线爆破成本。
@@ -232,6 +234,7 @@ def _env_engines() -> dict[str, Any]:
 def _env_defaults() -> dict[str, Any]:
     return {
         "concurrency": 3,
+        "deepen_cap": 2,
         "skip_score_threshold": float(os.environ.get("SKIP_SCORE_THRESHOLD", "-10")),
         "worker_prompt_version": normalize_worker_prompt_version(os.environ.get("WORKER_PROMPT_VERSION", "legacy")),
         "engine": os.environ.get("SEARCH_ENGINE", get_default_engine()),
@@ -278,6 +281,7 @@ def effective_settings() -> dict[str, Any]:
         "defaults": _merge_section(_cache.get("defaults"), _env_defaults()),
         "proxy": _merge_section(_cache.get("proxy"), _env_proxy()),
         "pricing": dict(_cache.get("pricing") or {}),
+        "ui": normalize_ui(_cache.get("ui")),
     }
 
 
@@ -544,6 +548,7 @@ def public_settings_view() -> dict[str, Any]:
         "engines": engines_view,
         "defaults": {
             "concurrency": int(defaults.get("concurrency") or 3),
+            "deepen_cap": clamp_deepen_cap(defaults.get("deepen_cap")),
             "skip_score_threshold": float(defaults.get("skip_score_threshold", -10)),
             "worker_prompt_version": normalize_worker_prompt_version(defaults.get("worker_prompt_version")),
             "engine": defaults.get("engine", get_default_engine()),
@@ -555,6 +560,7 @@ def public_settings_view() -> dict[str, Any]:
         },
         "pricing": dict(eff.get("pricing") or {}),
         "available_engines": list_engines(),
+        "ui": public_ui(eff.get("ui")),
         "updated_at": _cache.get("updated_at"),
     }
 
@@ -574,6 +580,7 @@ async def refresh_cache(session: AsyncSession) -> SystemSettings:
         "defaults": dict(row.defaults or {}),
         "proxy": dict(row.proxy or {}),
         "pricing": dict(row.pricing or {}),
+        "ui": dict(row.ui or {}),
         "updated_at": to_cst_iso(row.updated_at),
     }
     return row
@@ -667,7 +674,16 @@ async def update_settings(session: AsyncSession, payload: dict[str, Any]) -> dic
     if "defaults" in payload and payload["defaults"]:
         defaults = dict(row.defaults or {})
         for k, v in payload["defaults"].items():
-            if v is not None:
+            if v is None:
+                continue
+            if k == "concurrency":
+                try:
+                    defaults[k] = max(1, min(int(v), 32))
+                except (TypeError, ValueError):
+                    continue
+            elif k == "deepen_cap":
+                defaults[k] = clamp_deepen_cap(v)
+            else:
                 defaults[k] = v
         row.defaults = defaults
 
@@ -690,6 +706,12 @@ async def update_settings(session: AsyncSession, payload: dict[str, Any]) -> dic
             if current:
                 pricing[model_name] = current
         row.pricing = pricing
+
+    if "ui" in payload and payload["ui"] is not None:
+        current = dict(row.ui or {})
+        incoming = dict(payload["ui"] or {})
+        merged = {**current, **incoming, "saved": True}
+        row.ui = normalize_ui(merged, saved=True)
 
     await session.commit()
     await session.refresh(row)
@@ -821,7 +843,8 @@ async def list_available_models(
         return {"ok": False, "error": "未配置模型 base_url", "models": []}
     if not key:
         return {"ok": False, "error": "未配置 API Key，无法拉取模型列表", "models": []}
-    url = base if base.endswith("/models") else f"{base}/models"
+    from app.llm.client import llm_models_url
+    url = llm_models_url(base)
     from app.tools.netguard import SsrfBlocked, assert_safe_outbound_url
 
     try:

@@ -19,6 +19,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from app.http_defaults import BROWSER_HEADERS
+
 
 @dataclass(frozen=True)
 class FilterDecision:
@@ -111,6 +113,7 @@ SUCCESS_SIGNALS: tuple[SuccessSignal, ...] = (
     SuccessSignal("success_path:debug_leak", 3.0, (
         "/.env", "/trace.axd", "/index.php?s=", "/index.php?r=", "/actuator",
         "/actuator/env", "/metrics", "/server-status",
+        "/druid", "/druid/index.html", "/nacos/",
     )),
     SuccessSignal("success_path:webservice_report", 2.5, (
         "/webreport/reportserver", "/webreport", "/ssoservice.asmx",
@@ -140,7 +143,7 @@ _BUSINESS_APP_RE = re.compile(
 _POSITIVE_PRIORITY_LEAD_RE = re.compile(
     r"\+\d+(?:\.\d+)?\s+(?:oss_cloud_storage|admin_backend|top_cold_custom|data_interactive|"
     r"mobile_open_api|face_iot_access|spa_with_api|wechat_platform|enterprise_|api_surface)|"
-    r"(?:minio|bucket|oss|后台|管理|上传|导入|导出|开放平台|接口|api)",
+    r"(?:minio|bucket|oss|后台|管理|上传|导入|导出|开放平台|接口|api|druid|actuator|nacos|暴露端点|killchain)",
     re.I,
 )
 _MAX_BODY_BYTES = int(os.environ.get("TARGET_FILTER_MAX_BODY_BYTES", "250000"))
@@ -149,7 +152,6 @@ _MAX_DISCOVERY_PAGES = int(os.environ.get("TARGET_FILTER_MAX_DISCOVERY_PAGES", "
 _MAX_PROBE_PATHS = int(os.environ.get("TARGET_FILTER_MAX_PROBE_PATHS", "6"))
 _TARGET_FILTER_TIMEOUT = float(os.environ.get("TARGET_FILTER_TIMEOUT", "2.0"))
 _TARGET_FILTER_BUDGET = float(os.environ.get("TARGET_FILTER_BUDGET", "8.0"))
-_UA = {"User-Agent": "Mozilla/5.0 (compatible; AutoHunter-TargetFilter)"}
 _API_PATH_RE = re.compile(
     r"""(?P<q>["'`])(?P<path>/(?:api|prod-api|admin-api|dev-api|rest|service|system|auth|oauth|user|users|upload|file|download|export|import|swagger|actuator|metrics|webreport|ueditor|kindeditor|blade|sysCommon|clientUser|serverApi)[A-Za-z0-9_./?=&:%-]{0,240})(?P=q)""",
     re.I,
@@ -298,7 +300,7 @@ def analyze_site_surface(
         return max(0.25, min(timeout, deadline - time.monotonic()))
 
     try:
-        with httpx.Client(timeout=timeout, verify=False, follow_redirects=True, headers=_UA) as client:
+        with httpx.Client(timeout=timeout, verify=False, follow_redirects=True, headers=BROWSER_HEADERS) as client:
             resp = client.get(base, timeout=request_timeout())
             body = (resp.text or "")[:_MAX_BODY_BYTES]
             profile.final_url = str(resp.url)
@@ -426,6 +428,9 @@ def evaluate_target(
     """
     if source != "fofa" or leaked_creds:
         return FilterDecision(False)
+
+    if re.search(r"暴露端点|/druid|/actuator|/nacos/|killchain:", priority_reason or "", re.I):
+        return FilterDecision(False, score_bonus=2.0, bonus_reason="exposed_high_value_endpoint")
 
     if profile is None:
         profile = SiteProfile(

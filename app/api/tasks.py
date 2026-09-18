@@ -27,12 +27,13 @@ from app.api.findings import (
     _sanitize_assistant_messages,
 )
 from app.agents import collector, site_collab
-from app.agents.deepen import DEEPEN_CAP
+from app.agents.deepen import DEEPEN_CAP, clamp_deepen_cap
 from app.agents.manual_targets import clean_manual_target_list
 from app.agents.prompts import normalize_src_type
 from app.db.models import Finding, Killsweep, Review, Target, Task, TaskEvent, to_cst_iso
 from app.db.session import get_session
 from app.llm.usage import usage_snapshot, usage_snapshot_by_model
+from app.engines.meter import engine_snapshot
 from app.orchestrator import manager
 from app.security import resolve_role, token_from_headers
 from app.settings_service import (
@@ -56,6 +57,17 @@ from app.tools.executor import ToolExecutor
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
+# 任务级 worker 并发上限（与设置页 max=32、全局 WORKER_MAX_CONCURRENCY 对齐）。
+_TASK_CONCURRENCY_MAX = 32
+
+
+def _clamp_task_concurrency(value: int | None, default: int = 3) -> int:
+    try:
+        n = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(n, _TASK_CONCURRENCY_MAX))
+
 
 # Activity Stream 历史回放：过滤高频低价值事件（与前端 BoardView 规则对齐）。
 _STREAM_NOISE_KINDS = frozenset({"refill", "cluster_cooldown_skip", "skip", "ping"})
@@ -72,7 +84,7 @@ _STREAM_IMPORTANT_KINDS = frozenset({
     "review_start", "review_done", "review_error", "review_deferred", "review_cancelled",
     "reproduce_start", "reproduce_done",
     "killsweep_start", "killsweep_done", "killsweep_dedup", "killsweep_error",
-    "killsweep_invalid", "killsweep_cancelled",
+    "killsweep_invalid", "killsweep_cancelled", "killsweep_retry",
     "reclaim", "recover", "workers_cancelled", "quota_stop",
     "llm_error", "llm_soft_retry", "llm_interrupt", "worker_resume", "llm_provider_failed",
     "tool_exception",
@@ -259,6 +271,24 @@ def _public_model_config(task: Task) -> dict:
     }
 
 
+_OPEN_STATUSES = ("queued", "assigned", "scanning")
+_FINISHED_STATUSES = ("done", "dead")
+
+
+def host_is_checked(statuses: list[str]) -> bool:
+    """扫完且当前没有待跑/待深挖的站才算已检查。"""
+    if any(s in _OPEN_STATUSES for s in statuses):
+        return False
+    return any(s in _FINISHED_STATUSES for s in statuses)
+
+
+def _runtime_parts(task: Task) -> tuple[dict, dict]:
+    raw = dict(getattr(task, "runtime_stats", None) or {})
+    llm = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
+    engine = raw.get("engine") if isinstance(raw.get("engine"), dict) else {}
+    return llm, engine
+
+
 def _public_fofa_config(task: Task) -> dict:
     cfg = dict(task.fofa_config or {})
     eff = resolve_engine_config(task)
@@ -277,6 +307,10 @@ def _public_fofa_config(task: Task) -> dict:
         "last_target_filter_total": cfg.get("last_target_filter_total", 0),
         "last_target_filter_evaluated": cfg.get("last_target_filter_evaluated", 0),
         "last_skipped_filter": cfg.get("last_skipped_filter", 0),
+        "leak_roots_total": cfg.get("leak_roots_total", 0),
+        "leak_roots_done": cfg.get("leak_roots_done", 0),
+        "leak_hits": cfg.get("leak_hits", 0),
+        "leak_targets": cfg.get("leak_targets", 0),
     }
 
 
@@ -327,6 +361,7 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         id=t.id, name=_observer_task_name(t.name, t.id) if observer else t.name, status=t.status, src_type=t.src_type,
         vuln_types=t.vuln_types or [], target_source=t.target_source,
         engine=t.engine or "", fofa_query="" if observer else t.fofa_query, concurrency=t.concurrency,
+        deepen_cap=clamp_deepen_cap(getattr(t, "deepen_cap", None)),
         src_rules="" if observer else (t.src_rules or ""),
         cas_sso_config="" if observer else (t.cas_sso_config or ""),
         manual_targets=[] if observer else (t.manual_targets or []),
@@ -336,14 +371,18 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         engine_config={} if observer else {"engine": t.engine or ""},
         enable_worker_fofa_lookup=t.enable_worker_fofa_lookup if hasattr(t, 'enable_worker_fofa_lookup') else True,
         enable_killsweep_fofa_search=t.enable_killsweep_fofa_search if hasattr(t, 'enable_killsweep_fofa_search') else True,
-        llm_usage=llm_usage,
+        llm_usage={} if observer else usage_snapshot(
+            t.id, model_config.get("model", ""), persisted=_runtime_parts(t)[0],
+        ),
         llm_cost=round(llm_cost, 4),
+        engine_usage={} if observer else engine_snapshot(t.id, persisted=_runtime_parts(t)[1]),
         created_at=to_cst_iso(t.created_at), updated_at=to_cst_iso(t.updated_at),
         stats=stats, pending_user_review=pending_user_review,
         pending_archived=pending_archived, pending_input=pending_input,
         pending_discarded=pending_discarded,
         retest_active=bool(t.retest_state),
         progress_pct=progress_pct,
+        is_top=getattr(t, "is_top", False),
     )
 
 
@@ -399,7 +438,7 @@ async def _compute_stats(session: AsyncSession, task_id: str) -> TaskStats:
             stats.rejected += cnt
     stats.killsweep = (await session.execute(
         select(func.count()).select_from(Killsweep).where(
-            Killsweep.task_id == task_id, Killsweep.is_killsweep == True)  # noqa: E712
+            Killsweep.task_id == task_id, Killsweep.status != "invalid")
     )).scalar() or 0
     # AI 未采纳归档：与 /archived 接口筛选完全一致，保证徽标数字 == 列表条数（不用点开即预加载）
     stats.archived = (await session.execute(
@@ -428,6 +467,53 @@ async def _compute_stats(session: AsyncSession, task_id: str) -> TaskStats:
             ~Finding.target_id.in_(active_targets_sq),
         )
     )).scalar() or 0
+    stats.archived_write = (await session.execute(
+        select(func.count()).select_from(Finding)
+        .join(Review, Review.finding_id == Finding.id)
+        .where(
+            Finding.task_id == task_id,
+            Review.verdict.in_(["ignored", "deepen"]),
+            Review.user_status == "pending",
+            Finding.status != "superseded",
+            or_(
+                Finding.title.ilike("%删除%"),
+                Finding.title.ilike("%修改%"),
+                Finding.title.ilike("%更新%"),
+                Finding.title.ilike("%delete%"),
+                Finding.title.ilike("%update%"),
+                Finding.target_url.ilike("%delete%"),
+                Finding.target_url.ilike("%update%"),
+                Finding.target_url.ilike("%/save%"),
+                Finding.target_url.ilike("%remove%"),
+            ),
+        )
+    )).scalar() or 0
+
+    stats.hosts_total = (await session.execute(
+        select(func.count(func.distinct(Target.host))).where(
+            Target.task_id == task_id, Target.host != "",
+        )
+    )).scalar() or 0
+    open_hosts = {
+        h for (h,) in (await session.execute(
+            select(Target.host).where(
+                Target.task_id == task_id,
+                Target.host != "",
+                Target.status.in_(_OPEN_STATUSES),
+            ).distinct()
+        )).all() if h
+    }
+    finished_hosts = {
+        h for (h,) in (await session.execute(
+            select(Target.host).where(
+                Target.task_id == task_id,
+                Target.host != "",
+                Target.status.in_(_FINISHED_STATUSES),
+            ).distinct()
+        )).all() if h
+    }
+    stats.hosts_checked = len(finished_hosts - open_hosts)
+    stats.checked = (stats.done or 0) + (stats.dead or 0)
     return stats
 
 
@@ -482,9 +568,11 @@ async def create_task(req: CreateTaskRequest, session: AsyncSession = Depends(ge
         manual_targets=clean_manual_target_list(req.manual_targets or []),
         auth_bindings=_dump_auth_bindings(req.auth_bindings),
         model_config_json=model_config,
-        fofa_config=fofa_cfg, concurrency=req.concurrency,
+        fofa_config=fofa_cfg,
+        concurrency=_clamp_task_concurrency(req.concurrency),
         enable_worker_fofa_lookup=req.enable_worker_fofa_lookup,
         enable_killsweep_fofa_search=req.enable_killsweep_fofa_search,
+        deepen_cap=clamp_deepen_cap(req.deepen_cap),
         status="created",
     )
     session.add(task)
@@ -548,7 +636,10 @@ async def probe_task_models(
 
 @router.get("", response_model=list[TaskResponse])
 async def list_tasks(request: Request, session: AsyncSession = Depends(get_session)):
-    rows = await session.execute(select(Task).order_by(Task.created_at.desc()))
+    # 置顶任务永远排最前，其次按创建时间倒序（最新在上）。
+    rows = await session.execute(
+        select(Task).order_by(Task.is_top.desc(), Task.created_at.desc())
+    )
     tasks = rows.scalars().all()
     # 一条聚合查询拿到所有任务的「待人工复审」数（AI accepted 且用户 pending），避免 N+1。
     pending_map: dict[str, int] = {}
@@ -624,6 +715,67 @@ async def list_tasks(request: Request, session: AsyncSession = Depends(get_sessi
                         pending_discarded=discarded_map.get(t.id, 0)) for t in tasks]
 
 
+class TaskTopRequest(BaseModel):
+    """置顶/取消置顶请求体。"""
+    is_top: bool
+
+
+class TaskBatchTopRequest(BaseModel):
+    """批量置顶/取消置顶请求体。"""
+    ids: list[str]
+    is_top: bool
+
+
+@router.patch("/batch/top")
+async def batch_top_tasks(req: TaskBatchTopRequest, session: AsyncSession = Depends(get_session)):
+    """批量置顶/取消置顶任务。
+
+    Args:
+        req: 批量请求体，ids 为任务 ID 列表，is_top 为目标置顶状态。
+        session: 数据库会话。
+
+    Returns:
+        成功条数 success_count 与失败 ID 列表 failed_ids。
+    """
+    if not req.ids:
+        raise HTTPException(400, "ids 不能为空")
+    target_value = bool(req.is_top)
+    success_count = 0
+    failed_ids: list[str] = []
+    # 逐条 get 后置位再统一提交：批量操作一个事务，部分失败不影响已成功项。
+    for tid in req.ids:
+        task = await session.get(Task, tid)
+        if not task:
+            failed_ids.append(tid)
+            continue
+        task.is_top = target_value
+        success_count += 1
+    if success_count:
+        await session.commit()
+    return {"ok": True, "success_count": success_count, "failed_ids": failed_ids}
+
+
+@router.patch("/{task_id}/top")
+async def top_task(task_id: str, req: TaskTopRequest, session: AsyncSession = Depends(get_session)):
+    """置顶/取消置顶单个任务。
+
+    Args:
+        task_id: 任务 ID。
+        req: 请求体，is_top 为目标置顶状态。
+        session: 数据库会话。
+
+    Returns:
+        更新后的任务 ID 与置顶状态。
+    """
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    task.is_top = bool(req.is_top)
+    await session.commit()
+    await session.refresh(task)
+    return {"ok": True, "id": task.id, "is_top": task.is_top}
+
+
 @router.get("/hard-targets")
 async def global_hard_targets(
     request: Request,
@@ -666,7 +818,13 @@ async def global_hard_targets(
         select(func.count()).select_from(stmt.subquery())
     )).scalar() or 0
     stmt = (
-        stmt.order_by(Target.updated_at.desc(), Target.priority_score.desc())
+        stmt.order_by(
+            # 排序规则：置顶优先 → 更新时间降序 → 优先级降序。
+            # 保证置顶的硬骨头资产永远排最前，且对筛选/搜索结果同样生效。
+            Target.is_top.desc(),
+            Target.updated_at.desc(),
+            Target.priority_score.desc(),
+        )
         .offset(safe_offset)
         .limit(safe_limit)
     )
@@ -691,6 +849,7 @@ async def global_hard_targets(
             "priority_reason": "" if observer else t.priority_reason,
             "dead_reason": "" if observer else t.dead_reason,
             "last_error": "" if observer else t.last_error,
+            "is_top": bool(getattr(t, "is_top", False)),
             "created_at": to_cst_iso(t.created_at),
             "updated_at": to_cst_iso(t.updated_at),
         })
@@ -739,12 +898,13 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
     if req.auth_bindings is not None:
         task.auth_bindings = _dump_auth_bindings(req.auth_bindings)
     if req.concurrency is not None:
-        task.concurrency = max(1, min(int(req.concurrency), 20))
+        task.concurrency = _clamp_task_concurrency(req.concurrency)
     if req.enable_worker_fofa_lookup is not None:
         task.enable_worker_fofa_lookup = req.enable_worker_fofa_lookup
     if req.enable_killsweep_fofa_search is not None:
         task.enable_killsweep_fofa_search = req.enable_killsweep_fofa_search
-
+    if req.deepen_cap is not None:
+        task.deepen_cap = clamp_deepen_cap(req.deepen_cap)
     old_query = task.fofa_query or ""
     if req.fofa_query is not None:
         task.fofa_query = req.fofa_query
@@ -1028,8 +1188,13 @@ async def task_board(
         "stats": stats.model_dump(),
         "fofa_config": _observer_fofa_config() if observer else _public_fofa_config(task),
         "model_config_data": _observer_model_config() if observer else _public_model_config(task),
-        "llm_usage": {} if observer else usage_snapshot(task.id, resolve_llm_config(task).model),
+        "llm_usage": {} if observer else usage_snapshot(
+            task.id, resolve_llm_config(task).model, persisted=_runtime_parts(task)[0],
+        ),
         "llm_usage_by_model": [] if observer else _llm_usage_by_model_with_cost(task.id),
+        "engine_usage": {} if observer else engine_snapshot(
+            task.id, persisted=_runtime_parts(task)[1],
+        ),
         "events": events,
         "site_collab": site_overview,
         "retest_summary": retest_summary,
@@ -1614,6 +1779,65 @@ async def batch_start_tasks(session: AsyncSession = Depends(get_session)):
     for tid in started_ids:
         await manager.ensure_running(tid)
     return {"ok": True, "started": len(started_ids), "task_ids": started_ids}
+@router.get("/{task_id}/hosts")
+async def list_hosts(
+    task_id: str,
+    request: Request,
+    checked_only: bool = True,
+    limit: int = 500,
+    session: AsyncSession = Depends(get_session),
+):
+    """按独立网站聚合目标。默认只返回已扫完（无待跑/待深挖）的站。"""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    rows = (await session.execute(
+        select(
+            Target.host, Target.url, Target.title, Target.school, Target.org,
+            Target.status, Target.verdict, Target.deepen_count,
+            Target.updated_at, Target.created_at, Target.priority_score,
+        ).where(Target.task_id == task_id)
+    )).all()
+    grouped: dict[str, list] = {}
+    for t in rows:
+        key = (t.host or "").strip() or (t.url or "").strip()
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(t)
+    observer = _is_observer(request)
+    out = []
+    for host, items in grouped.items():
+        statuses = [x.status for x in items]
+        checked = host_is_checked(statuses)
+        if checked_only and not checked:
+            continue
+        found = any(x.status == "done" or x.verdict == "found" for x in items)
+        if any(s in ("assigned", "scanning") for s in statuses):
+            rollup = "scanning"
+        elif any(s == "queued" for s in statuses):
+            rollup = "queued"
+        elif found:
+            rollup = "done"
+        elif any(s == "dead" for s in statuses):
+            rollup = "dead"
+        else:
+            rollup = "skipped"
+        pick = max(items, key=lambda x: ((x.updated_at or x.created_at), x.priority_score or 0))
+        out.append({
+            "host": _observer_host(host) if observer else host,
+            "url": _observer_url(pick.url, pick.host) if observer else pick.url,
+            "title": _observer_text(pick.title) if observer else pick.title,
+            "school": _observer_text(pick.school) if observer else pick.school,
+            "org": _observer_text(pick.org) if observer else pick.org,
+            "status": rollup,
+            "checked": checked,
+            "found": found,
+            "target_count": len(items),
+            "deepen_count": max((x.deepen_count or 0) for x in items),
+            "verdict": pick.verdict or "",
+        })
+    out.sort(key=lambda r: (not r["found"], r["host"]))
+    return out[: max(1, min(int(limit or 500), 2000))]
 
 
 @router.post("/{task_id}/start", response_model=TaskResponse)

@@ -4,12 +4,14 @@ import { useRouter } from "vue-router";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { api, wsUrl, authRoleRef, authReadyRef, loadAuthRole } from "../api.js";
-import { copyText } from "../clipboard.js";
+import { copyText, formatLlmErrorCopy, isLlmErrorEvent } from "../clipboard.js";
 import { effectiveSeverity, buildReportMd, buildReportPy, buildEdusrcToolReport, reportSlug } from "../report.js";
 import { fmtLocalTime } from "../format.js";
 import ReportDrawer from "../components/ReportDrawer.vue";
 import TaskEditModal from "../components/TaskEditModal.vue";
 import { showToast } from "../toast.js";
+
+defineOptions({ name: "BoardView" });
 
 const props = defineProps({ id: String });
 const router = useRouter();
@@ -44,6 +46,7 @@ const drawerMode = ref("view");
 const toastMsg = ref("");
 const editOpen = ref(false);
 const invalidatingKillsweepId = ref(null);
+const retryingKillsweepId = ref(null);
 const traceOpen = ref(false);
 const traceWorker = ref(null);
 const traceEvents = ref([]);
@@ -55,7 +58,8 @@ const expandedEventKeys = ref(new Set());
 const streamDetailLoading = ref({});
 const eventLogRef = ref(null);
 const readonly = computed(() => authRoleRef.value !== "full");
-const initialLoading = ref(false);
+const initialLoading = ref(true);
+const boardReady = ref(false);
 const refreshing = ref(false);
 const loadedTaskId = ref("");
 const submitHasMore = ref(false);
@@ -390,6 +394,7 @@ function resetTaskState(full = true) {
   events.value = [];
   liveWorkers.value = [];
   liveEscalations.value = [];
+  boardReady.value = false;
   liveTraceByTarget.value = {};
   expandedEventKeys.value = new Set();
   streamDetailLoading.value = {};
@@ -405,16 +410,24 @@ function resetTaskState(full = true) {
 async function bootstrapTask() {
   if (!props.id) return;
   const switching = loadedTaskId.value && loadedTaskId.value !== props.id;
-  if (!task.value) initialLoading.value = true;
-  else if (switching) refreshing.value = true;
+  if (!task.value || switching) initialLoading.value = true;
+  else refreshing.value = true;
 
   closeWs(true);
   resetTaskState(!task.value || switching);
   loadedTaskId.value = props.id;
 
   try {
-    await Promise.all([loadTask(), loadBoard()]);
-    if (isListTab(tab.value)) await loadTabData(tab.value);
+    // 先出任务壳（标题/指标），看板 worker/活动流后到，避免被 /board 拖成白屏。
+    await loadTask();
+    initialLoading.value = false;
+    const extras = [loadBoard()];
+    if (isListTab(tab.value)) extras.push(loadTabData(tab.value));
+    try {
+      await Promise.all(extras);
+    } catch {
+      /* 任务壳已出；看板失败不阻断 WS，避免活态停更 */
+    }
     wsIntentionalClose = false;
     connectWs();
   } finally {
@@ -432,7 +445,7 @@ const IMPORTANT_KINDS = new Set([
   "review_start", "review_done", "review_error", "review_deferred", "review_cancelled",
   "reproduce_start", "reproduce_done",
   "killsweep_start", "killsweep_done", "killsweep_error", "killsweep_dedup",
-  "killsweep_invalid", "killsweep_cancelled",
+  "killsweep_invalid", "killsweep_cancelled", "killsweep_retry",
   "llm_error", "llm_soft_retry", "llm_interrupt", "worker_resume", "llm_provider_failed", "quota_stop", "reclaim", "recover", "workers_cancelled",
   "tool_exception",
   "retest_start", "retest_phase2", "retest_sleep", "retest_wake", "retest_done",
@@ -455,7 +468,7 @@ const LOG_INFO_IMPORTANT = new Set([
   "target_done", "target_requeued", "timeout", "auto_deepen", "salvage",
   "review_done", "review_deferred", "review_cancelled",
   "reclaim", "recover", "workers_cancelled", "quota_stop",
-  "killsweep_done", "killsweep_dedup", "killsweep_error", "killsweep_cancelled",
+  "killsweep_done", "killsweep_dedup", "killsweep_error", "killsweep_cancelled", "killsweep_retry",
   "escalate_done", "escalate_skip", "escalate_cancelled",
   "target_needs_auth",
 ]);
@@ -666,11 +679,12 @@ function fmtEvent(ev) {
     case "killsweep_error": return `通杀分析异常: ${(d.error || "").slice(0, 120)}`;
     case "killsweep_dedup": return `通杀分析去重：${d.product || ""}`;
     case "killsweep_invalid": return `通杀记录已标记无效：${d.product || ""}`;
+    case "killsweep_retry": return `手动重启通杀分析：${d.product || d.title || ""}`;
     case "llm_error": return `⚠ LLM 调用失败: ${d.error || ""}`;
-    case "llm_soft_retry": return `LLM 软重试 ${d.attempt || "?"}/${d.max_attempts || "?"}（${d.kind || "retry"}，等 ${d.wait_seconds || 0}s）: ${(d.error || "").slice(0, 120)}`;
-    case "llm_interrupt": return `LLM 中断收尾${d.has_resume ? "（已保存进度）" : ""}: ${(d.error || "").slice(0, 120)}`;
+    case "llm_soft_retry": return `LLM 软重试 ${d.attempt || "?"}/${d.max_attempts || "?"}（${d.kind || d.failure_kind || "retry"}，等 ${d.wait_seconds || 0}s）: ${(d.error || "").slice(0, 180)}`;
+    case "llm_interrupt": return `LLM 中断收尾${d.has_resume ? "（已保存进度）" : ""}: ${(d.error || "").slice(0, 180)}`;
     case "worker_resume": return `断点续挖：恢复笔记 ${d.notes_len || 0} 字 / cookie ${(d.cookies || []).length} / 头 ${(d.headers || []).length}`;
-    case "llm_provider_failed": return `LLM 端点失败: ${d.model || ""} @ ${d.base_url || ""} (${d.error_kind || "failed"})`;
+    case "llm_provider_failed": return `LLM 端点失败: ${d.model || ""} @ ${d.base_url || ""} (${d.error_kind || "failed"})${d.error ? ` · ${d.error}` : ""}`;
     case "tool_exception": return `工具异常: ${d.tool || ""} ${(d.error || "").slice(0, 80)}`;
     case "tool_http": return `HTTP ${d.method || "GET"} ${d.url || ""}`;
     case "tool_shell": return `$ ${(d.command || "").slice(0, 160)}`;
@@ -679,7 +693,13 @@ function fmtEvent(ev) {
     case "tool_js_analyze": return `JS 分析: ${(d.url || "").slice(0, 120)}`;
     case "tool_decode": return `解码: ${d.mode || "auto"}`;
     case "tool_waf_advice": return `WAF 建议: ${d.context || "generic"}`;
-    case "tool_fofa_lookup": return `FOFA: ${(d.query || "").slice(0, 100)}`;
+    case "tool_fofa_lookup": {
+      const eng = ({
+        fofa: "FOFA", quake: "360 Quake", hunter: "Hunter",
+        zoomeye: "ZoomEye", shodan: "Shodan", censys: "Censys",
+      })[task.value?.engine] || task.value?.engine || "测绘";
+      return `${eng}: ${(d.query || "").slice(0, 100)}`;
+    }
     case "tool_session_set": return `会话态更新`;
     case "worker_thought": return `💭 ${(d.text || "").slice(0, 200)}`;
     case "worker_directive": return `🎛 执行人工指令: ${(d.text || "").slice(0, 160)}`;
@@ -739,7 +759,7 @@ const _EV_CAT = {
   killsweep_error: "error", escalate_error: "error",
   worker_start: "phase", worker_resume: "phase", llm_round_start: "phase",
   collector_phase: "phase", review_start: "phase", reproduce_start: "phase",
-  escalate_start: "phase", killsweep_start: "phase",
+  escalate_start: "phase", killsweep_start: "phase", killsweep_retry: "phase",
   auth_status: "auth",
 };
 function evCat(ev) {
@@ -753,6 +773,11 @@ const _CAT_ICON = {
   warn: "!", phase: "○", auth: "◈", action: "›", muted: "·", neutral: "·",
 };
 function evIcon(cat) { return _CAT_ICON[cat] || "·"; }
+
+async function copyLlmEvent(ev) {
+  const ok = await copyText(formatLlmErrorCopy(ev));
+  toast(ok ? "已复制 LLM 错误信息" : "复制失败，请手动选中");
+}
 // 稳定唯一 key：优先用入库时分配的 _uid（保证唯一且跨刷新稳定），
 // 这样 TransitionGroup 只对真正新增的那条做进入动画，绝不会因重复内容撞 key。
 function evKey(ev) {
@@ -779,6 +804,60 @@ function authBadgeClass(w) {
 function phaseStateText(state) {
   return { active: "进行中", pending: "排队中", done: "已完成", idle: "未开始" }[state] || "";
 }
+function collabRouteCount(r) {
+  const n = Number(r?.count);
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+function collabRouteLabel(r) {
+  return String(r?.label || "").replace(/\s*[×xX]\s*\d+\s*$/, "").trim() || r?.label || "路线";
+}
+function groupedCollabRoutes(routes) {
+  if (!Array.isArray(routes) || !routes.length) return [];
+  const map = new Map();
+  const leftover = [];
+  for (const r of routes) {
+    const label = collabRouteLabel(r);
+    const status = r?.status || "done";
+    const findings = Number(r?.findings) || 0;
+    const count = collabRouteCount(r);
+    const running = Number(r?.running) || (status === "running" ? count : 0);
+    const queued = Number(r?.queued) || (status === "queued" ? count : 0);
+    const done = Number(r?.done) || (status === "done" ? count : 0);
+    if (r?.is_aggregate) {
+      leftover.push({ ...r, label, count, findings, running, queued, done });
+      continue;
+    }
+    const existing = map.get(label);
+    if (!existing) {
+      map.set(label, { ...r, label, count, findings, running, queued, done });
+      continue;
+    }
+    existing.count += count;
+    existing.findings += findings;
+    existing.running += running;
+    existing.queued += queued;
+    existing.done += done;
+    if (status === "running" || (status === "queued" && existing.status !== "running")) {
+      existing.status = status;
+    }
+  }
+  return [...map.values(), ...leftover];
+}
+function collabRouteTitle(r) {
+  const bits = [];
+  if (collabRouteCount(r) > 1) {
+    bits.push(`共 ${r.count} 条`);
+    if (r.running) bits.push(`${r.running} 进行中`);
+    if (r.queued) bits.push(`${r.queued} 排队`);
+    if (r.done) bits.push(`${r.done} 完成`);
+  }
+  return [r.focus || r.label, bits.join(" · ")].filter(Boolean).join("\n");
+}
+const collabPhases = computed(() => {
+  const phases = siteCollab.value?.phases;
+  if (!Array.isArray(phases)) return [];
+  return phases.map((p) => ({ ...p, routes: groupedCollabRoutes(p.routes) }));
+});
 
 async function loadBoard() {
   const id = props.id;
@@ -806,6 +885,29 @@ async function loadBoard() {
       .filter(isImportantEvent)
       .map((e) => normalizeTimedEvent(e, existingByKey))
       .filter(Boolean);
+  try {
+    const b = await api.board(id);
+    if (id !== props.id) return;
+    liveWorkers.value = b.live_workers || [];
+    liveEscalations.value = b.live_escalations || [];
+    siteCollab.value = b.site_collab || null;
+    if (task.value) {
+      if (b.task_status) task.value.status = b.task_status;
+      if (b.stats) task.value.stats = b.stats;
+      if (b.fofa_config) task.value.fofa_config = b.fofa_config;
+      if (b.model_config_data) task.value.model_config_data = b.model_config_data;
+      if (b.llm_usage) task.value.llm_usage = b.llm_usage;
+      if (b.engine_usage) task.value.engine_usage = b.engine_usage;
+    }
+    if (!events.value.length && b.events?.length) {
+      const existingByKey = new Map(events.value.map((e) => [streamEventStableKey(e), e]));
+      events.value = b.events
+        .filter(isImportantEvent)
+        .map((e) => normalizeTimedEvent(e, existingByKey))
+        .filter(Boolean);
+    }
+  } finally {
+    if (id === props.id) boardReady.value = true;
   }
 }
 
@@ -1441,6 +1543,23 @@ async function invalidateKillsweep(k) {
     invalidatingKillsweepId.value = null;
   }
 }
+function ksCanRetry(k) {
+  if (readonly.value) return false;
+  return !!k.retryable;
+}
+async function retryKillsweep(k) {
+  if (readonly.value || retryingKillsweepId.value) return;
+  retryingKillsweepId.value = k.id;
+  try {
+    await api.retryKillsweep(props.id, k.id);
+    toast("已重新启动通杀分析");
+    await Promise.all([loadTabData("killsweep"), loadBoard()]);
+  } catch (e) {
+    toast(`重启失败：${e.message || e}`);
+  } finally {
+    retryingKillsweepId.value = null;
+  }
+}
 
 async function loadMoreSubmit() {
   if (submitLoading.value || !submitHasMore.value) return;
@@ -1617,6 +1736,9 @@ const archivedCount = computed(() =>
   Math.max(stats.value.archived ?? 0, loadedTabs.value.has("archived") ? archivedItems.value.length : 0));
 const discardedCount = computed(() =>
   Math.max(stats.value.discarded ?? 0, loadedTabs.value.has("discarded") ? discardedItems.value.length : 0));
+const archivedWriteCount = computed(() => Number(stats.value.archived_write || 0));
+const checkedHosts = computed(() => Number(stats.value.hosts_checked || 0));
+const totalHosts = computed(() => Number(stats.value.hosts_total || 0));
 const totalTargets = computed(() =>
   (stats.value.queued ?? 0) + (stats.value.scanning ?? 0) +
   (stats.value.done ?? 0) + (stats.value.dead ?? 0) + (stats.value.skipped ?? 0) +
@@ -1631,7 +1753,7 @@ const collectorCfg = computed(() => task.value?.fofa_config || {});
 // 才算搜集中——主进度条走不确定动画 + collectorPct。终态/待命阶段一律不算搜集，
 // 即便 24×7 自动补队列让搜集器常驻待命也一样：
 //   dispatch=派发完成，idle=队列充足待命/手动清单入队完成，
-//   exhausted=FOFA 已翻尽，fofa_error=搜集出错。
+//   exhausted=测绘已翻尽，fofa_error=搜集出错。
 // 这些阶段必须切到「处置进度」(resolved/total)，否则 collectorPct 会兜底成无意义的 25%，
 // 让手动清单等入队完成后永久停在「25% 搜集进度」。
 const COLLECT_DONE_PHASES = new Set([
@@ -1792,6 +1914,15 @@ function formatCost(c) {
   if (v > 0) return `¥${v.toFixed(4)}`;
   return "—";
 }
+const engineUsage = computed(() => task.value?.engine_usage || {});
+const ENGINE_SRC_LABEL = { collector: "搜集", worker: "Worker", killsweep: "通杀" };
+const engineSourceHint = computed(() => {
+  const by = engineUsage.value.by_source || {};
+  return Object.entries(by)
+    .filter(([, n]) => Number(n) > 0)
+    .map(([k, n]) => `${ENGINE_SRC_LABEL[k] || k} ${n}`)
+    .join(" · ");
+});
 const cacheHitRate = computed(() => {
   const u = tokenUsage.value || {};
   const hit = Number(u.cache_hit_tokens || 0);
@@ -1803,9 +1934,9 @@ const cacheHitRate = computed(() => {
 const isEnterpriseTask = computed(() => task.value?.src_type === "enterprise");
 const taskModeName = computed(() => isEnterpriseTask.value ? "企业SRC" : "EduSRC");
 const targetSourceName = computed(() => (({
-  fofa: "FOFA",
+  fofa: "测绘搜集",
   manual: "手动清单",
-  both: "FOFA+手动",
+  both: "测绘+手动",
   site: "单站协作",
 })[task.value?.target_source] || task.value?.target_source || "-"));
 const engineName = computed(() => (({
@@ -1826,11 +1957,11 @@ const missionEyebrow = computed(() => {
   if (task.value?.target_source === "site") return "COOPERATIVE SINGLE-SITE OPERATION";
   return isEnterpriseTask.value ? "AUTONOMOUS ENTERPRISE SRC OPERATION" : "AUTONOMOUS EDU SRC OPERATION";
 });
-const searchPlaceholder = computed(() =>
-  isEnterpriseTask.value
+const searchPlaceholder = computed(() => {
+  return isEnterpriseTask.value
     ? "搜索漏洞：标题 / URL / 类型 / 单位 / 系统 / 报告正文 / 审核备注"
-    : "搜索漏洞：标题 / URL / 类型 / 学校 / 报告正文 / 审核备注"
-);
+    : "搜索漏洞：标题 / URL / 类型 / 学校 / 报告正文 / 审核备注";
+});
 const scopeCountLabel = computed(() => isEnterpriseTask.value ? "范围" : "教育");
 
 const searchTokens = computed(() =>
@@ -1943,9 +2074,10 @@ function fmtTime(iso) {
         <div class="mission-meta">
           <span>{{ taskModeName }}</span>
           <span>{{ targetSourceName }}</span>
-          <span v-if="task.engine && task.engine !== 'fofa'" class="engine-badge">🔍 {{ engineName }}</span>
+          <span v-if="task.target_source !== 'manual' && task.target_source !== 'site'" class="engine-badge">{{ engineName }}</span>
           <span>{{ missionScopeText }}</span>
           <span>并发 {{ task.concurrency }}</span>
+          <span>深挖 ×{{ task.deepen_cap ?? 2 }}</span>
           <span>{{ runState.hint }}</span>
         </div>
         <div v-if="retestCard" class="retest-card">
@@ -1991,6 +2123,11 @@ function fmtTime(iso) {
             <b>{{ poolStats.checkedout }}/{{ poolStats.total_capacity }}</b>
             <span class="pool-bar"><i :style="{ width: poolPct + '%' }"></i></span>
             <small v-if="poolStats.overflow > 0">+{{ poolStats.overflow }}溢出</small>
+          <span class="runtime-chip" :title="engineUsage.last_query || ''">
+            <i>测绘</i>
+            <b>{{ engineUsage.count || 0 }}</b>
+            <small>{{ engineUsage.last_engine || engineName }}</small>
+            <small v-if="engineSourceHint">{{ engineSourceHint }}</small>
           </span>
         </div>
       </div>
@@ -2029,32 +2166,34 @@ function fmtTime(iso) {
       </header>
       <div class="collab-flow">
         <div
-          v-for="(p, pi) in siteCollab.phases"
+          v-for="(p, pi) in collabPhases"
           :key="p.key"
           class="collab-phase"
           :class="[`state-${p.state}`, { current: p.phase === siteCollab.current_phase }]"
         >
           <div class="phase-rail">
             <span class="phase-dot"></span>
-            <span v-if="pi < siteCollab.phases.length - 1" class="phase-line"></span>
+            <span v-if="pi < collabPhases.length - 1" class="phase-line"></span>
           </div>
           <div class="phase-body">
             <div class="phase-head">
               <span class="phase-step">阶段 {{ p.phase + 1 }}</span>
               <b>{{ p.label }}</b>
               <span class="phase-state-tag" :class="`st-${p.state}`">{{ phaseStateText(p.state) }}</span>
+              <span v-if="p.counts?.total" class="phase-n">{{ p.counts.total }} 条</span>
             </div>
             <p class="phase-desc">{{ p.desc }}</p>
             <div v-if="p.routes.length" class="phase-routes">
               <div
                 v-for="r in p.routes"
-                :key="r.source"
+                :key="`${r.source}:${r.label}`"
                 class="route-chip"
                 :class="`rc-${r.status}`"
-                :title="r.focus"
+                :title="collabRouteTitle(r)"
               >
                 <span class="route-status-dot"></span>
-                <span class="route-label">{{ r.label }}</span>
+                <span class="route-label">{{ collabRouteLabel(r) }}</span>
+                <span v-if="collabRouteCount(r) > 1" class="route-count">×{{ collabRouteCount(r) }}</span>
                 <span v-if="r.findings" class="route-hit">{{ r.findings }}</span>
               </div>
             </div>
@@ -2082,12 +2221,14 @@ function fmtTime(iso) {
       <div class="metric-card clickable" @click="openTargetPanel" title="点击查看目标列表">
         <span v-if="pendingInputCount" class="metric-badge pending-badge" @click.stop="openTargetPanel(); targetFilter = 'pending_input'; loadTargetList()" title="待注册目标">{{ pendingInputCount }}</span>
         <span class="metric-k">TARGETS</span><b>{{ totalTargets }}</b><em>目标总数</em>
+      <div class="metric-card">
+        <span class="metric-k">SITES</span><b>{{ totalHosts || totalTargets }}</b><em>独立网站 · {{ totalTargets }} 条目标</em>
       </div>
       <div class="metric-card active">
         <span class="metric-k">ACTIVE</span><b>{{ stats.scanning ?? 0 }}</b><em>扫描中</em>
       </div>
       <div class="metric-card">
-        <span class="metric-k">DONE</span><b>{{ stats.done ?? 0 }}</b><em>已扫</em>
+        <span class="metric-k">CHECKED</span><b>{{ checkedHosts }}</b><em>已检查</em>
       </div>
       <div class="metric-card hot">
         <span class="metric-k">FINDINGS</span><b>{{ stats.findings_total ?? 0 }}</b><em>原始发现</em>
@@ -2123,9 +2264,10 @@ function fmtTime(iso) {
         <span class="tab-long">已驳回</span><span class="tab-short">驳回</span>
         <i v-if="rejectedCount">{{ rejectedCount }}</i>
       </button>
-      <button type="button" role="tab" :aria-selected="tab === 'archived'" :class="{ active: tab === 'archived' }" @click="tab = 'archived'">
+      <button type="button" role="tab" :aria-selected="tab === 'archived'" :class="{ active: tab === 'archived', 'has-write': archivedWriteCount }" @click="tab = 'archived'">
         <span class="tab-long">AI 未采纳</span><span class="tab-short">AI 未采纳</span>
         <i v-if="archivedCount">{{ archivedCount }}</i>
+        <em v-if="archivedWriteCount" class="write-flag">写删 {{ archivedWriteCount }}</em>
       </button>
       <button type="button" role="tab" :aria-selected="tab === 'discarded'" :class="{ active: tab === 'discarded' }" @click="tab = 'discarded'">
         <span class="tab-long">AI 已作废</span><span class="tab-short">已作废</span>
@@ -2164,7 +2306,10 @@ function fmtTime(iso) {
           <small>点击卡片查看轨迹</small>
           <i class="cnt">{{ liveWorkers.length }}</i>
         </div>
-        <div v-if="!liveWorkers.length" class="empty sm">暂无运行中的 worker</div>
+        <div v-if="!boardReady" class="board-hydrate" aria-hidden="true">
+          <div v-for="n in 3" :key="n" class="skeleton-worker"></div>
+        </div>
+        <div v-else-if="!liveWorkers.length" class="empty sm">暂无运行中的 worker</div>
         <div v-for="w in liveWorkers" :key="w.target_id" class="worker-card clickable"
           @click="openWorkerTrace(w)" title="查看执行轨迹 / 注入指令">
           <div class="wc-top">
@@ -2218,7 +2363,10 @@ function fmtTime(iso) {
           <small>点击带目标的行展开细节</small>
         </div>
         <div ref="eventLogRef" class="event-log">
-          <div v-if="!events.length" class="empty sm">等待事件…</div>
+          <div v-if="!boardReady && !events.length" class="board-hydrate" aria-hidden="true">
+            <div v-for="n in 6" :key="n" class="skeleton-line"></div>
+          </div>
+          <div v-else-if="!events.length" class="empty sm">等待事件…</div>
           <template v-for="(ev, i) in events" :key="eventExpandKey(ev, i)">
             <div
               :class="[evClass(ev), { expandable: canExpandEvent(ev), open: isEventExpanded(eventExpandKey(ev, i)) }]"
@@ -2231,6 +2379,13 @@ function fmtTime(iso) {
               <span class="ev-icon" :class="`ag-${ev.agent}`">{{ AGENT_ICON[ev.agent] || "•" }}</span>
               <span class="ev-agent" :class="`ag-${ev.agent}`">{{ AGENT_LABEL[ev.agent] || ev.agent }}</span>
               <span class="ev-msg">{{ ev._text }}</span>
+              <button
+                v-if="isLlmErrorEvent(ev)"
+                type="button"
+                class="ev-copy"
+                title="复制 LLM 真实错误"
+                @click.stop="copyLlmEvent(ev)"
+              >复制</button>
               <span class="ev-time">{{ evTime(ev) }}</span>
             </div>
             <div
@@ -2249,6 +2404,13 @@ function fmtTime(iso) {
                 <span class="ev-detail-round" v-if="d.round">R{{ d.round }}</span>
                 <span class="ev-detail-kind">{{ d.kind }}</span>
                 <span class="ev-detail-msg">{{ d._text || d.message || d.kind }}</span>
+                <button
+                  v-if="isLlmErrorEvent(d)"
+                  type="button"
+                  class="ev-copy"
+                  title="复制 LLM 真实错误"
+                  @click.stop="copyLlmEvent(d)"
+                >复制</button>
                 <span class="ev-detail-time">{{ evTime(d) }}</span>
               </div>
             </div>
@@ -2322,13 +2484,15 @@ function fmtTime(iso) {
         <small v-if="killsweepItems.length" class="muted">已加载 {{ killsweepItems.length }} 条{{ killsweepHasMore ? "，还有更多" : "" }}</small>
       </div>
       <div v-if="!killsweepItems.length" class="empty">还没有通杀候选（人工复审通过后，通杀 Hunter 会自动分析同款系统）</div>
+      <div class="list-head"><span>通杀列</span><small>人工通过后进入此列；失败可直接重启，不必改库回退复审</small></div>
+      <div v-if="!killsweepItems.length" class="empty">还没有通杀记录（人工复审通过后，通杀 Hunter 会自动分析同款系统，失败也会留在这里）</div>
       <div v-else-if="!filteredKillsweeps.length" class="empty">没有匹配当前关键词的通杀记录</div>
-      <div v-for="k in filteredKillsweeps" :key="k.id" class="killsweep-card" :class="{ open: isKillsweepOpen(k.id) }">
+      <div v-for="k in filteredKillsweeps" :key="k.id" class="killsweep-card" :class="{ open: isKillsweepOpen(k.id), failed: k.status === 'failed', running: k.status === 'analyzing' }">
         <button class="ks-summary" type="button" :aria-expanded="isKillsweepOpen(k.id)" @click="toggleKillsweep(k.id)">
           <span class="ks-chevron">{{ isKillsweepOpen(k.id) ? "⌄" : "›" }}</span>
           <span class="ks-main">
-            <span class="ks-title">{{ k.product_name || "未知产品" }}</span>
-            <span class="meta">{{ k.vuln_type }} · {{ k.origin_title || k.vuln_summary || "通杀候选" }}</span>
+            <span class="ks-title">{{ k.product_name || k.origin_title || k.vuln_summary || "通杀分析" }}</span>
+            <span class="meta">{{ k.vuln_type }} · {{ k.origin_title || k.vuln_summary || "源漏洞" }}</span>
             <span class="meta rr-time">发现 {{ fmtLocalTime(k.created_at) }}</span>
           </span>
           <span class="ks-summary-metrics">
@@ -2337,8 +2501,13 @@ function fmtTime(iso) {
             <span><b>{{ k.asset_count ?? 0 }}</b>全网</span>
           </span>
           <span class="ks-badges">
+            <span class="tag-run" v-if="k.status === 'analyzing'">分析中</span>
+            <span class="tag-fail" v-else-if="k.status === 'failed'">启动失败</span>
+            <span class="tag-miss" v-else-if="k.status === 'cancelled'">已取消</span>
+            <span class="tag-done" v-else-if="k.is_killsweep || k.has_sites">有通杀站{{ verifiedCount(k) > 1 ? ` ${verifiedCount(k)} 个` : "" }}</span>
+            <span class="tag-miss" v-else>无通杀站</span>
             <span class="tag-done" v-if="k.verified">已验证{{ verifiedCount(k) > 1 ? ` ${verifiedCount(k)} 个` : "" }}</span>
-            <span class="sev-pill" :class="k.confidence">{{ k.confidence || "uncertain" }}</span>
+            <span class="sev-pill" :class="k.confidence" v-if="k.confidence">{{ k.confidence }}</span>
           </span>
         </button>
 
@@ -2349,12 +2518,12 @@ function fmtTime(iso) {
               <p>{{ fmtLocalTime(k.created_at) || "未知" }}</p>
             </div>
             <div>
-              <span>FOFA 语法</span>
-              <code>{{ k.fofa_query || "无 FOFA 语法" }}</code>
+              <span>测绘语法</span>
+              <code>{{ k.fofa_query || "无测绘语法" }}</code>
             </div>
             <div>
               <span>指纹依据</span>
-              <p>{{ k.fingerprint || k.notes || "无补充依据" }}</p>
+              <p>{{ k.fingerprint || (k.status === 'failed' || k.status === 'cancelled' ? k.notes : '') || k.notes || "无补充依据" }}</p>
             </div>
           </div>
 
@@ -2387,10 +2556,17 @@ function fmtTime(iso) {
           </div>
 
           <div class="ks-actions" v-if="!readonly">
-            <button class="ks-invalid" type="button" :disabled="invalidatingKillsweepId === k.id" @click="invalidateKillsweep(k)">
+            <button v-if="ksCanRetry(k)" class="ks-retry" type="button"
+              :disabled="retryingKillsweepId === k.id"
+              @click="retryKillsweep(k)">
+              {{ retryingKillsweepId === k.id ? "启动中…" : "重新启动通杀" }}
+            </button>
+            <button class="ks-invalid" type="button" :disabled="invalidatingKillsweepId === k.id || k.status === 'analyzing'" @click="invalidateKillsweep(k)">
               {{ invalidatingKillsweepId === k.id ? "标记中…" : "标记为无效" }}
             </button>
-            <span>误判、资产不稳定、未实际验证或通杀条件不成立时使用。</span>
+            <span v-if="k.status === 'failed'">LLM/中转站失败后可直接重启，不用改复审状态。</span>
+            <span v-else-if="!(k.is_killsweep || k.has_sites)">分析完成但没有圈到通杀站；也可再跑一轮。</span>
+            <span v-else>误判、资产不稳定、未实际验证或通杀条件不成立时使用。</span>
           </div>
         </div>
       </div>
@@ -2426,17 +2602,19 @@ function fmtTime(iso) {
       <div class="list-head">
         <span>AI 未采纳</span>
         <small>AI 判为非漏洞或深挖未升级的洞，保留在此防误杀，可点开查看、必要时「恢复到复审」或「驳回」</small>
+        <small>AI 判为非漏洞或深挖未升级的洞，保留在此防误杀，可点开查看、必要时「恢复到复审」</small>
+        <small v-if="archivedWriteCount" class="write-hint">有 {{ archivedWriteCount }} 条写/删类已置顶，优先人工看，别让真洞埋在这里</small>
         <small v-if="archivedItems.length" class="muted">已加载 {{ archivedItems.length }} 条{{ archivedHasMore ? "，还有更多" : "" }}</small>
       </div>
       <div v-if="!archivedItems.length" class="empty">
         暂无 AI 未采纳的漏洞（AI 审核判「非漏洞」或「深挖未升级」的洞会沉淀到这里，防止误杀）
       </div>
       <div v-else-if="!filteredArchived.length" class="empty">没有匹配当前关键词的未采纳漏洞</div>
-      <div v-for="f in filteredArchived" :key="f.id" class="result-row archived" @click="openArchived(f.id)">
+      <div v-for="f in filteredArchived" :key="f.id" class="result-row archived" :class="{ 'write-op': f.is_write_op }" @click="openArchived(f.id)">
         <span class="sev-pill" :class="effectiveSeverity(f)">{{ effectiveSeverity(f) }}</span>
         <div class="rr-main">
           <div class="rr-title">
-            <span class="arch-tag" :class="f.archive_reason">{{ f.archive_reason_text }}</span>
+            <span class="arch-tag" :class="[f.archive_reason, { write: f.is_write_op }]">{{ f.archive_reason_text }}</span>
             {{ f.title }}
           </div>
           <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
@@ -2816,6 +2994,13 @@ function fmtTime(iso) {
                 <div class="trace-body">
                   <span class="trace-msg">{{ ev._text || ev.message || ev.kind }}</span>
                   <span class="trace-kind">{{ ev.kind }}</span>
+                  <button
+                    v-if="isLlmErrorEvent(ev)"
+                    type="button"
+                    class="ev-copy"
+                    title="复制 LLM 真实错误"
+                    @click.stop="copyLlmEvent(ev)"
+                  >复制错误</button>
                 </div>
                 <span class="trace-time">
                   <span v-if="ev.round" class="trace-round">R{{ ev.round }}</span>{{ evTime(ev) }}
@@ -2829,5 +3014,6 @@ function fmtTime(iso) {
 
     <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
     </template>
+    <div v-else class="empty">任务不存在或加载失败，请返回任务列表重试</div>
   </section>
 </template>

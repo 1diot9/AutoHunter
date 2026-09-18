@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -142,7 +143,8 @@ def record_usage(task_id: str | None, model: str, prompt_tokens: int = 0,
         logger.debug("token_usage DB 写入失败（内存计数不受影响）: %s", e)
 
 
-def usage_snapshot(task_id: str | None, model: str = "") -> dict[str, Any]:
+def usage_snapshot(task_id: str | None, model: str = "",
+                   persisted: dict[str, Any] | None = None) -> dict[str, Any]:
     """聚合所有模型的用量汇总（从 DB 读取，重启不丢）。"""
     if not task_id:
         return _empty(model)
@@ -192,6 +194,20 @@ def usage_snapshot(task_id: str | None, model: str = "") -> dict[str, Any]:
             last_model = r.get("model", "")
     agg["model"] = model or last_model or agg["model"]
     agg["updated_at"] = latest_ts
+    if agg["requests"] or agg["total_tokens"]:
+        return agg
+    if persisted and (persisted.get("requests") or persisted.get("total_tokens") or persisted.get("prompt_tokens")):
+        out = _empty(model)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                    "cache_hit_tokens", "cache_miss_tokens", "requests"):
+            try:
+                out[key] = max(0, int(persisted.get(key) or 0))
+            except (TypeError, ValueError):
+                pass
+        if persisted.get("model"):
+            out["model"] = str(persisted.get("model") or model)
+        out["updated_at"] = persisted.get("updated_at")
+        return out
     return agg
 
 
@@ -243,3 +259,52 @@ def _empty(model: str = "") -> dict[str, Any]:
         "model": model,
         "updated_at": None,
     }
+
+
+def persist_usage(task_id: str | None) -> None:
+    """把日历/内存用量同步进 tasks.runtime_stats，供任务结束后看板回看。"""
+    if not task_id:
+        return
+    snap = usage_snapshot(task_id)
+    if not snap.get("requests") and not snap.get("total_tokens"):
+        return
+    _write_runtime_stats(task_id, {"llm": snap})
+
+
+def persist_dirty_usage() -> None:
+    """日历路径每次 record_usage 已落库；这里无需额外脏集合。"""
+    return
+
+
+def _write_runtime_stats(task_id: str, patch: dict[str, Any]) -> None:
+    try:
+        from app.db.session import DB_PATH
+    except Exception:
+        return
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
+            if "runtime_stats" not in cols:
+                return
+            raw = con.execute(
+                "SELECT runtime_stats FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not raw:
+                return
+            current: dict[str, Any] = {}
+            if raw[0]:
+                try:
+                    current = json.loads(raw[0]) if isinstance(raw[0], str) else dict(raw[0] or {})
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    current = {}
+            current.update(patch)
+            con.execute(
+                "UPDATE tasks SET runtime_stats = ? WHERE id = ?",
+                (json.dumps(current, ensure_ascii=False), task_id),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        return

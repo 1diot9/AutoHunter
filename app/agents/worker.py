@@ -18,10 +18,14 @@ from pydantic import ValidationError
 
 from app.agents.history import compact_messages
 from app.agents.prompts import is_enterprise_src, normalize_worker_prompt_version, worker_system_prompt
+from app.agents.backdoor_proof import weak_backdoor_block_reason
+from app.agents.edu_scope import edu_bombing_block_reason
+from app.agents.write_proof import HARMLESS_PROTOCOL, weak_write_block_reason
 from app.agents import auth_bootstrap
 from app.config import worker_config
+from app.tools.cookie_manager import CookieHub
 from app import dedup
-from app.llm.client import LLMClient, LLMError
+from app.llm.client import LLMClient, LLMError, llm_error_event_fields
 from app.schemas import Finding, Verdict, WorkerResult
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import (
@@ -71,21 +75,27 @@ class Worker:
         prompt_version: str | None = None,
         enable_fofa_lookup: bool = True,
         deepen_count: int = 0,
+        src_rules: str = "",
         pop_directive: Optional[Callable[[], Optional[str]]] = None,
+        task_id: str = "",
     ):
         self.target = target
+        self.task_id = task_id or ""
         self.llm = llm or LLMClient()
         self.cancel_event = cancel_event or threading.Event()
         self.src_type = src_type
         self._enterprise = is_enterprise_src(src_type)
+        self.src_rules = src_rules or ""
         self.prompt_version = normalize_worker_prompt_version(prompt_version or worker_config.prompt_version)
         self._enable_fofa_lookup = enable_fofa_lookup
         self._deepen_count = deepen_count
         self.executor = ToolExecutor(
             target, cancel_event=self.cancel_event,
             enterprise=self._enterprise, fofa_key=fofa_key, fofa_base_url=fofa_base_url,
-            engine=engine,
+            engine=engine, task_id=self.task_id,
         )
+        self._cookie_hub = CookieHub(self.task_id, target)
+        self.executor._cookie_hub = self._cookie_hub
         self.findings: list[Finding] = []
         self.on_event = on_event or (lambda kind, data: None)
         self._finished: Optional[dict] = None
@@ -101,6 +111,7 @@ class Worker:
         self._js_tool_enabled = self._initial_js_tool_enabled()
         self._js_signal_seen = self._js_tool_enabled
         self._tool_counts: dict[str, int] = {}
+        self._http_urls: list[str] = []
         self._last_js_analysis_round = 0
         self._post_js_validation_count = 0
         # worker 主动上报的可复用情报（纯内存收集，由编排层 async 统一落全局情报库）
@@ -202,11 +213,57 @@ class Worker:
         return auth_bootstrap.user_auth_prompt_block(ctx, attempt)
 
     def _bootstrap_user_auth(self) -> None:
-        """启动时确定性使用用户凭据：注入 Cookie/Bearer 或尝试账密登录，并 emit 反馈。"""
+        """启动时：全局 Cookie 优先，否则用用户凭据登录；失败则后续 http 自动重登。"""
         ctx = (self.target_meta or {}).get("user_auth") or (self.target_meta or {}).get("auth_context")
-        if not ctx:
+        if not isinstance(ctx, dict):
+            ctx = None
+        hub = self._cookie_hub
+        if ctx:
+            hub.remember_from_auth_context(ctx)
+        elif hub.creds().get("username") and hub.creds().get("password"):
+            stored = hub.creds()
+            ctx = {
+                "matched": True,
+                "kinds": ["password"],
+                "username": stored.get("username") or "",
+                "password": stored.get("password") or "",
+                "login_url": stored.get("login_url") or "",
+                "matched_by": "shared",
+                "binding_target": "全局会话",
+            }
+            self.target_meta["user_auth"] = ctx
+            self.target_meta["auth_context"] = ctx
+        hub.bootstrapping = True
+        result = None
+        login_base = auth_bootstrap.login_origin(self.target) or self.target
+        try:
+            if hub.apply(self.executor):
+                names = sorted(getattr(self.executor, "_session_cookies", {}).keys())[:30]
+                headers = sorted(getattr(self.executor, "_session_headers", {}).keys())[:20]
+                result = auth_bootstrap.AuthAttemptResult(
+                    used=True, matched=True, status="injected",
+                    kinds=["cookie"], matched_by="shared", binding_target="全局会话",
+                    reason="复用本站全局 Cookie",
+                    cookie_names=names, header_names=headers,
+                )
+            if result is None and ctx:
+                with hub.login_turn() as action:
+                    if action == "reuse" and hub.apply(self.executor):
+                        names = sorted(getattr(self.executor, "_session_cookies", {}).keys())[:30]
+                        result = auth_bootstrap.AuthAttemptResult(
+                            used=True, matched=True, status="injected",
+                            kinds=["cookie"], matched_by="shared", binding_target="全局会话",
+                            reason="复用本站全局 Cookie",
+                            cookie_names=names,
+                        )
+                    else:
+                        result = auth_bootstrap.bootstrap_auth(self.executor, ctx, login_base)
+                        if result.status in ("injected", "login_ok"):
+                            hub.ingest(self.executor, status=result.status)
+        finally:
+            hub.bootstrapping = False
+        if result is None:
             return
-        result = auth_bootstrap.bootstrap_auth(self.executor, ctx, self.target)
         payload = result.as_event()
         self.target_meta["auth_attempt"] = payload
         self._emit(
@@ -229,6 +286,11 @@ class Worker:
 
     def _creds_block(self) -> str:
         """泄露凭证情报：搜集阶段查到的该域已泄露账号密码（已过滤打分）。"""
+        ctx = (self.target_meta or {}).get("user_auth") or (self.target_meta or {}).get("auth_context")
+        if auth_bootstrap.has_login_material(ctx):
+            return ""
+        if self._cookie_hub.creds().get("username"):
+            return ""
         creds = (self.target_meta or {}).get("leaked_creds") or []
         if not creds:
             return ""
@@ -309,7 +371,7 @@ class Worker:
             )
             self._emit("worker_start", target=self.target, prompt_version=self.prompt_version)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": worker_system_prompt(self.src_type, self.prompt_version)},
+            {"role": "system", "content": worker_system_prompt(self.src_type, self.prompt_version, src_rules=self.src_rules)},
             {"role": "user", "content": _WORKER_STATIC_PREFIX},
             {"role": "user", "content": user_content},
         ]
@@ -376,7 +438,8 @@ class Worker:
                 msg = self.llm.chat(send_messages, tools=tools, tool_choice="auto")
                 consecutive_llm_failures = 0
             except Exception as e:
-                self._emit("llm_error", error=str(e))
+                fields = llm_error_event_fields(e)
+                self._emit("llm_error", **fields)
                 failure_kind = e.kind if isinstance(e, LLMError) else ""
                 retry_after = e.retry_after if isinstance(e, LLMError) else 0
                 if self._should_soft_retry_llm(e) and consecutive_llm_failures < _WORKER_LLM_SOFT_RETRIES:
@@ -395,6 +458,9 @@ class Worker:
                         failure_kind=failure_kind or "unknown",
                         wait_seconds=wait_s,
                         error=str(e)[:240],
+                        error_copy=fields.get("error_copy") or str(e),
+                        detail=fields.get("detail") or "",
+                        diagnostic=fields.get("diagnostic") or "",
                     )
                     # 不消耗轮次预算：基础设施抖动不应吃掉挖掘配额
                     rounds = max(0, rounds - 1)
@@ -705,6 +771,7 @@ class Worker:
             "directive": "\n".join(directive_bits)[:2000],
             "worker_notes": notes[:4000],
             "session_cookies": cookies,
+            "session_cookie_jar": snap.get("session_cookie_jar") or [],
             "session_headers": headers,
             "rounds_done": rounds,
             "source": "llm_interrupt",
@@ -719,12 +786,19 @@ class Worker:
             return
         notes = str(ctx.get("worker_notes") or "")
         cookies = ctx.get("session_cookies") if isinstance(ctx.get("session_cookies"), dict) else {}
+        jar = ctx.get("session_cookie_jar") if isinstance(ctx.get("session_cookie_jar"), list) else []
         headers = ctx.get("session_headers") if isinstance(ctx.get("session_headers"), dict) else {}
         self.executor.restore_resume_state(
             worker_notes=notes,
             session_cookies=cookies,
             session_headers=headers,
+            session_cookie_jar=jar,
         )
+        if cookies or headers or jar:
+            try:
+                self._cookie_hub.ingest(self.executor, status="injected")
+            except Exception:
+                pass
         self._emit(
             "worker_resume",
             notes_len=len(notes),
@@ -876,6 +950,9 @@ class Worker:
                     "若没有明确攻击面就 finish(verdict=no_vuln)。",
                 )
             self._emit("tool_http", round=rnd, url=url, method=args.get("method", "GET"))
+            self._http_urls.append(url)
+            if len(self._http_urls) > 80:
+                self._http_urls = self._http_urls[-80:]
             self._maybe_enable_js_tool(url, "worker 主动请求 JS 资源")
             result = self.executor.http_request(
                 url=url,
@@ -883,7 +960,10 @@ class Worker:
                 headers=args.get("headers"),
                 data=args.get("data"),
                 json_body=args.get("json_body"),
+                files=args.get("files"),
                 follow_redirects=args.get("follow_redirects", False),
+                confirm_destructive=args.get("confirm_destructive", False),
+                confirm_reason=args.get("confirm_reason") or "",
             )
             if not self._js_tool_enabled and isinstance(result, dict):
                 headers = result.get("response_headers") if isinstance(result.get("response_headers"), dict) else {}
@@ -940,13 +1020,26 @@ class Worker:
                     ),
                 }
             self._emit("tool_shell", round=rnd, command=command[:200])
-            return self.executor.run_shell(command, timeout=args.get("timeout"))
+            return self.executor.run_shell(
+                command,
+                timeout=args.get("timeout"),
+                confirm_destructive=args.get("confirm_destructive", False),
+                confirm_reason=args.get("confirm_reason") or "",
+            )
 
         if name == "decode_transform":
             self._mark_tool_used(name, rnd)
             value = args.get("value") or ""
             self._emit("tool_decode", round=rnd, mode=args.get("mode", "auto"), value_len=len(str(value)))
             return self.executor.decode_transform(value=value, mode=args.get("mode", "auto"))
+
+        if name == "eval_javascript":
+            self._mark_tool_used(name, rnd)
+            code = args.get("code") or ""
+            if not str(code).strip():
+                return self._tool_arg_error("eval_javascript", "code", "必须传要执行的 JS，结果 console.log 出来。")
+            self._emit("tool_eval_js", round=rnd, code_len=len(str(code)))
+            return self.executor.eval_javascript(code=code, timeout=args.get("timeout", 8))
 
         if name == "suggest_waf_bypass":
             self._mark_tool_used(name, rnd)
@@ -1163,6 +1256,12 @@ class Worker:
             return ""
         if self.deepen_context:
             return ""
+        exposed = self._untested_exposed_endpoint()
+        if exposed:
+            return (
+                f"过早结束：搜集阶段已确认暴露端点 {exposed}，不能按纯前端静态站收尾。"
+                "先 GET 该路径验证是否真实开放，再决定是否无洞。"
+            )
         if self._js_signal_seen and not self._tool_counts.get("analyze_javascript"):
             return (
                 f"过早结束：已出现 JS/API/前端接口信号，但第 {rnd} 轮仍未调用 analyze_javascript。"
@@ -1201,6 +1300,40 @@ class Worker:
         return any(x in text for x in unreachable) or (
             any(x in text for x in static_or_empty) and any(x in text for x in no_surface)
         )
+
+    def _exposed_endpoint_hints(self) -> list[str]:
+        text = "\n".join([
+            str((self.target_meta or {}).get("priority_reason") or ""),
+            str((self.target_meta or {}).get("playbook_block") or ""),
+            " ".join((self.target_meta or {}).get("playbook_route", {}).get("tags") or [])
+            if isinstance((self.target_meta or {}).get("playbook_route"), dict) else "",
+            self.target or "",
+        ])
+        found = re.findall(
+            r"(/druid(?:/index\.html)?|/actuator(?:/[a-z0-9._-]+)?|/nacos/?)",
+            text,
+            re.I,
+        )
+        out: list[str] = []
+        for item in found:
+            low = item.lower()
+            if low not in out:
+                out.append(low)
+        return out
+
+    def _untested_exposed_endpoint(self) -> str:
+        hints = self._exposed_endpoint_hints()
+        if not hints:
+            return ""
+        hit = " ".join(self._http_urls).lower()
+        for ep in hints:
+            token = ep.rstrip("/").split("/")[-1]
+            if token and token in hit:
+                continue
+            if ep in hit:
+                continue
+            return ep
+        return ""
 
     def _maybe_enable_js_tool(self, text: str, reason: str) -> bool:
         if self._js_tool_enabled:
@@ -1245,8 +1378,8 @@ class Worker:
                 return f"302 跳转到 {loc[:120]}：若是跳登录页说明需要登录态；若是跳 ticket/SSO 链，设 follow_redirects=true 跟完整个登录链。"
             if "timed out" in err.lower() or "timeout" in err.lower():
                 return "请求超时：目标可能慢或不可达。换更小范围的请求、加大 timeout、或确认目标是否在线；连续超时就 finish。"
-            if "connection" in err.lower() or "refused" in err.lower() or "unreachable" in err.lower():
-                return "连接失败：目标可能下线/防火墙拦截/端口未开放。确认目标可达性(换个端口/协议)；不可达就 finish(no_vuln)。"
+            if "connection" in err.lower() or "refused" in err.lower() or "unreachable" in err.lower() or "reset" in err.lower():
+                return "连接失败：常见是网关按扫描器 UA 掐 TCP，不是 WAF 拦截页。http_request 已默认 Chrome UA；若用 run_shell 的 httpx/curl，加浏览器 UA 再试一次。没有拦截页就不要 suggest_waf_bypass。仍不通再 finish。"
         if tool == "run_shell":
             rc = result.get("return_code")
             if rc and rc != 0:
@@ -1273,6 +1406,8 @@ class Worker:
                 verdict="error",
                 failure_kind=failure_kind,
                 summary=reason[:300],
+                error=reason[:500],
+                error_copy=reason,
             )
             return
         verdict = "found" if self.findings else "no_vuln"
@@ -1484,6 +1619,27 @@ class Worker:
             self._emit("finding_invalid", errors=str(e))
             return {"ok": False, "error": f"Finding 校验失败，请修正后重新提交: {e}"}
 
+        if not self._enterprise:
+            bomb_block = edu_bombing_block_reason(finding)
+            if bomb_block:
+                self._emit("finding_out_of_scope", title=finding.title, reason=bomb_block[:200])
+                return {
+                    "ok": False,
+                    "kind": "out_of_scope",
+                    "submitted": False,
+                    "error": bomb_block,
+                }
+
+        backdoor_block = weak_backdoor_block_reason(finding)
+        if backdoor_block:
+            self._emit("finding_out_of_scope", title=finding.title, reason=backdoor_block[:200])
+            return {
+                "ok": False,
+                "kind": "out_of_scope",
+                "submitted": False,
+                "error": backdoor_block,
+            }
+
         evidence_block = self._weak_write_evidence_reason(finding)
         if evidence_block:
             self._emit("finding_needs_more_evidence", title=finding.title, reason=evidence_block[:200])
@@ -1493,9 +1649,7 @@ class Worker:
                 "submitted": False,
                 "error": evidence_block,
                 "guidance": (
-                    "不要把这条半成品提交给 reviewer。请继续找真实存在的对象 ID、列表/详情/查询接口，"
-                    "做 before/after 或响应差异验证；如果无法安全证明真实状态变化，调用 finish(verdict=no_vuln)，"
-                    "并在 deepen_lead 写清下一轮要沿哪个接口/ID 继续验证。"
+                    "不要把这条半成品提交给 reviewer。" + HARMLESS_PROTOCOL
                 ),
             }
 
@@ -1523,55 +1677,9 @@ class Worker:
     def _weak_write_evidence_reason(self, finding: Finding) -> str:
         """拦截 EduSRC 最常见半成品：写接口返回成功但影响 0 行。
 
-        这类 finding 会消耗 reviewer token，且大多被判 ignored。这里不终止 worker，
-        只把提交退回，要求继续找真实 ID/前后状态差异，或用 deepen_lead 交棒。
+        无害证法（哨兵闭环 / 鉴权对照 / 幂等回写 / 旁路回读）放行；
+        只拦「成功文案 + 零影响」且没有任何无害证据的半成品。
         """
         if self._enterprise:
             return ""
-        vuln_type = (finding.vuln_type or "").lower()
-        title_desc = "\n".join([
-            finding.title,
-            finding.target_url,
-            finding.description,
-            finding.poc,
-            finding.raw_request,
-            finding.raw_response,
-            finding.evidence.extracted_data_sample or "",
-            finding.evidence.notes or "",
-        ])
-        low = title_desc.lower()
-        if not any(marker in vuln_type for marker in ("unauthorized", "idor", "auth", "access", "越权", "未授权")):
-            return ""
-        write_markers = (
-            "updatedel", "delete", "remove", "update", "modify", "edit", "save",
-            "insert", "create", "del", "删除", "删", "修改", "更新", "写操作",
-        )
-        if not any(marker in low for marker in write_markers):
-            return ""
-        zero_effect_patterns = (
-            r'"data"\s*:\s*0\b',
-            r'"affected(?:rows)?"\s*:\s*0\b',
-            r'"row(?:s|count)?"\s*:\s*0\b',
-            r'"count"\s*:\s*0\b',
-            r"\b0\s+rows?\b",
-            r"影响\s*0",
-            r"0\s*行",
-            r"不存在",
-            r"未实证",
-            r"未证明",
-        )
-        if not any(re.search(pattern, low, re.IGNORECASE) for pattern in zero_effect_patterns):
-            return ""
-        positive_patterns = (
-            r'"data"\s*:\s*[1-9]\d*\b',
-            r'"affected(?:rows)?"\s*:\s*[1-9]\d*\b',
-            r"再次查询.*(不存在|消失|已删除|状态变化|已更新)",
-            r"(before|after|前后对比|状态变化|修改后查询|删除后查询)",
-            r"(真实存在的|已存在的)\s*(id|记录|对象)",
-        )
-        if any(re.search(pattern, low, re.IGNORECASE) for pattern in positive_patterns):
-            return ""
-        return (
-            "写/删/改接口证据不足：当前证据显示接口返回成功文案但影响为 0 或使用了不存在的对象，"
-            "只能证明接口可被调用，不能证明真实删除/修改了受限数据。"
-        )
+        return weak_write_block_reason(finding)

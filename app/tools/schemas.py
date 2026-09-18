@@ -10,7 +10,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "http_request",
-            "description": "发一个 HTTP 请求并返回完整的请求包，以及状态码、响应头和响应体。挖洞取证的首选工具。会自动携带并吸收 Cookie（含整条重定向链每一跳的 Set-Cookie），登录后深挖无需每次手拼凭证。【登录/CAS/SSO 场景】务必把 follow_redirects 设为 true：一次 POST 账号密码即可自动走完 302 连环跳（lt→CASTGC→ST ticket→JSESSIONID），返回里的 redirect_chain/final_url 可看清跳到哪、是否登录成功；别再手动一跳跳拼 ticket。",
+            "description": "发一个 HTTP 请求并返回完整的请求包，以及状态码、响应头和响应体。挖洞取证的首选工具。默认带 Chrome UA。会按域携带并吸收 Cookie（含重定向链每一跳），登录后深挖无需每次手拼凭证。headers 里的 Cookie 只覆盖同名，不会清空其它会话 cookie。【登录/CAS/SSO】follow_redirects=true。【上传】用 files 发 multipart，不要手拼 boundary。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -19,7 +19,13 @@ TOOL_SCHEMAS = [
                     "headers": {"type": "object", "description": "请求头键值对", "additionalProperties": {"type": "string"}},
                     "data": {"type": "string", "description": "请求体原始字符串（如表单 a=1&b=2）"},
                     "json_body": {"type": "object", "description": "JSON 请求体（与 data 二选一）"},
+                    "files": {
+                        "type": "object",
+                        "description": "multipart 上传。如 {\"file\":{\"filename\":\"t.txt\",\"content\":\"hello\",\"content_type\":\"text/plain\"}}，或 {\"file\":\"@相对工作目录的文件\"}。与 json_body 互斥，可与 data 表单字段并存。",
+                    },
                     "follow_redirects": {"type": "boolean", "default": False, "description": "是否自动跟随 302/301 跳转。登录/CAS/SSO 走通登录链必须设 true（自动带齐每跳 Cookie）。仅想看单跳 302 目标时才用 false。"},
+                    "confirm_destructive": {"type": "boolean", "default": False, "description": "疑似删库/清缓存/覆盖文件时会先暂停让你反思。确认无害后再设 true。"},
+                    "confirm_reason": {"type": "string", "description": "确认时必填：为何无害（SRC_TEST_/ROLLBACK/只证明接口存在）。"},
                 },
                 "required": ["url"],
             },
@@ -35,6 +41,8 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "command": {"type": "string", "description": "要执行的完整命令"},
                     "timeout": {"type": "integer", "description": "超时秒数，默认 120"},
+                    "confirm_destructive": {"type": "boolean", "default": False, "description": "疑似删库/清缓存/覆盖文件时会先暂停让你反思。确认无害后再设 true。"},
+                    "confirm_reason": {"type": "string", "description": "确认时必填：为何无害（SRC_TEST_/ROLLBACK/只证明接口存在）。"},
                 },
                 "required": ["command"],
             },
@@ -57,6 +65,21 @@ TOOL_SCHEMAS = [
                     },
                 },
                 "required": ["value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "eval_javascript",
+            "description": "在容器 node 里执行 JS，用于登录页 AES/RSA/SM2 加密、签名计算。把加密函数和密钥拼进 code，console.log 输出密文。没有 DOM。算出后用 http_request POST。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "完整 JS，结果必须 console.log 出来"},
+                    "timeout": {"type": "integer", "description": "超时秒数，默认 8，最大 20"},
+                },
+                "required": ["code"],
             },
         },
     },
@@ -555,7 +578,10 @@ KILLSWEEP_TOOL_SCHEMAS = [
                     "headers": {"type": "object", "additionalProperties": {"type": "string"}},
                     "data": {"type": "string"},
                     "json_body": {"type": "object"},
+                    "files": {"type": "object", "description": "multipart 上传字段"},
                     "follow_redirects": {"type": "boolean", "default": False, "description": "登录/CAS/SSO 走登录链必须设 true（自动带齐每跳 Cookie）。"},
+                    "confirm_destructive": {"type": "boolean", "default": False, "description": "疑似破坏性操作会先暂停反思。确认无害后再设 true。"},
+                    "confirm_reason": {"type": "string", "description": "确认时必填：为何无害。"},
                 },
                 "required": ["url"],
             },
@@ -571,6 +597,8 @@ KILLSWEEP_TOOL_SCHEMAS = [
                 "properties": {
                     "command": {"type": "string"},
                     "timeout": {"type": "integer"},
+                    "confirm_destructive": {"type": "boolean", "default": False, "description": "疑似破坏性操作会先暂停反思。确认无害后再设 true。"},
+                    "confirm_reason": {"type": "string", "description": "确认时必填：为何无害。"},
                 },
                 "required": ["command"],
             },
@@ -634,7 +662,10 @@ ESCALATE_TOOL_SCHEMAS = [
                     "headers": {"type": "object", "additionalProperties": {"type": "string"}},
                     "data": {"type": "string"},
                     "json_body": {"type": "object"},
+                    "files": {"type": "object", "description": "multipart 上传字段"},
                     "follow_redirects": {"type": "boolean", "default": False, "description": "登录/CAS/SSO 走登录链必须设 true（自动带齐每跳 Cookie）。"},
+                    "confirm_destructive": {"type": "boolean", "default": False, "description": "疑似破坏性操作会先暂停反思。确认无害后再设 true。"},
+                    "confirm_reason": {"type": "string", "description": "确认时必填：为何无害。"},
                 },
                 "required": ["url"],
             },
@@ -650,6 +681,8 @@ ESCALATE_TOOL_SCHEMAS = [
                 "properties": {
                     "command": {"type": "string"},
                     "timeout": {"type": "integer"},
+                    "confirm_destructive": {"type": "boolean", "default": False, "description": "疑似破坏性操作会先暂停反思。确认无害后再设 true。"},
+                    "confirm_reason": {"type": "string", "description": "确认时必填：为何无害。"},
                 },
                 "required": ["command"],
             },

@@ -51,7 +51,7 @@ class Task(Base):
     name: Mapped[str] = mapped_column(String(200))
     src_type: Mapped[str] = mapped_column(String(20), default="edusrc")
     vuln_types: Mapped[list] = mapped_column(JSON, default=list)        # 选定漏洞类型
-    src_rules: Mapped[str] = mapped_column(Text, default="")            # SRC 规则全文（审核用）
+    src_rules: Mapped[str] = mapped_column(Text, default="")            # 任务附加 SRC 规则（叠加内置标准，不替换）
     cas_sso_config: Mapped[str] = mapped_column(Text, default="")        # CAS SSO 统一认证凭证（任务级，每个 worker 都会收到）
     target_source: Mapped[str] = mapped_column(String(20), default="fofa")  # fofa / manual / both / site
     fofa_query: Mapped[str] = mapped_column(Text, default="")
@@ -62,6 +62,7 @@ class Task(Base):
     fofa_config: Mapped[dict] = mapped_column(JSON, default=dict)       # keys/max_pages/page_size/cursor
     engine: Mapped[str] = mapped_column(String(20), default="")         # 搜索引擎：fofa/quake/hunter/zoomeye/shodan/censys
     concurrency: Mapped[int] = mapped_column(Integer, default=3)
+    deepen_cap: Mapped[int] = mapped_column(Integer, default=2)         # 单目标深挖回炉上限（人工+AI+lead）
     # Worker 挖掘时是否允许调用 fofa_lookup（只读测绘确认归属/探攻击面）
     enable_worker_fofa_lookup: Mapped[bool] = mapped_column(Boolean, default=True)
     # 通杀分析时是否允许调用 fofa_search（圈定同款系统+统计规模）
@@ -72,6 +73,9 @@ class Task(Base):
     retest_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    is_top: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    # token / 测绘调用累计：内存实时 + 这里落库，任务结束或重启后还能看。
+    runtime_stats: Mapped[dict] = mapped_column(JSON, default=dict)
 
     targets: Mapped[list["Target"]] = relationship(back_populates="task", cascade="all, delete-orphan")
 
@@ -127,6 +131,8 @@ class Target(Base):
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    # 用户置顶标记：全局资产（硬骨头）库列表中置顶行优先展示（is_top DESC 排序）。
+    is_top: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
 
     task: Mapped["Task"] = relationship(back_populates="targets")
     findings: Mapped[list["Finding"]] = relationship(back_populates="target", cascade="all, delete-orphan")
@@ -170,6 +176,8 @@ class Finding(Base):
     # pending_review / reviewed
     status: Mapped[str] = mapped_column(String(20), default="pending_review", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    # 用户置顶标记：全局漏洞库列表中置顶行优先展示（is_top DESC 排序）。
+    is_top: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
 
     target: Mapped["Target"] = relationship(back_populates="findings")
     review: Mapped["Review | None"] = relationship(back_populates="finding", uselist=False, cascade="all, delete-orphan")
@@ -239,7 +247,7 @@ class Killsweep(Base):
     # 既用于前端展示，也会进入 worker 查重上下文，避免同学校同通杀洞反复提交。
     affected_table: Mapped[list] = mapped_column(JSON, default=list)
     notes: Mapped[str] = mapped_column(Text, default="")                 # 分析结论/批量建议
-    # analyzing / done / failed
+    # analyzing / done / failed / cancelled / invalid
     status: Mapped[str] = mapped_column(String(20), default="analyzing", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
@@ -361,6 +369,7 @@ class SystemSettings(Base):
     defaults: Mapped[dict] = mapped_column(JSON, default=dict)  # concurrency/skip_score_threshold/engine
     proxy: Mapped[dict] = mapped_column(JSON, default=dict)     # ssh_servers/ssh_key_path（WAF IP 封禁代理复测）
     pricing: Mapped[dict] = mapped_column(JSON, default=dict)   # {model_name: {input, output, cache_hit}} 单位:元/百万Token
+    ui: Mapped[dict] = mapped_column(JSON, default=dict)        # 外观：主题色 / 背景图元数据
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 

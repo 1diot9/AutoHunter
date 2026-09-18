@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import {
+  api,
   applyAccessToken,
   authReadyRef,
   authRoleRef,
@@ -10,7 +11,16 @@ import {
   submitTokenModal,
 } from "./api.js";
 import { toastList } from "./toast.js";
+import { applyUi, commitDefaultThemeGen, loadUiPrefs, markUiMigrated, peekDefaultThemeGen, prefsFromApi, prefsToApi, saveUiPrefs, uiNeedsMigrate } from "./uiTheme.js";
+
 const route = useRoute();
+const KEEP_ALIVE_VIEWS = [
+  "TasksView",
+  "VulnsView",
+  "IntelView",
+  "HardTargetsView",
+  "RuntimeLogsView",
+];
 
 const theme = ref("dark");
 const showTokenModal = ref(false);
@@ -18,12 +28,43 @@ const tokenInput = ref("");
 const tokenModalReason = ref("switch");
 const toastMsg = ref("");
 
-function applyTheme(t) {
-  theme.value = t;
-  document.documentElement.setAttribute("data-theme", t);
-  localStorage.setItem("ah-theme", t);
+async function applyTheme(t) {
+  const prefs = saveUiPrefs({ ...loadUiPrefs(), theme: t });
+  theme.value = prefs.theme;
+  await applyUi(prefs);
+  api.updateSettings({ ui: prefsToApi(prefs) }).catch(() => {});
+}
+
+async function hydrateUiFromServer() {
+  try {
+    const s = await api.getSettings();
+    const remote = s.ui || {};
+    if (!remote.saved && uiNeedsMigrate()) {
+      const local = commitDefaultThemeGen(loadUiPrefs());
+      await api.updateSettings({ ui: prefsToApi(local) });
+      markUiMigrated();
+      await applyUi(saveUiPrefs(local));
+      theme.value = local.theme;
+      return;
+    }
+    markUiMigrated();
+    const incoming = prefsFromApi(remote);
+    const prefs = saveUiPrefs(commitDefaultThemeGen(incoming));
+    await applyUi(prefs);
+    theme.value = prefs.theme;
+    if (prefs.theme !== incoming.theme) {
+      api.updateSettings({ ui: prefsToApi(prefs) }).catch(() => {});
+    }
+  } catch {
+    const prefs = await applyUi(saveUiPrefs(commitDefaultThemeGen(loadUiPrefs())));
+    theme.value = prefs.theme;
+  }
 }
 function toggleTheme() { applyTheme(theme.value === "dark" ? "light" : "dark"); }
+
+function onUiChanged(e) {
+  if (e.detail?.theme) theme.value = e.detail.theme;
+}
 
 function toast(m, ms = 2600) {
   toastMsg.value = m;
@@ -70,16 +111,21 @@ function changeToken() {
 }
 
 onMounted(async () => {
-  applyTheme(localStorage.getItem("ah-theme") || "dark");
+  const prefs = await applyUi(peekDefaultThemeGen(loadUiPrefs()));
+  theme.value = prefs.theme;
   window.addEventListener("autohunter-open-token-modal", onOpenTokenModal);
+  window.addEventListener("ah-ui-changed", onUiChanged);
   await loadAuthRole();
+  await hydrateUiFromServer();
 });
 onUnmounted(() => {
   window.removeEventListener("autohunter-open-token-modal", onOpenTokenModal);
+  window.removeEventListener("ah-ui-changed", onUiChanged);
 });
 </script>
 
 <template>
+  <div id="ah-wallpaper" class="ah-wallpaper" aria-hidden="true"></div>
   <header class="topbar">
     <div class="topbar-row">
       <div class="brand">
@@ -143,13 +189,17 @@ onUnmounted(() => {
     </nav>
   </header>
   <main>
-    <router-view />
+    <router-view v-slot="{ Component }">
+      <keep-alive :include="KEEP_ALIVE_VIEWS" :max="6">
+        <component :is="Component" />
+      </keep-alive>
+    </router-view>
   </main>
 
   <footer class="app-credit" aria-label="署名">
     <span>Powered By <b>StanleyNull</b></span>
     <span class="app-credit-sep">·</span>
-    <span>CC BY-NC 4.0</span>
+    <span>Apache License 2.0</span>
   </footer>
 
   <nav class="bottom-nav mobile-only-nav" aria-label="主导航">

@@ -1,15 +1,23 @@
-"""出站 URL 的 SSRF 校验。
+"""出站 URL 的 SSRF / 回环校验。
 
-仅用于 **AutoHunter 自身携带凭证的配置探测请求**（如拉取模型商 /models 列表、
-FOFA base_url 探测）——这类请求会把真实 API Key / FOFA Key 放进 Authorization/query，
-一旦 base_url 被篡改指向内网或云元数据，就会造成密钥外泄 + 内网探测。
+`assert_safe_outbound_url` 仅用于 **AutoHunter 自身携带凭证的配置探测请求**
+（如拉取模型商 /models 列表、FOFA base_url 探测）——这类请求会把真实 API Key /
+FOFA Key 放进 Authorization/query，一旦 base_url 被篡改指向内网或云元数据，
+就会造成密钥外泄 + 内网探测。
 
-注意：Worker/killsweep/report_assistant 主动挖洞的 http_request/run_shell 属于产品语义
-（就是要打目标，可能含内网），不走本模块。
+Worker/killsweep/report_assistant 主动挖洞的 http_request/run_shell 属于产品语义
+（就是要打目标，可能含内网），**不走** `assert_safe_outbound_url`，以免误杀
+校园网 / 实验室 RFC1918 目标。
+
+但挖洞请求必须走 `is_loopback_target`：域名若解析到 127.0.0.1/::1，worker 会打到
+AutoHunter 自己，产出「未授权访问 / 泄露漏洞报告」之类假洞（Issue #49）。
+只拦回环与未指定地址，不拦 10/8、192.168/16。
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import re
 import socket
 from urllib.parse import urlparse
 
@@ -85,3 +93,116 @@ def assert_safe_outbound_url(url: str, *, allow_extra_hosts: set[str] | None = N
         if _ip_is_forbidden(ip):
             raise SsrfBlocked(f"目标解析到私有/保留地址({ip_str})，已拦截")
     return raw
+
+
+# ---------------------------------------------------------------------------
+# Worker 侧回环拦截（Issue #49）
+# 只拦 loopback / unspecified，不拦 RFC1918。DNS 任一结果命中即拦。
+# ---------------------------------------------------------------------------
+
+_LOOPBACK_HOSTNAMES = frozenset({
+    "localhost",
+    "localhost.localdomain",
+    "ip6-localhost",
+    "ip6-loopback",
+})
+
+LOOPBACK_BLOCK_ERROR = "目标指向本机回环地址（127.0.0.1/::1），已拦截"
+LOOPBACK_SKIP_REASON = "目标指向本机回环地址（127.0.0.1/::1），自动跳过"
+
+_CMD_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
+_CMD_TOOL_LOOPBACK_RE = re.compile(
+    r"\b(?:curl|wget|httpie|http|nc|ncat|netcat|ssh|nmap|masscan|ffuf|gobuster|sqlmap)\b"
+    r"[^\n]{0,240}(?<![A-Za-z0-9_.-])"
+    r"(?:127(?:\.\d+){3}|\[::1\]|::1|localhost(?:\.localdomain)?)"
+    r"(?![A-Za-z0-9_.-])",
+    re.I,
+)
+
+
+def _ip_is_loopback(ip: ipaddress._BaseAddress) -> bool:
+    if ip.is_loopback or ip.is_unspecified:
+        return True
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None and (mapped.is_loopback or mapped.is_unspecified):
+        return True
+    return False
+
+
+def _parse_ip(text: str) -> ipaddress._BaseAddress | None:
+    raw = (text or "").strip().lstrip("[").rstrip("]")
+    if not raw:
+        return None
+    try:
+        return ipaddress.ip_address(raw)
+    except ValueError:
+        return None
+
+
+def is_loopback_ip(value: str) -> bool:
+    """字面 IP 是否为本机回环 / 未指定地址（含 IPv4-mapped IPv6）。"""
+    ip = _parse_ip(value)
+    return bool(ip and _ip_is_loopback(ip))
+
+
+def _extract_host(host_or_url: str) -> str:
+    from app.urlnorm import safe_hostname
+
+    raw = (host_or_url or "").strip()
+    if not raw:
+        return ""
+    host = safe_hostname(raw)
+    if host:
+        return host.rstrip(".")
+    s = raw.split("/")[0].split("?")[0].split("#")[0]
+    if s.startswith("[") and "]" in s:
+        return s[1:s.index("]")].rstrip(".")
+    if s.count(":") == 1:
+        left, right = s.rsplit(":", 1)
+        if right.isdigit():
+            s = left
+    return s.lower().rstrip(".")
+
+
+def is_loopback_target(host_or_url: str) -> bool:
+    """主机或 URL 是否指向本机回环。
+
+    - localhost / 127.0.0.0/8 / ::1 / 0.0.0.0 / ::
+    - 域名 DNS 解析到上述任一地址（Issue #49 真实场景）
+    - 解析失败返回 False，交给探活处理死链，避免把暂时解析不了的目标误跳过
+    """
+    host = _extract_host(host_or_url)
+    if not host:
+        return False
+    if host in _LOOPBACK_HOSTNAMES:
+        return True
+    ip = _parse_ip(host)
+    if ip is not None:
+        return _ip_is_loopback(ip)
+    # collector.refill / 派发跑在 asyncio 事件循环上。这里禁止阻塞 DNS：
+    # 字面 127.0.0.1 / localhost 已在上面拦掉（Issue #49 真场景）。
+    # 域名解析到回环只在 worker 线程里做（那边没有 running loop）。
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    for info in infos:
+        parsed = _parse_ip(info[4][0])
+        if parsed is not None and _ip_is_loopback(parsed):
+            return True
+    return False
+
+
+def command_hits_loopback(cmd: str) -> bool:
+    """shell 命令是否明显在打回环（URL 或 curl/wget 等工具的主机参数）。"""
+    text = cmd or ""
+    for match in _CMD_URL_RE.finditer(text):
+        if is_loopback_target(match.group(0).rstrip(").,;")):
+            return True
+    return bool(_CMD_TOOL_LOOPBACK_RE.search(text))

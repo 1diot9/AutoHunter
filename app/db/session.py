@@ -35,8 +35,8 @@ _CONNECT_PRAGMAS = (
     "PRAGMA busy_timeout=15000;",         # 写锁最多等 15s 再报错，吸收高并发竞争
     "PRAGMA synchronous=NORMAL;",         # WAL 下安全，显著降低写延迟
     "PRAGMA foreign_keys=ON;",
-    "PRAGMA cache_size=-64000;",          # 约 64MB page cache，减少看板/列表热读扫盘
-    "PRAGMA mmap_size=268435456;",        # 256MB mmap，SQLite 读多写少场景更稳
+    "PRAGMA cache_size=-16000;",          # 约 16MB page cache；每条连接一份，不能再开 64MB
+    "PRAGMA mmap_size=67108864;",         # 64MB mmap，避免把整库映射进 cgroup
     "PRAGMA temp_store=MEMORY;",          # ORDER BY/GROUP BY 临时表走内存
     "PRAGMA wal_autocheckpoint=1000;",
 )
@@ -91,6 +91,14 @@ _MIGRATIONS = [
     ("tasks", "auth_bindings", "JSON"),
     ("targets", "auth_context", "JSON"),
     ("targets", "auth_status", "JSON"),
+    ("tasks", "deepen_cap", "INTEGER DEFAULT 2"),
+    ("system_settings", "ui", "JSON DEFAULT '{}'"),
+    # 用户置顶标记：全局漏洞库/资产库列表中置顶行优先展示。
+    # NOT NULL + DEFAULT 0：老库补列时现有行全部置为 False，向前兼容。
+    ("findings", "is_top", "BOOLEAN DEFAULT 0 NOT NULL"),
+    ("targets", "is_top", "BOOLEAN DEFAULT 0 NOT NULL"),
+    ("tasks", "is_top", "BOOLEAN DEFAULT 0 NOT NULL"),
+    ("tasks", "runtime_stats", "JSON DEFAULT '{}'"),
 ]
 
 # 唯一索引：目标库(host)/漏洞库(dedup_key)的 DB 级查重兜底。
@@ -153,6 +161,9 @@ _SECONDARY_INDEXES = [
     ("ix_killsweeps_task_hit_rank",
      "CREATE INDEX IF NOT EXISTS ix_killsweeps_task_hit_rank "
      "ON killsweeps(task_id, is_killsweep, verified, asset_count, created_at)"),
+    ("ix_killsweeps_origin_finding",
+     "CREATE INDEX IF NOT EXISTS ix_killsweeps_origin_finding "
+     "ON killsweeps(origin_finding_id)"),
     # 运行异常日志：按 level/agent 过滤 + ts DESC 排序。
     ("ix_task_events_level_ts",
      "CREATE INDEX IF NOT EXISTS ix_task_events_level_ts ON task_events(level, ts)"),
@@ -162,6 +173,14 @@ _SECONDARY_INDEXES = [
     # 人工知识库：按 enabled+doc_type 过滤 + hit_count 排序
     ("ix_knowledge_enabled_type",
      "CREATE INDEX IF NOT EXISTS ix_knowledge_enabled_type ON knowledge_docs(enabled, doc_type)"),
+    # 置顶排序：全局漏洞库 / 资产库 ORDER BY is_top DESC, created_at/updated_at DESC。
+    # 布尔列基数低，复合索引让置顶行优先走索引扫描，避免全表排。
+    ("ix_findings_is_top_created",
+     "CREATE INDEX IF NOT EXISTS ix_findings_is_top_created ON findings(is_top, created_at)"),
+    ("ix_targets_is_top_updated",
+     "CREATE INDEX IF NOT EXISTS ix_targets_is_top_updated ON targets(is_top, updated_at)"),
+    ("ix_tasks_is_top_created",
+     "CREATE INDEX IF NOT EXISTS ix_tasks_is_top_created ON tasks(is_top, created_at)"),
 ]
 
 # 废弃的残留列：老 schema 里是 NOT NULL 无默认值，新代码不再写入会导致 INSERT 失败。

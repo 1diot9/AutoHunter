@@ -61,6 +61,7 @@ class CreateTaskRequest(BaseModel):
     concurrency: int = 3
     enable_worker_fofa_lookup: bool = True     # Worker 挖掘时是否允许调用 fofa_lookup
     enable_killsweep_fofa_search: bool = True   # 通杀分析时是否允许调用 fofa_search
+    deepen_cap: int = 2
 
 
 class PartialModelConfigDTO(BaseModel):
@@ -111,6 +112,7 @@ class UpdateTaskRequest(BaseModel):
     concurrency: Optional[int] = None
     enable_worker_fofa_lookup: Optional[bool] = None
     enable_killsweep_fofa_search: Optional[bool] = None
+    deepen_cap: Optional[int] = None
 
 
 class DirectiveRequest(BaseModel):
@@ -136,6 +138,10 @@ class TaskStats(BaseModel):
     rejected: int = 0
     archived: int = 0
     discarded: int = 0  # AI 已作废（superseded 且用户未处理）
+    archived_write: int = 0
+    hosts_total: int = 0
+    hosts_checked: int = 0
+    checked: int = 0
 
 
 class TaskResponse(BaseModel):
@@ -148,6 +154,7 @@ class TaskResponse(BaseModel):
     engine: str = ""
     fofa_query: str
     concurrency: int
+    deepen_cap: int = 2
     src_rules: str = ""
     cas_sso_config: str = ""
     manual_targets: list[str] = Field(default_factory=list)
@@ -159,6 +166,7 @@ class TaskResponse(BaseModel):
     enable_killsweep_fofa_search: bool = True
     llm_usage: dict = Field(default_factory=dict)
     llm_cost: float = 0.0
+    engine_usage: dict = Field(default_factory=dict)
     created_at: str
     updated_at: str
     stats: Optional[TaskStats] = None
@@ -173,6 +181,7 @@ class TaskResponse(BaseModel):
     retest_active: bool = False
     # 处置进度（已完成目标数/总目标数*100，四舍五入）——任务列表卡片进度条用
     progress_pct: int = 0
+    is_top: bool = False
 
 
 class LLMSettingsDTO(BaseModel):
@@ -201,6 +210,7 @@ class EngineSettingsDTO(BaseModel):
 
 class DefaultsSettingsDTO(BaseModel):
     concurrency: Optional[int] = None
+    deepen_cap: Optional[int] = None
     skip_score_threshold: Optional[float] = None
     worker_prompt_version: Optional[str] = None
     engine: Optional[str] = None
@@ -219,6 +229,16 @@ class ModelPricingDTO(BaseModel):
     cache_hit: Optional[float] = None
 
 
+class UiSettingsDTO(BaseModel):
+    theme: Optional[str] = None
+    accentHue: Optional[int] = None
+    wallpaperKind: Optional[str] = None
+    wallpaperUrl: Optional[str] = None
+    wallpaperFit: Optional[str] = None
+    wallpaperDim: Optional[float] = None
+    saved: Optional[bool] = None
+
+
 class SettingsUpdateRequest(BaseModel):
     llm: Optional[LLMSettingsDTO] = None
     fofa: Optional[FofaSettingsDTO] = None
@@ -226,3 +246,4 @@ class SettingsUpdateRequest(BaseModel):
     defaults: Optional[DefaultsSettingsDTO] = None
     proxy: Optional[ProxySettingsDTO] = None
     pricing: Optional[dict[str, ModelPricingDTO]] = None     # {model_name: {input, output, cache_hit}}
+    ui: Optional[UiSettingsDTO] = None

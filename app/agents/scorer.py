@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from app.http_defaults import BROWSER_HEADERS
+
 # ------------------------------------------------------------------------------
 # 关键词权重表（正向加权 / 负向降权；通用、可自行增删）
 # ------------------------------------------------------------------------------
@@ -71,8 +73,7 @@ _HIGH_VALUE_ENDPOINTS = [
 ]
 _AUTH_MEANS_EXISTS = {"/actuator", "/nacos/", "/druid/index.html"}
 
-_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+_UA = BROWSER_HEADERS
 
 
 def _match_rule(rule: dict, combined_text: str, server: str, port: int) -> bool:

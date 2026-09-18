@@ -13,7 +13,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Vue](https://img.shields.io/badge/Vue-3-4FC08D?style=flat-square&logo=vue.js&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose%20v2-2496ED?style=flat-square&logo=docker&logoColor=white)
-![License](https://img.shields.io/badge/License-CC%20BY--NC%204.0-blue?style=flat-square)
+![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)
 
 **一台机器 = 24×7 不停歇的挖洞平台。你只当「人工复审员」，醒来几分钟完成裁决。**
 
@@ -70,7 +70,7 @@
       <a href="https://github.com/1diot9">
         <img src="https://avatars.githubusercontent.com/u/181919166?v=4&s=128" width="72" height="72" alt="1diot9" /><br />
         <sub><b>1diot9</b></sub>
-      </a><br /><sup>Contributor</sup>
+      </a><br /><sup>Workdir Cleanup</sup>
     </td>
     <td align="center" width="100">
       <a href="https://github.com/qianchongceng0-cyber">
@@ -89,6 +89,35 @@
         <img src="https://avatars.githubusercontent.com/u/102737018?v=4&s=128" width="72" height="72" alt="DmcforSpc" /><br />
         <sub><b>DmcforSpc</b></sub>
       </a><br /><sup>Kimi Code</sup>
+    </td>
+    <td align="center" width="100">
+      <a href="https://github.com/moliyu1101">
+        <img src="https://avatars.githubusercontent.com/u/78614185?v=4&s=128" width="72" height="72" alt="moliyu1101" /><br />
+        <sub><b>moliyu1101</b></sub>
+      </a><br /><sup>DNS Probe</sup>
+    </td>
+    <td align="center" width="100">
+      <a href="https://github.com/Saide-sec">
+        <img src="https://avatars.githubusercontent.com/u/90189362?v=4&s=128" width="72" height="72" alt="Saide-sec" /><br />
+        <sub><b>Saide-sec</b></sub>
+      </a><br /><sup>Frontend UX</sup>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center" width="100">
+      <a href="https://github.com/tf748i5gf5t">
+        <img src="https://avatars.githubusercontent.com/u/110716280?v=4&s=128" width="72" height="72" alt="tf748i5gf5t" /><br />
+        <sub><b>tf748i5gf5t</b></sub>
+      </a><br /><sup>Reviewer Fix</sup>
+    </td>
+    <td align="center" width="100">
+      <a href="https://github.com/LLYHXX">
+        <img src="https://avatars.githubusercontent.com/u/191022220?v=4&s=128" width="72" height="72" alt="LLYHXX" /><br />
+        <sub><b>LLYHXX</b></sub>
+      </a><br /><sup>List Pinning</sup>
     </td>
   </tr>
 </table>
@@ -123,10 +152,11 @@ Powered By **StanleyNull** · 作者 EduSRC 主页：<https://src.sjtu.edu.cn/pr
 </div>
 
 > [!WARNING]
-> **仅限对已获明确书面授权的目标使用。** 本工具遵循 CC BY-NC 4.0，禁止任何商业用途，滥用后果自负。
+> **仅限对已获明确书面授权的目标使用。** 本工具采用 Apache License 2.0，滥用后果自负。
+还有，本工具做了删除限制，但是仍有可能在某些外部情况如模型自主意愿等情况下修改或删除少量数据，本工具造成的一切后果请后果自负，请在完全了解的情况下使用!使用本工具出现的问题可以提出意见我来修改，但请不要怪到我本人或者我们团队🤔
 
 > [!NOTE]
-> 🌱 本项目为 **Demo 级别**，作者抛砖引玉，欢迎 Star / Issue / 二次开发。
+> 🌱 抛砖引玉，欢迎 Star / Issue / 二次开发。
 
 ---
 
@@ -177,10 +207,11 @@ flowchart LR
 | 🌙 **24×7 无人值守** | 挂机过夜，重启自动续跑；你醒来只做复审决策 |
 | 🔧 **真实工具链挖洞** | 容器内置 nmap · nuclei · sqlmap · httpx · whatweb，LLM 真实发包/执行，不是纸上谈兵 |
 | 🧪 **极理性 AI 初审** | 只认「实际可利用 + 实锤危害」，过滤半成品，减少无效人工复审 |
-| 🏫 **归属离线反查** | 按 IP/域名离线查所属高校，自动填报告归属单位 + EduSRC 提交 JSON |
+| 🏫 **归属证明** | 按 IP/域名查 [ip138](https://www.ip138.com/)（标记/运营商/ASN 归属地），自动填报告归属单位与证明 + EduSRC 提交 JSON |
 | 💥 **通杀 Hunter** | 出洞后自动分析能否「一打一片」，实打多个同款站点验证 |
 | 🧠 **情报沉淀复用** | 验证过的凭证/端点/指纹入全局情报库，后续 Worker 直接复用 |
 | 🛡️ **内置 WAF + 鉴权** | 应用层 WAF 默认开启，多角色访问令牌（全权/只读/观摩） |
+| 💾 **数据库备份** | 设置页一键下载/恢复 SQLite（在线一致快照），可选打包工作目录，服务器定时留快照 |
 
 ---
 
@@ -215,9 +246,9 @@ sudo firewall-cmd --permanent --add-port=18800/tcp && sudo firewall-cmd --reload
 
 <br>
 
-1. 管理员 PowerShell 装 WSL2：`wsl --install`，装完重启。
-2. 装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，安装勾选 “Use WSL 2 based engine”，Settings → Resources → WSL Integration 打开集成。
-3. 在 **WSL / Git Bash** 里：
+1. 管理员 PowerShell 装 WSL2：**必须装一个 Linux 发行版**（推荐 Ubuntu）。执行 `wsl --install`（或 `wsl --install -d Ubuntu`），装完重启。只开 Docker Desktop 自带的 `docker-desktop` 不够。
+2. 装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，安装勾选 “Use WSL 2 based engine”。打开 **Settings → Resources → WSL Integration**，打开集成并**勾选 Ubuntu**。
+3. 在 **Ubuntu 终端**（不要用空的 WSL 壳）里：
    ```bash
    git clone https://github.com/StanleyNull/AutoHunter.git autohunter && cd autohunter
    bash scripts/install.sh
@@ -225,6 +256,10 @@ sudo firewall-cmd --permanent --add-port=18800/tcp && sudo firewall-cmd --reload
 4. 访问 `http://localhost:18800/`。
 
 > 💡 代码放在 **WSL 文件系统内**（如 `~/autohunter`）比放 `C:\` 挂载盘性能好很多。只用 PowerShell 的话走下方手动部署。
+>
+> 国内拉 `node` / `python` 基础镜像失败时，在 Docker Desktop → Docker Engine 自行配置 `registry-mirrors`（第三方加速地址经常失效，不要写死进项目）。
+>
+> 仓库脚本已强制 LF。若你是从 zip 解压到 Windows 再 build，镜像构建时会自动去掉 `\r`，不必再手动 dos2unix。
 
 </details>
 
@@ -304,6 +339,21 @@ body="管理" && org="China Education and Research Network Center"
 
 组合逻辑：`&&`（且）、`||`（或）、`!=`（非）。**语句越精确、归属越收窄，Worker 越不会打到范围外资产。**
 
+任务里还可把搜索引擎换成 **360 Quake / Hunter / ZoomEye / Shodan / Censys**（设置页配对应 Key）。查询框两种写法都认：
+
+1. **FOFA 语法**（推荐统一这么写）→ 请求前自动翻译到当前引擎
+2. **该引擎官网原生语法** → 识别后原样请求，不再二次翻译
+
+| 引擎 | 原生示例 | Key |
+|------|----------|-----|
+| 360 Quake | `title:"登录" AND domain:"edu.cn"` | `QUAKE_KEY`（个人中心 API Token） |
+| Hunter | `web.title="登录" && domain.suffix="edu.cn"` | `HUNTER_KEY` |
+| ZoomEye | `title="login" && country="CN"` | `ZOOMEYE_KEY` |
+| Shodan | `http.title:"nginx" port:443` | `SHODAN_KEY`（需 Search API 权限） |
+| Censys | `host.dns.names: edu.cn` | `CENSYS_KEY`（Platform Personal Access Token；旧账号才用 `API_ID:SECRET`） |
+
+> 选了 Quake 却从官网粘 `title:"xxx" AND ...` 时，请把搜集方式设为「查询语法」或保持自动判断——系统会按原生语法直发，不再当成自然语言改写。
+
 > [!IMPORTANT]
 > **务必收窄授权范围**：只搜你有权限测试的资产。`org` / `domain` / `cert` 是最有效的归属过滤手段。
 
@@ -342,6 +392,8 @@ docker compose up -d --build           # 更新代码后重建
 ```
 
 数据持久化在 Docker volume：`ah_data`（SQLite + 漏洞证据）、`ah_work`（Worker 临时工作区）。**升级/重启不丢数据。**
+
+**备份 / 迁移**：设置页「数据备份」可导出一致的 SQLite 快照（可选打包工作目录）并上传恢复，这是主路径。服务器默认不自动堆快照；若点「在服务器覆盖留一份」，只覆盖 `data/backups/autohunter-latest.db.gz` 这一份，空间不够会拒绝以免把库盘写满。不要用 `cp autohunter.db` 当备份——WAL 模式下直接拷文件很容易拷到半截库。
 
 **开机自启**：`docker compose up -d` 的容器默认 `restart: unless-stopped`，崩溃/重启会自动拉起。若想托管给 systemd：
 
@@ -390,7 +442,7 @@ hunt.example.com {
 > **访问控制**：公网部署**务必设 `AUTOHUNTER_API_TOKEN`**，否则控制台和挖洞能力对全网裸奔。内置 WAF 默认开启，但令牌是第一道门。
 
 - **成本控制**：Worker 靠 LLM 驱动，目标越多 token 越贵。用 `.env` 的 `WORKER_MAX_ROUNDS` / `*_BUDGET_CAP` 收紧预算，或降低并发。
-- **资源**：每个并发 Worker 会跑真实工具子进程。小内存机器调小 `AUTOHUNTER_AGENT_THREAD_POOL_SIZE` 和任务并发数。
+- **资源**：默认按 CPU/内存自动定 Worker 并发（约 1C1G→3，2C4G→8，大机器顶 32），Docker 会读 cgroup 限额。复制 `.env.example` 不必再填线程池。要强制用 `AUTOHUNTER_WORKER_MAX_CONCURRENCY`；每个 Worker 会跑真实工具子进程，小机器把任务并发也调低。
 - **网络**：服务器需能访问 LLM API 和目标网络；走代理要给 Docker/容器配好出网。
 - **重启恢复**：`AUTOHUNTER_RESTORE_ON_STARTUP=1` 时重启自动续跑之前 running 的任务；受限机器设 `0` 只起 Web/API。
 
@@ -411,18 +463,18 @@ hunt.example.com {
 
 - 🐛 发现 bug / 有建议 → 提 [Issue](https://github.com/StanleyNull/AutoHunter/issues)
 - ⭐ 觉得有用 → 点个 Star 支持一下
-- 🔀 欢迎 Fork 二次开发（保留署名、非商业用途）
+- 🔀 欢迎 Fork 二次开发（保留版权与许可声明）
 - 🙋 想出现在首页 Contributors → 按 [CONTRIBUTORS.md](CONTRIBUTORS.md) 自行申请（开 PR 即可）
 
 ---
 
 ## 许可协议
 
-本项目采用 **[CC BY-NC 4.0](./LICENSE)**（署名-非商业性使用）：
+本项目采用 **[Apache License 2.0](./LICENSE)**：
 
-- ✅ 可自由使用、修改、二次分发
-- ✅ **必须保留原作者署名**：`Powered By StanleyNull`
-- ❌ **禁止任何商业用途**
+- ✅ 可自由使用、修改、二次分发（含商业用途）
+- ✅ 必须保留版权声明与本许可副本
+- ⚠️ 仅限对已获明确书面授权的目标做安全测试
 
 ---
 

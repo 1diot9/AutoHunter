@@ -2,9 +2,9 @@
 
 AutoHunter 写报告时会自动把目标 IP/域名反查成「所属高校」，用于填充报告的归属单位与
 EduSRC 提交 JSON 的标题/单位字段。归属数据是一个离线 SQLite 库
-`app/data_static/edu_ip.db`（已随仓库附带，开箱即用）。
+运行时已改走 [ip138](https://www.ip138.com/iplookup.php) 在线查询（见 `app/tools/edu_ip.py`），不再读本目录生成的离线库。
 
-本目录提供**重建/更新**该库的脚本，数据来源为公开的「纯真 IP 库(qqwry.dat)」，
+本目录仅保留**历史**重建脚本，数据来源为公开的「纯真 IP 库(qqwry.dat)」，
 它把中国教育网 IP 段标注到了学校级（含校区/院系粒度）。
 
 ## 重建步骤

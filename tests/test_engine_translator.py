@@ -9,6 +9,8 @@ from app.engines.translator import (
     fofa_to_quake,
     fofa_to_shodan,
     fofa_to_zoomeye,
+    looks_like_native_syntax,
+    looks_like_query_syntax,
     parse_fofa_query,
     translate_fofa_query,
 )
@@ -57,8 +59,8 @@ class TranslatorTests(unittest.TestCase):
 
     def test_censys(self):
         q = fofa_to_censys('title="Login" && port="80"')
-        self.assertIn("services.http.response.html_title", q)
-        self.assertIn("services.port:80", q)
+        self.assertIn("host.services.http.response.html_title", q)
+        self.assertIn("host.services.port:80", q)
         self.assertIn(" and ", q)
 
     def test_passthrough_native(self):
@@ -89,12 +91,43 @@ class TranslatorTests(unittest.TestCase):
         native = 'hostname="www.example.com" && title="login"'
         self.assertEqual(translate_fofa_query(native, "zoomeye"), native)
 
-    def test_fofa_still_translates_on_quake(self):
+    def test_runtime_never_rewrites_selected_engine_query(self):
         q = 'title="登录" && domain=".edu.cn"'
-        out = translate_fofa_query(q, "quake")
-        self.assertIn('title:"登录"', out)
-        self.assertIn('domain:"edu.cn"', out)
-        self.assertNotEqual(out, q)
+        self.assertEqual(translate_fofa_query(q, "quake"), q)
+        hunter = 'ip.isp="中国教育网"&&header.status_code="200"'
+        self.assertEqual(translate_fofa_query(hunter, "hunter"), hunter)
+        self.assertTrue(looks_like_native_syntax("hunter", hunter))
+
+    def test_quake_protocol_maps_to_service_name(self):
+        q = fofa_to_quake('protocol="http" && port="443"')
+        self.assertIn("service.name", q)
+        self.assertNotIn("service:\"http\"", q)
+
+    def test_quake_official_syntax_detected(self):
+        native = 'title:"统一身份认证" AND country:"China"'
+        self.assertTrue(looks_like_query_syntax("quake", native))
+        self.assertTrue(looks_like_native_syntax("quake", native))
+        self.assertEqual(translate_fofa_query(native, "quake"), native)
+
+    def test_quake_title_only_not_treated_as_intent(self):
+        native = 'title:"教务系统"'
+        self.assertTrue(looks_like_query_syntax("quake", native))
+        self.assertEqual(translate_fofa_query(native, "quake"), native)
+
+    def test_http_url_in_fofa_value_not_native_colon(self):
+        q = 'body="http://example.com/login"'
+        self.assertTrue(looks_like_query_syntax("fofa", q))
+        self.assertEqual(translate_fofa_query(q, "quake"), q)
+
+    def test_plain_language_not_syntax(self):
+        self.assertFalse(looks_like_query_syntax("quake", "找全国高校的统一身份认证"))
+        self.assertFalse(looks_like_query_syntax("fofa", "挖这个学校的后台"))
+
+    def test_hunter_official_query_is_native(self):
+        q = 'ip.isp="中国教育网"&&header.status_code="200"'
+        self.assertTrue(looks_like_native_syntax("hunter", q))
+        self.assertTrue(looks_like_query_syntax("hunter", q))
+        self.assertEqual(translate_fofa_query(q, "hunter"), q)
 
 
 if __name__ == "__main__":

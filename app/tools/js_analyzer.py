@@ -20,6 +20,8 @@ from typing import Any, Iterator
 from urllib.request import Request, url2pathname, urlopen
 from urllib.parse import urljoin, urlparse
 
+from app.http_defaults import BROWSER_UA
+
 
 _MAX_CONTEXT = 180
 
@@ -887,7 +889,7 @@ def _fetch_text(url: str, *, timeout: float) -> tuple[str, str]:
         return _fetch_local_file(url)
     if scheme not in _ALLOWED_FETCH_SCHEMES:
         raise ValueError(f"不支持的抓取协议: {scheme or '(空)'}")
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; AutoHunter-JSAnalyzer)"})
+    req = Request(url, headers={"User-Agent": BROWSER_UA})
     with urlopen(req, timeout=timeout) as resp:  # noqa: S310 - 协议已白名单，本地工具只读取内容
         # 流式读取并设硬上限，避免超大响应一次性吃满内存。
         raw = resp.read(_MAX_FETCH_BYTES)

@@ -2,20 +2,67 @@
 
 只做确定性的机械判断（不耗 LLM）：
 0. 敏感域名（.gov / .mil / 军政公安关键词等）→ 跳过（永不攻击）
+0.5 回环地址（127.0.0.1 / ::1 / localhost，含 DNS 解析到回环）→ 跳过（永不打本机）
 1. CDN / 对象存储 / 云 WAF 域名特征 → 跳过
 2. 死链 / 连接超时 / 无响应 → 跳过
 3. 纯前端静态站（无任何后端交互特征，且是 SPA/静态托管）→ 跳过
 
 判断尽量保守：拿不准就放行（宁可多挖，不要误杀有价值目标）。
-例外：敏感域名一律跳过，无例外。
+例外：敏感域名、回环地址一律跳过，无例外。
 """
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import os
+import socket
+import threading
 from urllib.parse import urlparse
 
 import httpx
+
+from app.http_defaults import BROWSER_HEADERS
+from app.tools.netguard import (
+    LOOPBACK_SKIP_REASON,
+    is_loopback_ip,
+    is_loopback_target,
+)
+
+# ---------------------------------------------------------------------------
+# 黑洞 DNS 防护：autodiscover 等记录常解析出几十个 IP（大量 IPv6 黑洞地址），
+# socket.create_connection 会逐个地址试到超时，单次探活可卡几分钟，进而把
+# 派发循环整批卡死。探活期间把解析限制为 IPv4 前 2 个地址
+# （引用计数式临时替换，多线程安全；IPv6-only 域名自动回退原始解析）。
+# ---------------------------------------------------------------------------
+_ORIG_GETADDRINFO = socket.getaddrinfo
+_GA_LOCK = threading.Lock()
+_GA_DEPTH = 0
+
+
+def _capped_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    try:
+        res = _ORIG_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
+    except OSError:
+        # 纯 IPv6 / 无 A 记录：回退原始解析，避免误杀 IPv6-only 站点
+        res = _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+    return res[:2]
+
+
+@contextlib.contextmanager
+def capped_resolution():
+    """探活期间限制 DNS 解析：IPv4 优先、最多 2 个地址。"""
+    global _GA_DEPTH
+    with _GA_LOCK:
+        if _GA_DEPTH == 0:
+            socket.getaddrinfo = _capped_getaddrinfo
+        _GA_DEPTH += 1
+    try:
+        yield
+    finally:
+        with _GA_LOCK:
+            _GA_DEPTH -= 1
+            if _GA_DEPTH == 0:
+                socket.getaddrinfo = _ORIG_GETADDRINFO
 
 # CDN / 对象存储 / 静态托管 域名特征（命中即跳过）
 _CDN_MARKERS = (
@@ -26,7 +73,7 @@ _CDN_MARKERS = (
 )
 
 # 纯静态托管 Server 头特征
-_STATIC_SERVERS = ("githubpages", "netlify", "vercel", "cloudflare", "amazons3", "aliyunoss")
+_STATIC_SERVERS = ("githubpages", "netlify", "vercel", "amazons3", "aliyunoss")
 
 # 敏感公共后缀第二级标签（*.gov / *.gov.cn / *.mil.cn …）
 _SENSITIVE_PUBLIC_LABELS = frozenset({"gov", "mil"})
@@ -40,7 +87,7 @@ _SENSITIVE_KEYWORDS = (
 )
 
 _SENSITIVE_SKIP_REASON = "敏感域名（政府/军政/政法等），自动跳过"
-# 兼容旧常量名
+# 兼容旧常量名；LOOPBACK_SKIP_REASON / is_loopback_* 从 netguard 再导出
 
 
 def _extra_sensitive_suffixes() -> tuple[str, ...]:
@@ -131,26 +178,27 @@ def is_cdn_host(host: str) -> bool:
 def probe(url: str, timeout: float = 8.0) -> dict:
     """探活：返回 {alive, status, server, body_len, is_spa}。失败则 alive=False。"""
     try:
-        with httpx.Client(timeout=timeout, verify=False, follow_redirects=True) as c:
-            r = c.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; AutoHunter)"})
-            body = r.text or ""
-            server = r.headers.get("server", "").lower()
-            # 粗判 SPA/纯前端：body 很短 + 含 <div id=app/root> + 几乎无表单/接口痕迹
-            low = body.lower()
-            is_spa = (
-                len(body) < 3000
-                and ('id="app"' in low or 'id="root"' in low or "<script" in low)
-                and "<form" not in low
-                and "login" not in low
-            )
-            import re
-            m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
-            title = (m.group(1).strip()[:200] if m else "")
-            return {
-                "alive": True, "status": r.status_code, "server": server,
-                "body_len": len(body), "is_spa": is_spa,
-                "title": title, "body_snippet": body[:4000],
-            }
+        with capped_resolution():
+            with httpx.Client(timeout=timeout, verify=False, follow_redirects=True) as c:
+                r = c.get(url, headers=BROWSER_HEADERS)
+                body = r.text or ""
+                server = r.headers.get("server", "").lower()
+                # 粗判 SPA/纯前端：body 很短 + 含 <div id=app/root> + 几乎无表单/接口痕迹
+                low = body.lower()
+                is_spa = (
+                    len(body) < 3000
+                    and ('id="app"' in low or 'id="root"' in low or "<script" in low)
+                    and "<form" not in low
+                    and "login" not in low
+                )
+                import re
+                m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+                title = (m.group(1).strip()[:200] if m else "")
+                return {
+                    "alive": True, "status": r.status_code, "server": server,
+                    "body_len": len(body), "is_spa": is_spa,
+                    "title": title, "body_snippet": body[:4000],
+                }
     except Exception:
         return {"alive": False, "status": 0, "server": "", "body_len": 0,
                 "is_spa": False, "title": "", "body_snippet": ""}
@@ -171,9 +219,12 @@ def should_skip_ex(host: str, url: str, timeout: float | None = None) -> tuple[b
     # 敏感域名最先拦：不探活、不发包、不派 worker
     if is_sensitive_host(host) or is_sensitive_host(url):
         return True, _SENSITIVE_SKIP_REASON, {}
+    # 回环次之：域名 A/AAAA 指向 127.0.0.1 时探活会打到 AutoHunter 自己（Issue #49）
+    if is_loopback_target(host) or is_loopback_target(url):
+        return True, LOOPBACK_SKIP_REASON, {}
     if is_cdn_host(host):
         return True, "CDN/对象存储/静态托管域名", {}
-    info = probe(url, timeout) if timeout is not None else probe(url)
+    info = probe(url, timeout=timeout) if timeout is not None else probe(url)
     if not info["alive"]:
         return True, "死链/连接超时/无响应", info
     # 5xx 暂时挂了，跳过本轮（不彻底淘汰，可后续重试）
