@@ -38,8 +38,7 @@ def _read_text_without_project_dotenv(path: Path, *args, **kwargs) -> str:
 
 with (
     patch.object(Path, "exists", _exists_without_project_dotenv),
-    patch.object(Path, "read_text", _read_text_without_project_dotenv),
-):
+    patch.object(Path, "read_text", _read_text_without_project_dotenv)):
     from app.config import LLMConfig
     from app import settings_service
     from app.api import settings as settings_api
@@ -54,18 +53,20 @@ with (
     )
     from app.llm import client as client_module
     from app.llm import health
+    from app.llm import slots as provider_slots
 
 
 FAKE_SECRET = "test-key-not-a-real-secret"
 
 
-def _provider(name: str, *, weight: int = 1) -> LLMConfig:
+def _provider(name: str, *, weight: int = 1, max_threads: int = 4) -> LLMConfig:
     return LLMConfig(
         base_url=f"https://{name}.invalid/v1",
         api_key=f"{FAKE_SECRET}-{name}",
         model=f"model-{name}",
         protocol="openai_chat",
         weight=weight,
+        max_threads=max_threads,
         enabled=True,
     )
 
@@ -74,14 +75,12 @@ class StateResetMixin:
     def setUp(self) -> None:
         with health._LOCK:
             health._HEALTH.clear()
-        with client_module._RR_LOCK:
-            client_module._RR_STATE.clear()
+        provider_slots.reset_for_tests()
 
     def tearDown(self) -> None:
         with health._LOCK:
             health._HEALTH.clear()
-        with client_module._RR_LOCK:
-            client_module._RR_STATE.clear()
+        provider_slots.reset_for_tests()
 
 
 class SettingsServiceTests(StateResetMixin, unittest.TestCase):
@@ -118,6 +117,14 @@ class SettingsServiceTests(StateResetMixin, unittest.TestCase):
                 "model": "model-heavy",
                 "temperature": 9,
                 "weight": 999,
+                "max_threads": 999,
+            },
+            {
+                "name": "tiny",
+                "base_url": "https://tiny.invalid/v1",
+                "api_key": f"{FAKE_SECRET}-tiny",
+                "model": "model-tiny",
+                "max_threads": 0,
             },
             {
                 "name": "missing-key",
@@ -126,13 +133,16 @@ class SettingsServiceTests(StateResetMixin, unittest.TestCase):
             },
         ])
 
-        self.assertEqual(len(providers), 2)
+        self.assertEqual(len(providers), 3)
         self.assertFalse(providers[0]["enabled"])
         self.assertEqual(providers[0]["weight"], 1)
         self.assertEqual(providers[0]["temperature"], 0.0)
         self.assertTrue(providers[1]["enabled"])
         self.assertEqual(providers[1]["weight"], 100)
         self.assertEqual(providers[1]["temperature"], 2.0)
+        self.assertEqual(providers[0]["max_threads"], 4)
+        self.assertEqual(providers[1]["max_threads"], 64)
+        self.assertEqual(providers[2]["max_threads"], 1)
 
     def test_provider_key_round_trip_never_exposes_plaintext(self) -> None:
         old_provider = {
@@ -205,8 +215,7 @@ class SettingsServiceTests(StateResetMixin, unittest.TestCase):
                 "effective_settings",
                 return_value={"llm": {"mode": "pool", "providers": [old_provider]}},
             ),
-            patch.object(settings_api, "update_settings", side_effect=fake_update),
-        ):
+            patch.object(settings_api, "update_settings", side_effect=fake_update)):
             import asyncio
             result = asyncio.run(settings_api.put_settings(body, Mock()))
 
@@ -237,8 +246,7 @@ class SettingsServiceTests(StateResetMixin, unittest.TestCase):
                 "api_key": "",
                 "model": "",
                 "protocol": "auto",
-            }},
-        ):
+            }}):
             providers = settings_service.resolve_llm_providers(task)
 
         self.assertEqual([provider.model for provider in providers], ["model-global"])
@@ -267,8 +275,7 @@ class SettingsServiceTests(StateResetMixin, unittest.TestCase):
                 "api_key": f"{FAKE_SECRET}-single",
                 "model": "model-single",
                 "protocol": "auto",
-            }},
-        ):
+            }}):
             providers = settings_service.resolve_llm_providers(task)
 
         self.assertEqual(len(providers), 1)
@@ -292,8 +299,7 @@ class SettingsServiceTests(StateResetMixin, unittest.TestCase):
                 "api_key": f"{FAKE_SECRET}-single",
                 "model": "model-single",
                 "protocol": "openai_chat",
-            }},
-        ):
+            }}):
             providers = settings_service.resolve_llm_providers(task)
 
         self.assertEqual(len(providers), 1)
@@ -321,8 +327,7 @@ class SettingsServiceTests(StateResetMixin, unittest.TestCase):
         async def run_update():
             with (
                 patch.object(tasks_api, "_compute_stats", new=AsyncMock(return_value=Mock())),
-                patch.object(tasks_api, "_task_to_dto", return_value={"ok": True}),
-            ):
+                patch.object(tasks_api, "_task_to_dto", return_value={"ok": True})):
                 return await tasks_api.update_task("task-1", request, session)
 
         import asyncio
@@ -366,8 +371,7 @@ class SettingsServiceTests(StateResetMixin, unittest.TestCase):
             with (
                 patch.object(tasks_api, "resolve_llm_config", return_value=runtime_config),
                 patch.object(tasks_api, "_compute_stats", new=AsyncMock(return_value=Mock())),
-                patch.object(tasks_api, "_task_to_dto", return_value={"ok": True}),
-            ):
+                patch.object(tasks_api, "_task_to_dto", return_value={"ok": True})):
                 return await tasks_api.update_task("task-1", request, session)
 
         import asyncio
@@ -410,8 +414,7 @@ class ProviderHealthTests(StateResetMixin, unittest.TestCase):
 
         with (
             patch.object(health, "_FAIL_THRESHOLD", 1),
-            patch.object(health, "_COOLDOWN_STEPS", [60]),
-        ):
+            patch.object(health, "_COOLDOWN_STEPS", [60])):
             health.mark_provider_failed(
                 base_url,
                 model,
@@ -445,8 +448,7 @@ class ProviderHealthTests(StateResetMixin, unittest.TestCase):
 
         with (
             patch.object(health, "_FAIL_THRESHOLD", 1),
-            patch.object(health, "_COOLDOWN_STEPS", [60]),
-        ):
+            patch.object(health, "_COOLDOWN_STEPS", [60])):
             state = health.mark_provider_failed(
                 base_url, model, "mock transport failure", api_key, kind="network"
             )
@@ -471,6 +473,54 @@ class ProviderHealthTests(StateResetMixin, unittest.TestCase):
                 (True, "ready"),
             )
             self.assertEqual(health.snapshot()[ref]["status"], "ok")
+
+    def test_half_open_network_probe_does_not_escalate_cooldown(self) -> None:
+        base_url = "https://half-open-net.invalid/v1"
+        model = "model-half-open-net"
+        api_key = f"{FAKE_SECRET}-half-open-net"
+        ref = health.provider_ref(base_url, model, api_key)
+
+        with (
+            patch.object(health, "_FAIL_THRESHOLD", 1),
+            patch.object(health, "_COOLDOWN_STEPS", [300, 900])):
+            first = health.mark_provider_failed(
+                base_url, model, "mock transport failure", api_key, kind="quota"
+            )
+            self.assertEqual(first["status"], "cooldown")
+            self.assertEqual(int(first["cooldown_count"]), 1)
+            with health._LOCK:
+                health._HEALTH[ref]["cooldown_until_ts"] = 0
+
+            self.assertEqual(
+                health.acquire_provider_slot(base_url, model, api_key),
+                (True, "half_open"),
+            )
+            probe = health.mark_provider_failed(
+                base_url, model, "Connection error.", api_key, kind="network"
+            )
+            self.assertEqual(probe["transition"], "half_open_transient_retry")
+            self.assertNotEqual(probe.get("status"), "cooldown")
+            self.assertEqual(int(probe.get("cooldown_count") or 0), 1)
+            self.assertFalse(health.snapshot()[ref].get("half_open_inflight"))
+
+    def test_successful_probe_clears_network_cooldown_but_not_quota(self) -> None:
+        net_url = "https://probe-net.invalid/v1"
+        quota_url = "https://probe-quota.invalid/v1"
+        model = "probe-model"
+        api_key = f"{FAKE_SECRET}-probe"
+        with (
+            patch.object(health, "_FAIL_THRESHOLD", 1),
+            patch.object(health, "_COOLDOWN_STEPS", [60])):
+            health.mark_provider_failed(net_url, model, "Connection error.", api_key, kind="network")
+            health.mark_provider_failed(quota_url, model, "quota exhausted", api_key, kind="quota")
+
+        net_cleared = health.recover_transport_after_successful_probe(net_url, model, api_key)
+        quota_cleared = health.recover_transport_after_successful_probe(quota_url, model, api_key)
+        self.assertIsNotNone(net_cleared)
+        self.assertEqual(net_cleared["status"], "ok")
+        self.assertIsNone(quota_cleared)
+        quota_ref = health.provider_ref(quota_url, model, api_key)
+        self.assertEqual(health.snapshot()[quota_ref]["status"], "cooldown")
 
     def test_failed_provider_gets_one_half_open_probe_after_retry_delay(self) -> None:
         base_url = "https://recover.invalid/v1"
@@ -524,8 +574,7 @@ class ProviderHealthTests(StateResetMixin, unittest.TestCase):
 
         with (
             patch.object(health, "_FAIL_THRESHOLD", 2),
-            patch.object(health, "_BEHAVIOR_FAIL_THRESHOLD", 2),
-        ):
+            patch.object(health, "_BEHAVIOR_FAIL_THRESHOLD", 2)):
             health.mark_provider_failed(
                 base_url, model, "mock transport failure", api_key, kind="network"
             )
@@ -567,8 +616,7 @@ class ProviderHealthTests(StateResetMixin, unittest.TestCase):
 
         with (
             patch.object(health, "_BEHAVIOR_FAIL_THRESHOLD", 1),
-            patch.object(health, "_COOLDOWN_STEPS", [60]),
-        ):
+            patch.object(health, "_COOLDOWN_STEPS", [60])):
             health.mark_provider_behavior_failed(
                 base_url, model, "mock empty tool loop", api_key
             )
@@ -619,37 +667,80 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
             llm.client.chat.completions.create.side_effect = error
             with (
                 patch.object(client_module.time, "sleep") as sleep,
-                self.assertRaises(client_module.LLMError) as raised,
-            ):
+                self.assertRaises(client_module.LLMError) as raised):
                 llm._chat_current_provider([{"role": "user", "content": "mock request"}])
 
         self.assertEqual(raised.exception.kind, "auth")
         self.assertEqual(llm.client.chat.completions.create.call_count, 1)
         sleep.assert_not_called()
 
-    def test_weighted_round_robin_uses_configured_distribution(self) -> None:
-        primary = _provider("weighted-primary", weight=3)
-        secondary = _provider("weighted-secondary", weight=1)
+    def test_higher_weight_is_used_before_lower_weight(self) -> None:
+        high = _provider("high-weight", weight=10, max_threads=2)
+        low = _provider("low-weight", weight=1, max_threads=2)
+        picked = []
+        for _ in range(2):
+            provider = provider_slots.acquire([high, low])
+            self.assertIsNotNone(provider)
+            picked.append(provider.model)
+        self.assertEqual(picked, [high.model, high.model])
+        # High tier full → fall through to low weight.
+        third = provider_slots.acquire([high, low])
+        self.assertIs(third, low)
+        provider_slots.release(high)
+        provider_slots.release(high)
+        provider_slots.release(low)
 
-        with patch.object(client_module.LLMClient, "_build_client", return_value=Mock()):
-            llm = client_module.LLMClient(providers=[primary, secondary])
-            first_models = [llm._provider_order()[0].model for _ in range(4)]
+    def test_same_weight_balances_by_utilization(self) -> None:
+        a = _provider("util-a", weight=5, max_threads=4)
+        b = _provider("util-b", weight=5, max_threads=4)
+        first = provider_slots.acquire([a, b])
+        self.assertIs(first, a)
+        second = provider_slots.acquire([a, b])
+        self.assertIs(second, b)
+        provider_slots.release(a)
+        provider_slots.release(b)
 
-        self.assertEqual(
-            first_models,
-            [primary.model, primary.model, secondary.model, primary.model],
+    def test_queue_waits_when_all_healthy_slots_full(self) -> None:
+        import threading
+        import time
+
+        only = _provider("queue-only", max_threads=1)
+        held = provider_slots.acquire([only])
+        self.assertIs(held, only)
+
+        result: list[object] = []
+
+        def waiter() -> None:
+            got = provider_slots.acquire([only], timeout=2.0)
+            result.append(got)
+            if got is not None:
+                provider_slots.release(got)
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.15)
+        self.assertEqual(result, [])
+        provider_slots.release(only)
+        thread.join(timeout=2.0)
+        self.assertTrue(result)
+        self.assertIs(result[0], only)
+
+    def test_sticky_prefers_same_provider_while_under_cap(self) -> None:
+        primary = _provider("sticky-cap-primary", weight=3, max_threads=2)
+        secondary = _provider("sticky-cap-secondary", weight=3, max_threads=2)
+        sticky = health.provider_ref(
+            primary.base_url, primary.model, primary.api_key, primary.protocol
         )
-
-    def test_smooth_round_robin_keeps_duplicate_entries_independent(self) -> None:
-        primary = _provider("duplicate-provider")
-        duplicate = primary.model_copy()
-
-        with patch.object(client_module.LLMClient, "_build_client", return_value=Mock()):
-            llm = client_module.LLMClient(providers=[primary, duplicate])
-            selected = [llm._provider_order()[0] for _ in range(2)]
-
-        self.assertIs(selected[0], primary)
-        self.assertIs(selected[1], duplicate)
+        first = provider_slots.acquire([primary, secondary], sticky)
+        self.assertIs(first, primary)
+        second = provider_slots.acquire([primary, secondary], sticky)
+        self.assertIs(second, primary)
+        # Primary full → sticky cannot hold; pick sibling at same weight.
+        third = provider_slots.acquire([primary, secondary], sticky)
+        self.assertIs(third, secondary)
+        provider_slots.release(primary)
+        provider_slots.release(primary)
+        provider_slots.release(secondary)
 
     def test_pool_with_one_enabled_provider_keeps_single_provider_retries(self) -> None:
         provider = _provider("single-enabled-provider")
@@ -666,8 +757,7 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
 
         with (
             patch.object(client_module.LLMClient, "_build_client", return_value=api_client),
-            patch.object(client_module.time, "sleep"),
-        ):
+            patch.object(client_module.time, "sleep")):
             llm = client_module.LLMClient(providers=[provider], pool_mode=True)
             result = llm.chat([{"role": "user", "content": "mock request"}])
 
@@ -675,36 +765,11 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
         self.assertIs(result, expected)
         self.assertEqual(api_client.chat.completions.create.call_count, 2)
 
-    def test_sticky_provider_does_not_advance_weighted_round_robin(self) -> None:
-        primary = _provider("sticky-weighted-primary", weight=3)
-        secondary = _provider("sticky-weighted-secondary")
-
-        with patch.object(client_module.LLMClient, "_build_client", return_value=Mock()):
-            llm = client_module.LLMClient(providers=[primary, secondary])
-            llm._provider_order()
-            with client_module._RR_LOCK:
-                before = dict(client_module._RR_STATE)
-            llm._sticky_provider_ref = health.provider_ref(
-                primary.base_url,
-                primary.model,
-                primary.api_key,
-                primary.protocol,
-            )
-
-            for _ in range(8):
-                self.assertIs(llm._provider_order()[0], primary)
-
-            with client_module._RR_LOCK:
-                after = dict(client_module._RR_STATE)
-
-        self.assertEqual(after, before)
-
     def test_single_provider_cooldown_raises_structured_retry(self) -> None:
         provider = _provider("single-cooldown")
         with (
             patch.object(health, "_FAIL_THRESHOLD", 1),
-            patch.object(health, "_COOLDOWN_STEPS", [60]),
-        ):
+            patch.object(health, "_COOLDOWN_STEPS", [60])):
             health.mark_provider_failed(
                 provider.base_url,
                 provider.model,
@@ -718,8 +783,7 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
             llm = client_module.LLMClient(providers=[provider], pool_mode=False)
             with (
                 patch.object(llm, "_chat_current_provider") as invoke,
-                self.assertRaises(client_module.LLMError) as raised,
-            ):
+                self.assertRaises(client_module.LLMError) as raised):
                 llm.chat([{"role": "user", "content": "mock request"}])
 
         self.assertEqual(raised.exception.kind, "provider_cooldown")
@@ -733,13 +797,11 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
         with (
             patch.object(health, "_FAIL_THRESHOLD", 1),
             patch.object(health, "_COOLDOWN_STEPS", [60]),
-            patch.object(client_module.LLMClient, "_build_client", return_value=Mock()),
-        ):
+            patch.object(client_module.LLMClient, "_build_client", return_value=Mock())):
             llm = client_module.LLMClient(providers=[provider], pool_mode=False)
             with (
                 patch.object(llm, "_chat_current_provider", side_effect=failure),
-                self.assertRaises(client_module.LLMError) as raised,
-            ):
+                self.assertRaises(client_module.LLMError) as raised):
                 llm.chat([{"role": "user", "content": "mock request"}])
 
         self.assertEqual(raised.exception.kind, "provider_cooldown")
@@ -754,12 +816,10 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
         with patch.object(client_module.LLMClient, "_build_client", return_value=Mock()):
             llm = client_module.LLMClient(providers=[primary, secondary])
             with (
-                patch.object(llm, "_provider_order", return_value=[primary, secondary]),
                 patch.object(
                     llm,
                     "_chat_current_provider",
-                    side_effect=[first_error, expected],
-                ) as invoke
+                    side_effect=[first_error, expected]) as invoke
             ):
                 result = llm.chat([{"role": "user", "content": "mock request"}])
 
@@ -774,7 +834,6 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
         with patch.object(client_module.LLMClient, "_build_client", return_value=Mock()):
             llm = client_module.LLMClient(providers=[primary, secondary])
             with (
-                patch.object(llm, "_provider_order", return_value=[primary, secondary]),
                 patch.object(
                     llm,
                     "_chat_current_provider",
@@ -783,8 +842,7 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
                         client_module.LLMError("quota", "secondary quota exhausted"),
                     ],
                 ),
-                self.assertRaises(client_module.LLMError) as raised,
-            ):
+                self.assertRaises(client_module.LLMError) as raised):
                 llm.chat([{"role": "user", "content": "mock request"}])
 
         self.assertEqual(raised.exception.kind, "quota")
@@ -796,8 +854,7 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
 
         with (
             patch.object(health, "_FAIL_THRESHOLD", 1),
-            patch.object(health, "_COOLDOWN_STEPS", [60]),
-        ):
+            patch.object(health, "_COOLDOWN_STEPS", [60])):
             health.mark_provider_failed(
                 secondary.base_url,
                 secondary.model,
@@ -810,14 +867,11 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
             with patch.object(client_module.LLMClient, "_build_client", return_value=Mock()):
                 llm = client_module.LLMClient(providers=[primary, secondary])
                 with (
-                    patch.object(llm, "_provider_order", return_value=[primary, secondary]),
                     patch.object(
                         llm,
                         "_chat_current_provider",
-                        side_effect=auth_error,
-                    ) as invoke,
-                    self.assertRaises(client_module.LLMError) as raised,
-                ):
+                        side_effect=auth_error) as invoke,
+                    self.assertRaises(client_module.LLMError) as raised):
                     llm.chat([{"role": "user", "content": "mock request"}])
 
         self.assertEqual(raised.exception.kind, "auth")
@@ -831,7 +885,6 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
         with patch.object(client_module.LLMClient, "_build_client", return_value=Mock()):
             llm = client_module.LLMClient(providers=[primary, secondary])
             with (
-                patch.object(llm, "_provider_order", return_value=[primary, secondary]),
                 patch.object(
                     llm,
                     "_chat_current_provider",
@@ -843,8 +896,7 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
                         ),
                         expected,
                     ],
-                ),
-            ):
+                )):
                 self.assertIs(
                     llm.chat([{"role": "user", "content": "mock request"}]),
                     expected,
@@ -874,13 +926,11 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
                 on_provider_selected=selections.append,
             )
             with (
-                patch.object(llm, "_provider_order", return_value=[primary, secondary]),
                 patch.object(
                     llm,
                     "_chat_current_provider",
                     side_effect=[first_error, object()],
-                ),
-            ):
+                )):
                 llm.chat([{"role": "user", "content": "mock request"}])
 
         self.assertEqual(
@@ -920,6 +970,7 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
         )
 
         with (
+            patch.object(client_module, "_POOL_SAME_PROVIDER_RETRIES", 0),
             patch.object(
                 client_module.LLMClient,
                 "_build_client",
@@ -939,8 +990,7 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
         providers = [_provider("cooldown-a"), _provider("cooldown-b")]
         with (
             patch.object(health, "_FAIL_THRESHOLD", 1),
-            patch.object(health, "_COOLDOWN_STEPS", [60]),
-        ):
+            patch.object(health, "_COOLDOWN_STEPS", [60])):
             for provider in providers:
                 health.mark_provider_failed(
                     provider.base_url,
@@ -960,6 +1010,61 @@ class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
         self.assertEqual(raised.exception.kind, "provider_cooldown")
         self.assertGreaterEqual(raised.exception.retry_after, 1)
         invoke.assert_not_called()
+
+    def test_shared_network_failure_does_not_cooldown_the_pool(self) -> None:
+        primary = _provider("shared-net-a")
+        secondary = _provider("shared-net-b")
+        with patch.object(client_module.LLMClient, "_build_client", return_value=Mock()):
+            llm = client_module.LLMClient(providers=[primary, secondary])
+            with (
+                patch.object(
+                    llm,
+                    "_chat_current_provider",
+                    side_effect=[
+                        client_module.LLMError("network", "Connection error."),
+                        client_module.LLMError("network", "Connection error."),
+                    ],
+                ),
+                self.assertRaises(client_module.LLMError) as raised):
+                llm.chat([{"role": "user", "content": "mock request"}])
+
+        self.assertEqual(raised.exception.kind, "network")
+        for provider in (primary, secondary):
+            ref = health.provider_ref(
+                provider.base_url, provider.model, provider.api_key, provider.protocol
+            )
+            state = health.snapshot().get(ref, {})
+            self.assertNotIn(state.get("status"), {"failed", "cooldown"})
+            self.assertEqual(int(state.get("consecutive_failures") or 0), 0)
+            self.assertEqual(int(state.get("cooldown_count") or 0), 0)
+
+    def test_unique_network_failure_still_marks_that_endpoint(self) -> None:
+        primary = _provider("unique-net-a")
+        secondary = _provider("unique-net-b")
+        expected = object()
+        with patch.object(client_module.LLMClient, "_build_client", return_value=Mock()):
+            llm = client_module.LLMClient(providers=[primary, secondary])
+            with (
+                patch.object(
+                    llm,
+                    "_chat_current_provider",
+                    side_effect=[
+                        client_module.LLMError("network", "Connection error."),
+                        expected,
+                    ],
+                )):
+                self.assertIs(llm.chat([{"role": "user", "content": "mock request"}]), expected)
+
+        bad_ref = health.provider_ref(
+            primary.base_url, primary.model, primary.api_key, primary.protocol
+        )
+        good_ref = health.provider_ref(
+            secondary.base_url, secondary.model, secondary.api_key, secondary.protocol
+        )
+        snapshot = health.snapshot()
+        self.assertEqual(snapshot[bad_ref]["status"], "failed")
+        self.assertEqual(int(snapshot[bad_ref]["consecutive_failures"]), 1)
+        self.assertEqual(snapshot.get(good_ref, {}).get("status", "ok"), "ok")
 
     def test_tls_downgrade_is_remembered_only_for_affected_provider(self) -> None:
         primary = _provider("tls-primary")

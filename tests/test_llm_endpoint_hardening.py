@@ -31,8 +31,7 @@ def _read_text_without_project_dotenv(path: Path, *args, **kwargs) -> str:
 
 with (
     patch.object(Path, "exists", _exists_without_project_dotenv),
-    patch.object(Path, "read_text", _read_text_without_project_dotenv),
-):
+    patch.object(Path, "read_text", _read_text_without_project_dotenv)):
     from app import settings_service
     from app.api import settings as settings_api
     from app.api import tasks as tasks_api
@@ -91,8 +90,7 @@ def test_behavior_probe_retry_delay_is_capped():
 
     with (
         patch.object(health, "_BEHAVIOR_FAIL_THRESHOLD", 1),
-        patch.object(health, "_BEHAVIOR_PROBE_SECONDS", 900),
-    ):
+        patch.object(health, "_BEHAVIOR_PROBE_SECONDS", 900)):
         health.mark_provider_behavior_failed(base_url, model, "behavior failure", api_key)
         with health._LOCK:
             health._HEALTH[ref]["behavior_cooldown_until_ts"] = 0
@@ -148,10 +146,8 @@ def test_failure_callback_exception_does_not_break_failover():
             on_provider_failure=callback,
         )
         with (
-            patch.object(llm, "_provider_order", return_value=[primary, secondary]),
             patch.object(llm, "_chat_current_provider", side_effect=[first_error, expected]),
-            patch.object(client_module.logger, "exception") as logged,
-        ):
+            patch.object(client_module.logger, "exception") as logged):
             assert llm.chat([{"role": "user", "content": "test"}]) is expected
 
     callback.assert_called_once()
@@ -196,8 +192,7 @@ def _update_llm_settings(current_llm: dict, llm_update: dict):
     with (
         patch.object(settings_service, "effective_settings", return_value=current),
         patch.object(settings_service, "refresh_cache", new=AsyncMock()),
-        patch.object(settings_service, "public_settings_view", return_value={}),
-    ):
+        patch.object(settings_service, "public_settings_view", return_value={})):
         asyncio.run(settings_service.update_settings(session, {"llm": llm_update}))
     return row
 
@@ -260,8 +255,7 @@ def test_key_only_update_snapshots_endpoint_identity():
             "defaults": {},
         }),
         patch.object(settings_service, "refresh_cache", new=AsyncMock()),
-        patch.object(settings_service, "public_settings_view", return_value={}),
-    ):
+        patch.object(settings_service, "public_settings_view", return_value={})):
         asyncio.run(settings_service.update_settings(
             session, {"llm": {"api_key": db_key}}
         ))
@@ -279,8 +273,7 @@ def test_key_only_update_snapshots_endpoint_identity():
     cache = {"llm": row.llm, "fofa": {}, "engines": {}, "defaults": {}}
     with (
         patch.dict(os.environ, changed_env, clear=False),
-        patch.object(settings_service, "_cache", cache),
-    ):
+        patch.object(settings_service, "_cache", cache)):
         assert settings_service.resolve_llm_key_for_identity(
             GLOBAL_PROVIDER["base_url"],
             GLOBAL_PROVIDER["model"],
@@ -318,8 +311,7 @@ def test_public_single_key_state_uses_endpoint_bound_key():
         patch.dict(os.environ, env, clear=False),
         patch.object(settings_service, "_cache", cache),
         patch.object(settings_service, "list_engines", return_value=[]),
-        patch.object(settings_service, "llm_health_snapshot", return_value={}),
-    ):
+        patch.object(settings_service, "llm_health_snapshot", return_value={})):
         public = settings_service.public_settings_view()["llm"]
 
     assert public["api_key"] == ""
@@ -352,8 +344,7 @@ def test_db_single_key_overrides_env_key_for_same_endpoint():
         patch.dict(os.environ, env, clear=False),
         patch.object(settings_service, "_cache", cache),
         patch.object(settings_service, "list_engines", return_value=[]),
-        patch.object(settings_service, "llm_health_snapshot", return_value={}),
-    ):
+        patch.object(settings_service, "llm_health_snapshot", return_value={})):
         providers = settings_service.resolve_llm_providers()
         public = settings_service.public_settings_view()["llm"]
 
@@ -390,8 +381,7 @@ def test_fixed_task_endpoint_change_drops_embedded_key(model_patch):
         with (
             patch.object(settings_service, "effective_settings", return_value=current),
             patch.object(tasks_api, "_compute_stats", new=AsyncMock(return_value=Mock())),
-            patch.object(tasks_api, "_task_to_dto", return_value={"ok": True}),
-        ):
+            patch.object(tasks_api, "_task_to_dto", return_value={"ok": True})):
             return await tasks_api.update_task("task-1", request, session)
 
     assert asyncio.run(run_update()) == {"ok": True}
@@ -437,8 +427,7 @@ def test_models_probe_can_reuse_masked_provider_identity():
     with (
         patch.object(settings_service, "effective_settings", return_value=_settings()),
         patch("httpx.AsyncClient", AsyncClient),
-        patch("app.tools.netguard.assert_safe_outbound_url"),
-    ):
+        patch("app.tools.netguard.assert_safe_outbound_url")):
         result = asyncio.run(settings_service.list_available_models(
             base_url=POOL_PROVIDER["base_url"],
             protocol=POOL_PROVIDER["protocol"],
@@ -492,8 +481,7 @@ def test_llm_connection_probe_uses_runtime_user_agent(protocol, model, expected_
     with (
         patch("httpx.AsyncClient", AsyncClient),
         patch.object(settings_api, "assert_safe_outbound_url"),
-        patch.object(settings_api, "_resolve_user_agent", return_value="probe-UA/1.0") as resolve_ua,
-    ):
+        patch.object(settings_api, "_resolve_user_agent", return_value="probe-UA/1.0") as resolve_ua):
         result = asyncio.run(settings_api._test_llm_one("probe", provider))
 
     assert result["ok"] is True
@@ -503,3 +491,61 @@ def test_llm_connection_probe_uses_runtime_user_agent(protocol, model, expected_
     resolve_ua.assert_called_once_with(model, "https://relay.example/v1")
     if protocol == "anthropic_messages":
         assert AsyncClient.captured[1]["x-api-key"] == POOL_KEY
+
+
+def test_llm_connection_probe_clears_network_cooldown_only():
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class AsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, headers, json):
+            return Response()
+
+    net = LLMConfig(
+        base_url="https://recover-net.example/v1",
+        api_key=POOL_KEY,
+        model="net-model",
+        protocol="openai_chat",
+    )
+    quota = LLMConfig(
+        base_url="https://keep-quota.example/v1",
+        api_key=POOL_KEY,
+        model="quota-model",
+        protocol="openai_chat",
+    )
+    with (
+        patch.object(health, "_FAIL_THRESHOLD", 1),
+        patch.object(health, "_COOLDOWN_STEPS", [60]),
+        patch("httpx.AsyncClient", AsyncClient),
+        patch.object(settings_api, "assert_safe_outbound_url"),
+        patch.object(settings_api, "_probe_tool_calling", new=AsyncMock(return_value="yes")),
+        patch.object(settings_api, "_resolve_user_agent", return_value="probe-UA/1.0")):
+        health.mark_provider_failed(
+            net.base_url, net.model, "Connection error.", net.api_key, net.protocol, kind="network"
+        )
+        health.mark_provider_failed(
+            quota.base_url, quota.model, "quota", quota.api_key, quota.protocol, kind="quota"
+        )
+        net_result = asyncio.run(settings_api._test_llm_one("net", net))
+        quota_result = asyncio.run(settings_api._test_llm_one("quota", quota))
+
+    assert net_result["ok"] is True
+    assert quota_result["ok"] is True
+    net_ref = health.provider_ref(net.base_url, net.model, net.api_key, net.protocol)
+    quota_ref = health.provider_ref(quota.base_url, quota.model, quota.api_key, quota.protocol)
+    assert health.snapshot()[net_ref]["status"] == "ok"
+    assert health.snapshot()[quota_ref]["status"] == "cooldown"
+

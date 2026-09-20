@@ -16,6 +16,13 @@ _BEHAVIOR_FAIL_THRESHOLD = max(1, int(os.environ.get("LLM_PROVIDER_BEHAVIOR_FAIL
 _FAILED_RETRY_SECONDS = max(1, int(os.environ.get("LLM_PROVIDER_FAILED_RETRY_SECONDS", "60")))
 _TRANSPORT_PROBE_SECONDS = max(1, int(os.environ.get("LLM_PROVIDER_PROBE_SECONDS", "120")))
 _BEHAVIOR_PROBE_SECONDS = max(1, int(os.environ.get("LLM_PROVIDER_BEHAVIOR_PROBE_SECONDS", "900")))
+_SHARED_TRANSPORT_RETRY_SECONDS = max(
+    1, int(os.environ.get("LLM_PROVIDER_SHARED_TRANSPORT_RETRY_SECONDS", "30"))
+)
+# Connection/timeout often describe this process (DNS, huge body RST, local
+# egress) rather than one upstream being down. Those must not escalate cooldown.
+_TRANSIENT_TRANSPORT_KINDS = frozenset({"network", "timeout"})
+_PROBE_RECOVERABLE_KINDS = frozenset({"network", "timeout", ""})
 
 
 def _cooldown_steps() -> list[int]:
@@ -199,6 +206,92 @@ def provider_retry_after_seconds(
     return max(1, int(math.ceil(min(positive)))) if positive else 1
 
 
+def _is_transient_transport_kind(kind: str) -> bool:
+    return str(kind or "").strip().lower() in _TRANSIENT_TRANSPORT_KINDS
+
+
+def _release_probe_leases(row: dict[str, Any]) -> None:
+    row["half_open_inflight"] = False
+    row["half_open_until_ts"] = 0
+    if str(row.get("behavior_status") or "") == "half_open":
+        row["behavior_probe_owner"] = ""
+        row["behavior_probe_until_ts"] = 0
+
+
+def note_shared_transport_issue(
+    base_url: str,
+    model: str,
+    error: str,
+    api_key: str = "",
+    protocol: str = "auto",
+    *,
+    kind: str = "network",
+) -> dict[str, Any]:
+    """Pool-wide client transport failure: do not count this endpoint as down.
+
+    When every attempted provider in one chat() sweep fails with the same
+    connect/timeout error, the request or local egress is the common factor.
+    Healthy endpoints stay healthy. Half-open probes get a short pause without
+    escalating cooldown_count.
+    """
+    ref = provider_ref(base_url, model, api_key, protocol)
+    now = _now()
+    with _LOCK:
+        row = _HEALTH.get(ref)
+        if not row:
+            return {
+                **_base_row(ref, base_url, model, protocol),
+                "transport_status": "ok",
+                "behavior_status": "ok",
+                "status": "ok",
+                "consecutive_failures": 0,
+                "cooldown_seconds": 0,
+                "transition": "shared_transport_ignored",
+            }
+        _release_probe_leases(row)
+        transport = _transport_status(row)
+        row.update({
+            **_base_row(ref, base_url, model, protocol),
+            "last_error": " ".join(str(error or "").split())[:500],
+            "error_kind": str(kind or ""),
+            "last_seen": _iso(now),
+        })
+        if transport in {"half_open", "failed", "cooldown"}:
+            row["transport_status"] = "failed"
+            row["failed_retry_at_ts"] = now.timestamp() + _SHARED_TRANSPORT_RETRY_SECONDS
+            row["cooldown_seconds"] = 0
+            row["cooldown_until"] = ""
+            row["cooldown_until_ts"] = 0
+            transition = "shared_transport_backoff"
+        else:
+            transition = "shared_transport_ignored"
+        _refresh_status(row, now)
+        return {**row, "transition": transition}
+
+
+def recover_transport_after_successful_probe(
+    base_url: str, model: str, api_key: str = "", protocol: str = "auto"
+) -> dict[str, Any] | None:
+    """Clear network/timeout circuit-breaker after a live connectivity probe.
+
+    Quota/auth/rate-limit/blocked cooldowns stay put so a tiny ping cannot
+    send workers back into a provider that just rejected them.
+    """
+    ref = provider_ref(base_url, model, api_key, protocol)
+    with _LOCK:
+        row = _HEALTH.get(ref)
+        if not row:
+            return None
+        _refresh_expired_probes(row, _now())
+        kind = str(row.get("error_kind") or "").strip().lower()
+        status = str(row.get("status") or "")
+        if status not in {"failed", "cooldown", "half_open"}:
+            return None
+        if kind not in _PROBE_RECOVERABLE_KINDS:
+            return None
+    return mark_provider_ok(base_url, model, api_key, protocol)
+
+
 def mark_provider_ok(
     base_url: str, model: str, api_key: str = "", protocol: str = "auto"
 ) -> dict[str, Any]:
@@ -360,6 +453,38 @@ def mark_provider_failed(
                 "half_open_until_ts": 0,
             })
             return {**row, "transition": "cooldown_suppressed"}
+
+        # A half-open probe that dies with connect/timeout is inconclusive: the
+        # same huge worker request (or a local DNS blip) can RST every upstream.
+        # Do not climb cooldown_count; pause briefly and probe again.
+        if previous_status == "half_open" and _is_transient_transport_kind(kind):
+            if row.get("behavior_status") == "half_open":
+                row.update({
+                    "behavior_status": "failed",
+                    "behavior_retry_at_ts": now.timestamp() + _FAILED_RETRY_SECONDS,
+                    "behavior_probe_owner": "",
+                    "behavior_probe_until_ts": 0,
+                })
+            row.update({
+                **_base_row(ref, base_url, model, protocol),
+                "transport_status": "failed",
+                "last_error": " ".join(str(error or "").split())[:500],
+                "error_kind": str(kind or ""),
+                "last_seen": _iso(now),
+                "failed_retry_at_ts": now.timestamp() + _FAILED_RETRY_SECONDS,
+                "half_open_inflight": False,
+                "half_open_until_ts": 0,
+                "cooldown_seconds": 0,
+                "cooldown_until": "",
+                "cooldown_until_ts": 0,
+            })
+            _refresh_status(row, now)
+            return {
+                **row,
+                "transition": "half_open_transient_retry",
+                "consecutive_failures": int(row.get("consecutive_failures") or 0),
+                "cooldown_seconds": 0,
+            }
 
         consecutive = int(row.get("consecutive_failures") or 0) + 1
         cooldown_count = int(row.get("cooldown_count") or 0)

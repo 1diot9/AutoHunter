@@ -12,7 +12,6 @@ import os
 import json
 import logging
 import re
-import threading
 import time
 import uuid
 from typing import Any, Callable, Optional
@@ -28,10 +27,11 @@ from app.llm.health import (
     mark_provider_behavior_failed,
     mark_provider_behavior_ok,
     mark_provider_ok,
+    note_shared_transport_issue,
     provider_ref,
     provider_retry_after_seconds,
-    snapshot as health_snapshot,
 )
+from app.llm import slots as provider_slots
 from app.llm.usage import record_usage, reconcile_cache_tokens
 
 logger = logging.getLogger("autohunter.llm")
@@ -50,10 +50,6 @@ _REQUEST_TIMEOUT = float(os.environ.get("LLM_REQUEST_TIMEOUT", "120"))
 _MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
 # 端点池：同端点先轻量重试几次再切下一个（避免一次网络毛刺就换模型丢上下文）。
 _POOL_SAME_PROVIDER_RETRIES = int(os.environ.get("LLM_POOL_SAME_PROVIDER_RETRIES", "1"))
-_RR_LOCK = threading.Lock()
-# Smooth weighted round-robin current weights, keyed by pool/rank/provider.
-# The state is intentionally process-local; the production process runs one Uvicorn worker.
-_RR_STATE: dict[str, int] = {}
 
 
 def _api_root(base_url: str) -> str:
@@ -857,26 +853,12 @@ def _should_retry_current_provider(error: Exception) -> bool:
     }
 
 
-def _provider_weight(provider: LLMConfig) -> int:
-    try:
-        weight = int(getattr(provider, "weight", 1) or 1)
-    except (TypeError, ValueError):
-        weight = 1
-    return max(1, min(weight, 100))
+_CLIENT_TRANSPORT_KINDS = frozenset({"network", "timeout"})
 
 
-def _provider_health_rank(provider: LLMConfig, health: dict[str, dict[str, Any]]) -> int:
-    state = health.get(provider_ref(
-        provider.base_url, provider.model, provider.api_key, provider.protocol
-    )) or {}
-    status = str(state.get("status") or "")
-    if status == "half_open":
-        return 0
-    if status == "failed":
-        return 1
-    if status == "cooldown":
-        return 2
-    return 0
+def _is_client_transport_error(error: Exception) -> bool:
+    """Connect/timeout: may be this process or this request, not one upstream."""
+    return isinstance(error, LLMError) and error.kind in _CLIENT_TRANSPORT_KINDS
 
 
 _USAGE_FIELD_NAMES = (
@@ -928,13 +910,14 @@ def _usage_mapping(obj: Any) -> dict[str, Any]:
     extra = getattr(obj, "model_extra", None) or getattr(obj, "__pydantic_extra__", None)
     if isinstance(extra, dict):
         dumped = {**dumped, **extra}
-    if dumped:
-        return dumped
-    out: dict[str, Any] = {}
     for key in _USAGE_FIELD_NAMES:
+        if key in dumped and dumped[key] is not None:
+            continue
         if hasattr(obj, key):
-            out[key] = getattr(obj, key)
-    return out
+            val = getattr(obj, key)
+            if val is not None:
+                dumped[key] = val
+    return dumped
 
 
 def _first_usage_int(data: dict[str, Any], *keys: str) -> int | None:
@@ -1053,79 +1036,6 @@ class LLMClient:
             self.config.model,
         )
         return True
-
-    def _provider_order(self) -> list[LLMConfig]:
-        if len(self.providers) <= 1:
-            return list(self.providers)
-        health = health_snapshot()
-        if self._sticky_provider_ref:
-            sticky_index = next((
-                index
-                for index, provider in enumerate(self.providers)
-                if provider_ref(
-                    provider.base_url, provider.model, provider.api_key, provider.protocol
-                )
-                == self._sticky_provider_ref
-                and _provider_health_rank(provider, health) == 0
-            ), None)
-            if sticky_index is not None:
-                remaining = sorted(
-                    (index for index in range(len(self.providers)) if index != sticky_index),
-                    key=lambda index: _provider_health_rank(self.providers[index], health),
-                )
-                return [self.providers[sticky_index], *(self.providers[index] for index in remaining)]
-        groups: dict[int, list[int]] = {0: [], 1: [], 2: []}
-        for index, provider in enumerate(self.providers):
-            groups[_provider_health_rank(provider, health)].append(index)
-
-        ordered: list[int] = []
-        for rank in (0, 1, 2):
-            for index in self._weighted_group_order(groups[rank], rank):
-                if index not in ordered:
-                    ordered.append(index)
-        return [self.providers[index] for index in ordered]
-
-    def _weighted_group_order(self, indices: list[int], rank: int) -> list[int]:
-        if not indices:
-            return []
-        positions = {index: position for position, index in enumerate(indices)}
-        refs = {
-            index: provider_ref(
-                self.providers[index].base_url,
-                self.providers[index].model,
-                self.providers[index].api_key,
-                self.providers[index].protocol,
-            )
-            for index in indices
-        }
-        weights = {index: _provider_weight(self.providers[index]) for index in indices}
-        pool_key = "|".join(
-            f"{refs[index]}:{weights[index]}"
-            for index in indices
-        )
-        total_weight = sum(weights.values())
-        state_prefix = f"{rank}:{pool_key}:"
-        with _RR_LOCK:
-            scores: dict[int, int] = {}
-            for index in indices:
-                key = f"{state_prefix}{positions[index]}:{refs[index]}"
-                score = _RR_STATE.get(key, 0) + weights[index]
-                _RR_STATE[key] = score
-                scores[index] = score
-
-            # Choose the highest accumulated score, then subtract the pool total.
-            # This is the standard Smooth WRR recurrence and avoids bursts such as
-            # A,A,A,B for a 3:1 pool while preserving the exact long-run ratio.
-            selected = max(indices, key=lambda index: (scores[index], -positions[index]))
-            selected_key = f"{state_prefix}{positions[selected]}:{refs[selected]}"
-            _RR_STATE[selected_key] -= total_weight
-            scores[selected] -= total_weight
-
-            remaining = sorted(
-                (index for index in indices if index != selected),
-                key=lambda index: (-scores[index], positions[index]),
-            )
-        return [selected, *remaining]
 
     def _activate_provider(self, config: LLMConfig) -> None:
         self.config = config
@@ -1264,84 +1174,188 @@ class LLMClient:
         *,
         omit_max_tokens: bool = False,
     ):
-        """调用一个健康端点，失败时按健康状态和权重切换备用端点。
+        """调用一个健康端点，失败时按权重档与线程余量切换备用端点。
 
+        每端点受 max_threads 限制；健康端点全部满员时在此排队领槽。
         extra_body 会透传给 OpenAI 兼容接口（如 enable_thinking / reasoning_effort）；
         omit_max_tokens=True 时不传输出上限（Anthropic Messages 仍给大兜底值）。
         """
         last_exc: Exception | None = None
         cooldown_delays: list[int] = []
-        order = self._provider_order()
-        for index, provider in enumerate(order):
-            self._activate_provider(provider)
-            can_try, slot_state = acquire_provider_slot(
+        deferred_transport: list[tuple[LLMConfig, Exception, str]] = []
+        # Bound failover loops: each attempt claims a fresh thread slot.
+        max_attempts = max(len(self.providers) * 3, 3)
+        attempted = 0
+        exclude_refs: set[str] = set()
+
+        def _commit_transport_failure(provider: LLMConfig, error: Exception) -> dict[str, Any]:
+            state = mark_provider_failed(
                 provider.base_url,
                 provider.model,
+                str(error),
                 provider.api_key,
                 provider.protocol,
-                owner=self._provider_slot_owner,
+                kind=getattr(error, "kind", ""),
             )
-            if not can_try:
-                cooldown_delays.append(
-                    provider_retry_after_seconds(
-                        provider.base_url, provider.model, provider.api_key, provider.protocol
-                    )
-                )
-                continue
-            self.selected_provider = provider
-            self._notify_provider_selected(provider, slot_state)
+            self._notify_provider_failure(error, state)
+            return state
+
+        def _flush_deferred_transport() -> dict[str, Any] | None:
+            state = None
+            while deferred_transport:
+                provider, error, _slot = deferred_transport.pop(0)
+                state = _commit_transport_failure(provider, error)
+            return state
+
+        while attempted < max_attempts:
+            attempted += 1
+            provider = provider_slots.acquire(
+                self.providers,
+                self._sticky_provider_ref,
+                exclude_refs=exclude_refs,
+            )
+            if provider is None:
+                if not cooldown_delays:
+                    for candidate in self.providers:
+                        if not getattr(candidate, "enabled", True):
+                            continue
+                        ref = provider_ref(
+                            candidate.base_url,
+                            candidate.model,
+                            candidate.api_key,
+                            candidate.protocol,
+                        )
+                        if ref in exclude_refs:
+                            continue
+                        cooldown_delays.append(
+                            provider_retry_after_seconds(
+                                candidate.base_url,
+                                candidate.model,
+                                candidate.api_key,
+                                candidate.protocol,
+                            )
+                        )
+                break
+
+            slot_held = True
             try:
-                message = self._chat_current_provider(
-                    messages, tools, tool_choice, temperature, max_tokens,
-                    extra_body=extra_body, omit_max_tokens=omit_max_tokens,
-                )
-                self._remember_auto_protocol()
-                mark_provider_ok(
-                    provider.base_url, provider.model, provider.api_key, provider.protocol
-                )
-                self._sticky_provider_ref = provider_ref(
-                    provider.base_url, provider.model, provider.api_key, provider.protocol
-                )
-                return message
-            except Exception as exc:
-                error = exc if isinstance(exc, LLMError) else _classify_error(exc)
-                state = mark_provider_failed(
+                self._activate_provider(provider)
+                can_try, slot_state = acquire_provider_slot(
                     provider.base_url,
                     provider.model,
-                    str(error),
                     provider.api_key,
                     provider.protocol,
-                    kind=getattr(error, "kind", ""),
+                    owner=self._provider_slot_owner,
                 )
-                self._notify_provider_failure(error, state)
-                last_exc = error
-                if (
-                    not self.pool_mode
-                    and state.get("status") == "cooldown"
-                    and _should_retry_current_provider(error)
-                ):
-                    retry_after = provider_retry_after_seconds(
+                if not can_try:
+                    cooldown_delays.append(
+                        provider_retry_after_seconds(
+                            provider.base_url, provider.model, provider.api_key, provider.protocol
+                        )
+                    )
+                    exclude_refs.add(provider_ref(
+                        provider.base_url, provider.model, provider.api_key, provider.protocol
+                    ))
+                    continue
+
+                self.selected_provider = provider
+                self._notify_provider_selected(provider, slot_state)
+                try:
+                    message = self._chat_current_provider(
+                        messages, tools, tool_choice, temperature, max_tokens,
+                        extra_body=extra_body, omit_max_tokens=omit_max_tokens,
+                    )
+                    self._remember_auto_protocol()
+                    _flush_deferred_transport()
+                    mark_provider_ok(
+                        provider.base_url, provider.model, provider.api_key, provider.protocol
+                    )
+                    self._sticky_provider_ref = provider_ref(
+                        provider.base_url, provider.model, provider.api_key, provider.protocol
+                    )
+                    return message
+                except Exception as exc:
+                    error = exc if isinstance(exc, LLMError) else _classify_error(exc)
+                    last_exc = error
+                    exclude_refs.add(provider_ref(
+                        provider.base_url, provider.model, provider.api_key, provider.protocol
+                    ))
+                    if _is_client_transport_error(error):
+                        deferred_transport.append((provider, error, slot_state))
+                        state = None
+                    else:
+                        _flush_deferred_transport()
+                        state = _commit_transport_failure(provider, error)
+                    if (
+                        state is not None
+                        and not self.pool_mode
+                        and state.get("status") == "cooldown"
+                        and _should_retry_current_provider(error)
+                    ):
+                        retry_after = provider_retry_after_seconds(
+                            provider.base_url,
+                            provider.model,
+                            provider.api_key,
+                            provider.protocol,
+                        )
+                        raise LLMError(
+                            "provider_cooldown",
+                            f"LLM 端点正在冷却，预计 {retry_after} 秒后重试。",
+                            retry_after=retry_after,
+                        )
+                    if _should_try_next_provider(error):
+                        logger.warning(
+                            "LLM provider failed; trying next provider "
+                            "(attempt=%d/%d, kind=%s, slot=%s, model=%s, base=%s)",
+                            attempted, max_attempts, getattr(error, "kind", "?"), slot_state,
+                            provider.model, provider.base_url,
+                        )
+                        continue
+                    break
+            finally:
+                if slot_held:
+                    provider_slots.release(provider)
+
+        if deferred_transport:
+            if len(deferred_transport) >= 2 and all(
+                _is_client_transport_error(error) for _provider, error, _slot in deferred_transport
+            ):
+                logger.warning(
+                    "LLM pool shared %s across %d endpoints; not marking them unhealthy "
+                    "(likely local egress or this request, not every upstream)",
+                    getattr(deferred_transport[0][1], "kind", "network"),
+                    len(deferred_transport),
+                )
+                for provider, error, _slot in deferred_transport:
+                    note_shared_transport_issue(
                         provider.base_url,
                         provider.model,
+                        str(error),
                         provider.api_key,
                         provider.protocol,
+                        kind=getattr(error, "kind", "network"),
+                    )
+                deferred_transport.clear()
+            else:
+                state = _flush_deferred_transport()
+                if (
+                    last_exc is not None
+                    and state is not None
+                    and not self.pool_mode
+                    and state.get("status") == "cooldown"
+                    and _should_retry_current_provider(last_exc)
+                ):
+                    retry_after = provider_retry_after_seconds(
+                        self.config.base_url,
+                        self.config.model,
+                        self.config.api_key,
+                        self.config.protocol,
                     )
                     raise LLMError(
                         "provider_cooldown",
                         f"LLM 端点正在冷却，预计 {retry_after} 秒后重试。",
                         retry_after=retry_after,
                     )
-                if index + 1 < len(order) and _should_try_next_provider(error):
-                    logger.warning(
-                        "LLM provider failed; trying next provider %d/%d "
-                        "(kind=%s, slot=%s, model=%s, base=%s)",
-                        index + 2, len(order), getattr(error, "kind", "?"), slot_state,
-                        provider.model, provider.base_url,
-                    )
-                    continue
-                if self.pool_mode and _should_try_next_provider(error):
-                    break
-                raise error
 
         # A cooldown result means that no endpoint was actually called. If at
         # least one endpoint was called, preserve its real error so quota/auth/
@@ -1363,7 +1377,7 @@ class LLMClient:
         raise RuntimeError("没有可用的 LLM 端点")
 
     def clear_sticky_provider(self) -> None:
-        """清掉粘性端点，下次 chat 重新按健康度/权重选端点（worker 软重试用）。"""
+        """清掉粘性端点，下次 chat 重新按权重档/利用率选端点（worker 软重试用）。"""
         self._sticky_provider_ref = ""
 
     def _notify_provider_selected(self, provider: LLMConfig, slot_state: str) -> None:
@@ -1777,6 +1791,8 @@ class LLMClient:
 
     def _record_openai_usage(self, resp: Any) -> None:
         usage = getattr(resp, "usage", None)
+        if usage is None and isinstance(resp, dict):
+            usage = resp.get("usage")
         if not usage:
             return
         parsed = parse_completion_usage(usage)

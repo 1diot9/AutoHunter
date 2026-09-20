@@ -94,6 +94,8 @@ def _provider_enabled(value: Any) -> bool:
 
 
 def _clean_llm_providers(items: Any) -> list[dict[str, Any]]:
+    from app.llm.slots import clamp_max_threads
+
     providers: list[dict[str, Any]] = []
     for index, item in enumerate(_json_list(items)):
         base_url = str(item.get("base_url") or item.get("base") or "").strip()
@@ -117,6 +119,7 @@ def _clean_llm_providers(items: Any) -> list[dict[str, Any]]:
             "protocol": normalize_llm_protocol(item.get("protocol")),
             "temperature": max(0.0, min(temperature, 2.0)),
             "weight": max(1, min(weight, 100)),
+            "max_threads": clamp_max_threads(item.get("max_threads", 4)),
             "enabled": _provider_enabled(item.get("enabled", True)),
         })
     return providers
@@ -152,10 +155,20 @@ def _preserve_provider_keys(
 
 
 def _public_llm_provider(item: dict[str, Any]) -> dict[str, Any]:
+    from app.llm.slots import slot_view_for
+
     api_key = str(item.get("api_key") or "").strip()
     health_ref = provider_ref(
         item.get("base_url", ""), item.get("model", ""), api_key, item.get("protocol", "auto")
     )
+    health = dict(llm_health_snapshot().get(health_ref, {}))
+    health.update(slot_view_for(
+        item.get("base_url", ""),
+        item.get("model", ""),
+        api_key,
+        item.get("protocol", "auto"),
+        max_threads=item.get("max_threads"),
+    ))
     return {
         **{key: value for key, value in item.items() if key != "api_key"},
         "api_key": "",
@@ -163,7 +176,7 @@ def _public_llm_provider(item: dict[str, Any]) -> dict[str, Any]:
         "api_key_masked": mask_secret(api_key),
         "key_ref": secret_ref(api_key),
         "health_ref": health_ref,
-        "health": llm_health_snapshot().get(health_ref, {}),
+        "health": health,
     }
 
 
@@ -183,6 +196,8 @@ def is_masked_secret(value: str) -> bool:
 
 
 def _env_llm() -> dict[str, Any]:
+    from app.llm.slots import clamp_max_threads
+
     providers = _clean_llm_providers(os.environ.get("LLM_PROVIDERS_JSON", ""))
     configured_mode = os.environ.get("LLM_PROVIDER_MODE", "").strip()
     return {
@@ -192,6 +207,7 @@ def _env_llm() -> dict[str, Any]:
         "model": os.environ.get("LLM_MODEL", "deepseek-chat"),
         "temperature": float(os.environ.get("LLM_TEMPERATURE", "0.3")),
         "protocol": normalize_llm_protocol(os.environ.get("LLM_PROTOCOL", "auto")),
+        "max_threads": clamp_max_threads(os.environ.get("LLM_MAX_THREADS", "4")),
         "providers": providers,
     }
 
@@ -286,6 +302,8 @@ def effective_settings() -> dict[str, Any]:
 
 
 def _llm_config_from_provider(item: dict[str, Any], default_temperature: float) -> LLMConfig:
+    from app.llm.slots import clamp_max_threads
+
     return LLMConfig(
         base_url=str(item.get("base_url") or "").strip(),
         api_key=str(item.get("api_key") or "").strip(),
@@ -293,11 +311,14 @@ def _llm_config_from_provider(item: dict[str, Any], default_temperature: float) 
         temperature=float(item.get("temperature", default_temperature)),
         protocol=normalize_llm_protocol(item.get("protocol")),
         weight=max(1, min(int(item.get("weight") or 1), 100)),
+        max_threads=clamp_max_threads(item.get("max_threads", 4)),
         enabled=_provider_enabled(item.get("enabled", True)),
     )
 
 
 def resolve_llm_providers(task: Task | None = None) -> list[LLMConfig]:
+    from app.llm.slots import clamp_max_threads
+
     eff = effective_settings()["llm"]
     mc = (task.model_config_json or {}) if task else {}
     inherit_setting = mc.get("inherit_global")
@@ -340,6 +361,9 @@ def resolve_llm_providers(task: Task | None = None) -> list[LLMConfig]:
         temperature=float(mc.get("temperature") or eff["temperature"]),
         protocol=protocol,
         weight=1,
+        max_threads=clamp_max_threads(
+            mc.get("max_threads") if mc.get("max_threads") is not None else eff.get("max_threads", 4)
+        ),
         enabled=True,
     )
     return [config] if config.api_key else []
@@ -487,6 +511,8 @@ def resolve_proxy_config() -> ProxyConfig:
 
 def public_settings_view() -> dict[str, Any]:
     """API 返回：密钥脱敏。"""
+    from app.llm.slots import clamp_max_threads, slot_view_for
+
     eff = effective_settings()
     llm = eff["llm"]
     fofa = eff["fofa"]
@@ -501,6 +527,15 @@ def public_settings_view() -> dict[str, Any]:
         llm.get("base_url", ""), llm.get("model", ""), single_key, llm.get("protocol", "auto")
     )
     llm_health = llm_health_snapshot()
+    single_max_threads = clamp_max_threads(llm.get("max_threads", 4))
+    single_health = dict(llm_health.get(single_health_ref, {}))
+    single_health.update(slot_view_for(
+        llm.get("base_url", ""),
+        llm.get("model", ""),
+        single_key,
+        llm.get("protocol", "auto"),
+        max_threads=single_max_threads,
+    ))
 
     # 构建引擎列表视图
     # FOFA 引擎需额外合并 fofa section 的 key/base_url（旧版兼容）
@@ -529,11 +564,12 @@ def public_settings_view() -> dict[str, Any]:
             "model": llm["model"],
             "temperature": llm["temperature"],
             "protocol": normalize_llm_protocol(llm.get("protocol")),
+            "max_threads": single_max_threads,
             "api_key": mask_secret(single_key),
             "api_key_set": bool(single_key),
             "key_ref": secret_ref(single_key),
             "health_ref": single_health_ref,
-            "health": llm_health.get(single_health_ref, {}),
+            "health": single_health,
             "provider_count": len(llm_providers),
             "providers": [_public_llm_provider(item) for item in llm_providers],
         },
@@ -583,6 +619,10 @@ async def refresh_cache(session: AsyncSession) -> SystemSettings:
         "ui": dict(row.ui or {}),
         "updated_at": to_cst_iso(row.updated_at),
     }
+    try:
+        _sync_llm_slot_caps()
+    except Exception:
+        pass
     return row
 
 
@@ -629,6 +669,10 @@ async def update_settings(session: AsyncSession, payload: dict[str, Any]) -> dic
                 continue
             if k == "protocol":
                 llm["protocol"] = normalize_llm_protocol(v)
+                continue
+            if k == "max_threads":
+                from app.llm.slots import clamp_max_threads
+                llm["max_threads"] = clamp_max_threads(v)
                 continue
             if v is not None:
                 llm[k] = v
@@ -716,7 +760,28 @@ async def update_settings(session: AsyncSession, payload: dict[str, Any]) -> dic
     await session.commit()
     await session.refresh(row)
     await refresh_cache(session)
+    _sync_llm_slot_caps()
     return public_settings_view()
+
+
+def _sync_llm_slot_caps() -> None:
+    """Push current provider max_threads into the process-local slot table."""
+    from app.llm.slots import update_caps
+
+    llm = effective_settings()["llm"]
+    providers = _clean_llm_providers(llm.get("providers") or [])
+    if providers:
+        update_caps(providers)
+    else:
+        update_caps([{
+            "base_url": llm.get("base_url", ""),
+            "model": llm.get("model", ""),
+            "api_key": resolve_llm_key_for_identity(
+                llm.get("base_url", ""), llm.get("model", ""), llm.get("protocol", "auto")
+            ),
+            "protocol": llm.get("protocol", "auto"),
+            "max_threads": llm.get("max_threads", 4),
+        }])
 
 
 def llm_client_for_task(

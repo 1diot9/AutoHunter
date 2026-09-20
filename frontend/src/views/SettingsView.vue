@@ -166,6 +166,7 @@ const form = reactive({
   model: "",
   protocol: "openai_chat",
   temperature: 0.3,
+  max_threads: 4,
   api_key_set: false,
   llm_providers: [],
   fofa_key: "",
@@ -217,6 +218,7 @@ function newLlmProvider() {
     protocol: form.protocol || "openai_chat",
     temperature: Number(form.temperature ?? 0.3),
     weight: 1,
+    max_threads: Number(form.max_threads ?? 4),
     enabled: true,
     testing: false,
     models: [],
@@ -247,6 +249,7 @@ function loadLlmProviders(items = [], { resetSelection = true } = {}) {
     protocol: normalizeLlmProtocol(provider.protocol),
     temperature: provider.temperature ?? form.temperature ?? 0.3,
     weight: provider.weight ?? 1,
+    max_threads: provider.max_threads ?? form.max_threads ?? 4,
     enabled: provider.enabled !== false,
     testing: false,
     models: [],
@@ -301,12 +304,27 @@ function providerHealthText(provider) {
 
 function providerHealthTitle(provider) {
   const health = provider.health || {};
-  if (!health.last_seen) return "暂无运行时健康记录";
-  const parts = [health.last_seen];
+  if (!health.last_seen && health.inflight == null) return "暂无运行时健康记录";
+  const parts = [];
+  if (health.last_seen) parts.push(health.last_seen);
+  if (health.max_threads != null) {
+    parts.push(`线程 ${health.inflight ?? 0}/${health.max_threads}`);
+  }
+  if (health.queued) parts.push(`排队 ${health.queued}`);
   if (health.consecutive_failures) parts.push(`连续失败 ${health.consecutive_failures} 次`);
   if (health.cooldown_until) parts.push(`冷却到 ${health.cooldown_until}`);
   if (health.last_error) parts.push(health.last_error);
-  return parts.join("；");
+  return parts.join("；") || "暂无运行时健康记录";
+}
+
+function providerThreadText(provider) {
+  const health = provider.health || {};
+  const maxThreads = Number(health.max_threads ?? provider.max_threads ?? 4);
+  const inflight = Number(health.inflight ?? 0);
+  const queued = Number(health.queued ?? 0);
+  let text = `权重 ${provider.weight || 1} · ${inflight}/${maxThreads}`;
+  if (queued > 0) text += ` · 排队 ${queued}`;
+  return text;
 }
 
 function addLlmProvider() {
@@ -350,6 +368,7 @@ function buildLlmProvider(provider) {
     protocol: normalizeLlmProtocol(provider.protocol),
     temperature: Number(provider.temperature ?? form.temperature ?? 0.3),
     weight: Math.max(1, Math.min(100, Number(provider.weight || 1))),
+    max_threads: Math.max(1, Math.min(64, Number(provider.max_threads || 4))),
     enabled: provider.enabled !== false,
   };
 }
@@ -587,6 +606,7 @@ async function load() {
     form.model = s.llm?.model || "";
     form.protocol = normalizeLlmProtocol(s.llm?.protocol);
     form.temperature = s.llm?.temperature ?? 0.3;
+    form.max_threads = s.llm?.max_threads ?? 4;
     form.api_key = "";
     form.key_ref = s.llm?.key_ref || "";
     form.api_key_set = s.llm?.api_key_set;
@@ -702,6 +722,7 @@ async function save({ silent = false } = {}) {
         model: form.model,
         protocol: form.protocol,
         temperature: Number(form.temperature),
+        max_threads: Math.max(1, Math.min(64, Number(form.max_threads || 4))),
         providers: buildLlmProviders(),
       },
       fofa: {
@@ -1267,6 +1288,10 @@ async function restoreBackup() {
             <label>temperature
               <input v-model="form.temperature" type="number" step="0.1" min="0" max="2" />
             </label>
+            <label>最大线程
+              <input v-model="form.max_threads" type="number" min="1" max="64" />
+              <small class="muted">该端点同时在途 LLM 请求上限；与下方「调度」里的 Worker 并发无关。Worker 更多时会排队领用。</small>
+            </label>
             <label class="full">模型名
               <LlmModelPicker
                 v-model="form.model"
@@ -1313,7 +1338,7 @@ async function restoreBackup() {
                 <b>{{ provider.name || `llm-${idx + 1}` }}</b>
                 <small>{{ provider.model || "未设置模型" }}</small>
                 <em>{{ provider.protocol === "auto" ? "Auto" : provider.protocol === "anthropic_messages" ? "Anthropic" : "OpenAI" }}</em>
-                <i>权重 {{ provider.weight || 1 }}</i>
+                <i>{{ providerThreadText(provider) }}</i>
               </button>
             </div>
 
@@ -1362,6 +1387,11 @@ async function restoreBackup() {
                 </label>
                 <label>权重
                   <input v-model="selectedLlm.weight" type="number" min="1" max="100" />
+                  <small class="muted">调度优先级：高权重线程用尽后才用低权重；同权重按利用率均分。</small>
+                </label>
+                <label>最大线程
+                  <input v-model="selectedLlm.max_threads" type="number" min="1" max="64" />
+                  <small class="muted">该端点同时在途上限（1–64）。满员后切其它端点；全满则 Worker 排队。</small>
                 </label>
                 <label class="wide">模型名
                   <LlmModelPicker

@@ -55,6 +55,7 @@ function normalizeRow(provider = {}, idx = 0) {
     protocol: normalizeProtocol(provider.protocol),
     temperature: provider.temperature ?? props.defaults.temperature ?? 0.3,
     weight: provider.weight ?? 1,
+    max_threads: provider.max_threads ?? props.defaults.max_threads ?? 4,
     enabled: provider.enabled !== false,
     models: Array.isArray(provider.models) ? provider.models : [],
     modelsLoading: !!provider.modelsLoading,
@@ -246,6 +247,7 @@ function exportProviders() {
     protocol: normalizeProtocol(p.protocol),
     temperature: Number(p.temperature ?? 0.3),
     weight: Math.max(1, Math.min(100, Number(p.weight || 1))),
+    max_threads: Math.max(1, Math.min(64, Number(p.max_threads || 4))),
     enabled: p.enabled !== false,
   }));
 }
@@ -284,7 +286,7 @@ defineExpose({ exportProviders, addProvider });
         <b>{{ provider.name || `llm-${idx + 1}` }}</b>
         <small>{{ provider.model || "未设置模型" }}</small>
         <em>{{ provider.protocol === "auto" ? "Auto" : provider.protocol === "anthropic_messages" ? "Anthropic" : "OpenAI" }}</em>
-        <i>权重 {{ provider.weight || 1 }}</i>
+        <i>权重 {{ provider.weight || 1 }} · 线程 {{ provider.max_threads || 4 }}</i>
       </button>
     </div>
 
@@ -356,6 +358,14 @@ defineExpose({ exportProviders, addProvider });
             :value="current.weight"
             :disabled="disabled"
             @input="patchCurrent({ weight: $event.target.value })"
+          />
+        </label>
+        <label>最大线程
+          <input
+            type="number" min="1" max="64"
+            :value="current.max_threads"
+            :disabled="disabled"
+            @input="patchCurrent({ max_threads: $event.target.value })"
           />
         </label>
         <label class="wide">模型名

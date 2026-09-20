@@ -18,6 +18,7 @@ from app.db.session import get_session
 from app.engines import get_engine, list_engines
 from app.engines.translator import translate_fofa_query
 from app.llm.client import _is_kimi_coding_endpoint, _resolve_user_agent, llm_request_url
+from app.llm.health import recover_transport_after_successful_probe
 from app.tools.netguard import SsrfBlocked, assert_safe_outbound_url
 from app.ui_prefs import (
     MAX_WALLPAPER_BYTES,
@@ -170,6 +171,7 @@ def _test_configs(body: LLMTestRequest) -> list[tuple[str, LLMConfig]]:
                     protocol=item["protocol"],
                     temperature=float(item["temperature"]),
                     weight=int(item["weight"]),
+                    max_threads=int(item.get("max_threads") or 4),
                     enabled=bool(item["enabled"]),
                 ),
             )
@@ -350,7 +352,11 @@ async def _test_llm_one(name: str, provider: LLMConfig) -> dict:
         # 连通性 OK 后再探一次工具调用能力（额外一次小请求，仅测试按钮触发，不碰挖洞）。
         result["tool_calling"] = await _probe_tool_calling(url, headers, provider.model, protocol)
         result["error_copy"] = _llm_test_error_copy(result)
-        # 测试成功不清生产熔断器（否则会抹掉真实 cooldown，让 worker 立即冲击刚被限流的端点）。
+        # 小请求探活成功：只解除 network/timeout 熔断（本机出网/大请求 RST 误伤）。
+        # quota/auth/rate_limit/blocked 仍保留，避免把 worker 立刻打回刚拒我们的端点。
+        recover_transport_after_successful_probe(
+            provider.base_url, provider.model, provider.api_key, provider.protocol,
+        )
         return result
     except Exception as exc:
         result["latency_ms"] = int((time.perf_counter() - started) * 1000)

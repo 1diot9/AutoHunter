@@ -31,6 +31,7 @@ class LLMConfig(BaseModel):
     temperature: float = float(os.environ.get("LLM_TEMPERATURE", "0.3"))
     protocol: str = os.environ.get("LLM_PROTOCOL", "auto")
     weight: int = int(os.environ.get("LLM_WEIGHT", "1"))
+    max_threads: int = max(1, min(int(os.environ.get("LLM_MAX_THREADS", "4")), 64))
     enabled: bool = True
 
 
@@ -44,10 +45,9 @@ class WorkerConfig(BaseModel):
     # 实际回传给 LLM 的工具输出上限。即使老环境把 WORKER_OUTPUT_TRUNCATE 设得很大，
     # 默认仍只给模型一份紧凑证据片段，完整内容继续落工作目录文件，避免动态上下文失控。
     llm_tool_output_truncate: int = int(os.environ.get("WORKER_LLM_TOOL_OUTPUT_TRUNCATE", "4096"))
-    # 历史滑动窗口：保留最近 N 轮的完整 tool 响应，更早的 tool 响应在重发时
-    # 压成一行摘要（保留状态/长度/关键字段，丢弃大 body）。这是省 token 的核心：
-    # 模型决策主要依赖最近几轮，远古完整响应每轮重发是 190M 输入的主因。
-    history_full_tool_rounds: int = int(os.environ.get("WORKER_HISTORY_FULL_TOOL_ROUNDS", "4"))
+    # 历史滑动窗口：保留最近 N 轮的完整 tool 响应，更早的才压成摘要。
+    # 改历史中间的 tool 体会打断前缀缓存；默认 999，大于 max_rounds，等于整段挖掘不压缩。
+    history_full_tool_rounds: int = int(os.environ.get("WORKER_HISTORY_FULL_TOOL_ROUNDS", "999"))
     # 硬上限：单目标最大工具调用轮数（LLM 自主决定 finish，这是兜底防失控）
     max_rounds: int = int(os.environ.get("WORKER_MAX_ROUNDS", "90"))
     # 软引导阈值：超过此轮数后每轮催 worker 收尾，减少低价值空转（不硬杀，保质量）
