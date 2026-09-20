@@ -21,6 +21,11 @@ from app.agents.prompts import is_enterprise_src, normalize_worker_prompt_versio
 from app.agents.backdoor_proof import weak_backdoor_block_reason
 from app.agents.edu_scope import edu_bombing_block_reason
 from app.agents.write_proof import HARMLESS_PROTOCOL, weak_write_block_reason
+from app.agents.xss_audit import (
+    edu_reflected_xss_block_reason,
+    xss_missing_evidence_reason,
+    xss_worker_prompt,
+)
 from app.agents import auth_bootstrap
 from app.config import worker_config
 from app.tools.cookie_manager import CookieHub
@@ -371,7 +376,14 @@ class Worker:
             )
             self._emit("worker_start", target=self.target, prompt_version=self.prompt_version)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": worker_system_prompt(self.src_type, self.prompt_version, src_rules=self.src_rules)},
+            {
+                "role": "system",
+                "content": (
+                    worker_system_prompt(self.src_type, self.prompt_version, src_rules=self.src_rules).rstrip()
+                    + "\n\n"
+                    + xss_worker_prompt(self.src_type)
+                ),
+            },
             {"role": "user", "content": _WORKER_STATIC_PREFIX},
             {"role": "user", "content": user_content},
         ]
@@ -1619,6 +1631,11 @@ class Worker:
             self._emit("finding_invalid", errors=str(e))
             return {"ok": False, "error": f"Finding 校验失败，请修正后重新提交: {e}"}
 
+        # subtype=reflected 时强制对齐 is_reflected_xss
+        xc = getattr(finding.self_check, "xss_check", None)
+        if xc is not None and str(getattr(xc, "subtype", "") or "").lower() == "reflected":
+            finding.self_check.is_reflected_xss = True
+
         if not self._enterprise:
             bomb_block = edu_bombing_block_reason(finding)
             if bomb_block:
@@ -1629,6 +1646,15 @@ class Worker:
                     "submitted": False,
                     "error": bomb_block,
                 }
+            reflected_block = edu_reflected_xss_block_reason(finding)
+            if reflected_block:
+                self._emit("finding_out_of_scope", title=finding.title, reason=reflected_block[:200])
+                return {
+                    "ok": False,
+                    "kind": "out_of_scope",
+                    "submitted": False,
+                    "error": reflected_block,
+                }
 
         backdoor_block = weak_backdoor_block_reason(finding)
         if backdoor_block:
@@ -1638,6 +1664,17 @@ class Worker:
                 "kind": "out_of_scope",
                 "submitted": False,
                 "error": backdoor_block,
+            }
+
+        xss_evidence_block = xss_missing_evidence_reason(finding)
+        if xss_evidence_block:
+            self._emit("finding_needs_more_evidence", title=finding.title, reason=xss_evidence_block[:200])
+            return {
+                "ok": False,
+                "kind": "needs_more_evidence",
+                "submitted": False,
+                "error": xss_evidence_block,
+                "guidance": "先 GET 落地文件/页面，把 Content-Type 与 execution_origin 写进 raw_response / self_check.xss_check 再交。",
             }
 
         evidence_block = self._weak_write_evidence_reason(finding)

@@ -734,10 +734,12 @@ def _build_chains(findings: list[JsFinding], base_url: str) -> list[JsChain]:
         probes = _qiniu_probes(findings)
         chains.append(JsChain(
             "qiniu_upload_xss",
-            "配置泄露云存储 upload_token，可发展为对象存储 HTML/XSS",
+            "配置泄露云存储 upload_token；桶上 HTML 的执行 Origin 是对象存储域名，默认不是主站 Stored XSS",
             "high",
             "高危",
-            "同时出现上传 token / 上传入口 / 文件访问域名，符合本地成功报告中的 /config → 七牛桶 XSS 链路。",
+            "同时出现上传 token / 上传入口 / 文件访问域名。注意：浏览器在桶 Origin 执行 JS，不等于主站同源 XSS；"
+            "需另证 CORS 可读响应、Cookie Domain 共享、postMessage/OAuth 等跨 Origin 信任后才可能影响主站用户。"
+            "符合本地成功报告中的 /config → 七牛桶链路，但按 XSS 独立标准先记执行 Origin 再定级。",
             evidence,
             probes,
         ))

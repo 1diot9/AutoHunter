@@ -191,6 +191,28 @@ TOOL_SCHEMAS = [
                             "scanner_only_no_poc": {"type": "boolean"},
                             "is_public_interface": {"type": "boolean", "description": "该接口是否本就是面向公众的公开接口"},
                             "info_leak_hits_strict_list": {"type": "boolean", "description": "若信息泄露类：是否命中身份证照片/大头照/身份证号/密码哈希死规矩"},
+                            "xss_check": {
+                                "type": "object",
+                                "description": "XSS 类可选取证：Origin/可执行性/可达性。subtype=reflected 时 is_reflected_xss 必须 true",
+                                "properties": {
+                                    "subtype": {
+                                        "type": "string",
+                                        "description": "reflected/stored/dom/self/html_injection/upload/markdown/third_party_storage",
+                                    },
+                                    "js_executes": {"type": "boolean"},
+                                    "execution_url": {"type": "string"},
+                                    "execution_origin": {"type": "string"},
+                                    "same_origin_as_target": {"type": "boolean"},
+                                    "reachable_by_others": {"type": "boolean"},
+                                    "content_type": {"type": "string"},
+                                    "content_disposition": {"type": "string"},
+                                    "cross_origin_trust": {
+                                        "type": "string",
+                                        "description": "none/cookie_share/cors/postmessage/oauth/unknown",
+                                    },
+                                    "missing_evidence": {"type": "array", "items": {"type": "string"}},
+                                },
+                            },
                         },
                         "required": ["is_reflected_xss", "needs_admin_login", "needs_mitm", "is_pure_info_leak", "scanner_only_no_poc"],
                     },

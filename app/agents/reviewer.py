@@ -25,6 +25,14 @@ from app.agents.write_proof import (
     has_strong_write_proof,
     should_skip_live_replay,
 )
+from app.agents.xss_audit import (
+    XssClass,
+    apply_xss_override_to_review,
+    classify_xss,
+    looks_like_xss,
+    map_xss_verdict,
+    xss_review_prompt,
+)
 from app.llm.client import LLMClient, LLMError, _is_forced_tool_choice_unsupported
 from app.schemas import Confidence, Finding, Review, ReviewVerdict, Severity
 from app.tools.executor import ToolExecutor
@@ -51,6 +59,8 @@ _REVIEW_NEVER_DEEPEN_MARKERS = (
     "短信轰炸", "邮箱轰炸", "邮件轰炸", "验证码轰炸", "sms bomb", "email bomb",
     "非教育", "不在范围", "钓鱼", "中间人", "mitm", "本就公开", "公开展示", "公开接口",
 )
+# 企业 SRC：反射型 XSS 允许证据不足时 deepen；Edu 仍永不 deepen 反射
+_REVIEW_NEVER_DEEPEN_REFLECTED = ("反射型xss", "反射 xss")
 _REVIEW_CAPTCHA_ONLY_IGNORE_MARKERS = ("图形验证码", "算术验证码")
 
 
@@ -100,6 +110,9 @@ def _ignored_deepen_directive(finding: Finding, review: Review, src_type: str) -
     text = _review_text(finding, review)
     register_like = _has_any(text, ("注册", "register", "signup"))
     never_markers = _REVIEW_NEVER_DEEPEN_MARKERS
+    # 企业模式：从永不 deepen 列表拿掉反射型 XSS，允许补 Origin/影响证据
+    if src_type == "enterprise":
+        never_markers = tuple(m for m in never_markers if m not in _REVIEW_NEVER_DEEPEN_REFLECTED)
     if register_like:
         never_markers = tuple(m for m in never_markers if m not in {"本就公开", "公开接口"})
     if (
@@ -234,6 +247,47 @@ def _maybe_reject_weak_backdoor(finding: Finding, review: Review) -> bool:
     return True
 
 
+def _maybe_apply_xss_policy(finding: Finding, review: Review, src_type: str) -> bool:
+    """XSS 独立审核闸门：Origin/可执行性/可达性启发式改判。
+
+    返回 True 表示已改判；若 block_deepen_rescue（Edu 反射/Self 等），调用方应跳过后续 deepen 救回。
+    """
+    if not looks_like_xss(finding):
+        return False
+    classification = classify_xss(finding)
+    override = map_xss_verdict(classification, src_type, finding)
+    if override is None:
+        # 仍在 notes 留下分类痕迹，便于人工复审对齐
+        if classification.classification != XssClass.NOT_XSS:
+            note = f"[XSS判定] {classification.classification.value}：{classification.reason}"
+            if note not in (review.reviewer_notes or ""):
+                review.reviewer_notes = ((review.reviewer_notes or "").strip() + "\n" + note).strip()
+        return False
+
+    before = review.verdict
+    # VALID_XSS 抬升：仅当 LLM 误 ignored
+    if (
+        override.force_verdict == "accepted"
+        and before != ReviewVerdict.ignored
+    ):
+        note = f"[XSS判定] {override.classification.value}：{override.reason}"
+        if note not in (review.reviewer_notes or ""):
+            review.reviewer_notes = ((review.reviewer_notes or "").strip() + "\n" + note).strip()
+        return False
+
+    # 已 accepted 的高置信 VALID 不必再改；但错误 accepted（如不可执行上传）要压下去
+    if before == ReviewVerdict.accepted and override.force_verdict == "accepted":
+        note = f"[XSS判定] {override.classification.value}：{override.reason}"
+        if note not in (review.reviewer_notes or ""):
+            review.reviewer_notes = ((review.reviewer_notes or "").strip() + "\n" + note).strip()
+        return False
+
+    apply_xss_override_to_review(review, override)
+    # 标记：后续 deepen 救回是否应跳过
+    review._xss_block_deepen = bool(override.block_deepen_rescue)  # type: ignore[attr-defined]
+    return True
+
+
 def _maybe_accept_write_proof(finding: Finding, review: Review) -> bool:
     """无害写/删证据已经齐时，不允许因「没破坏真实数据」被 ignored/deepen。"""
     if review.verdict not in {ReviewVerdict.ignored, ReviewVerdict.deepen}:
@@ -358,10 +412,20 @@ class Reviewer:
             self._emit("review_auto_ignore_bombing", title=finding.title)
         elif _maybe_reject_weak_backdoor(finding, review):
             self._emit("review_auto_ignore_weak_backdoor", title=finding.title)
-        elif _maybe_accept_write_proof(finding, review):
-            self._emit("review_auto_accept_write", title=finding.title, write_kind=classify_write_proof(finding))
-        elif _maybe_deepen_ignored(finding, review, self.src_type):
-            self._emit("review_auto_deepen", title=finding.title, directive=review.deepen_directive)
+        else:
+            xss_applied = _maybe_apply_xss_policy(finding, review, self.src_type)
+            if xss_applied:
+                self._emit(
+                    "review_auto_xss_policy",
+                    title=finding.title,
+                    verdict=review.verdict.value,
+                )
+            # Edu 反射 / Self-XSS 等硬 ignored：禁止被 deepen 救回
+            block_deepen = bool(getattr(review, "_xss_block_deepen", False))
+            if _maybe_accept_write_proof(finding, review):
+                self._emit("review_auto_accept_write", title=finding.title, write_kind=classify_write_proof(finding))
+            elif not block_deepen and _maybe_deepen_ignored(finding, review, self.src_type):
+                self._emit("review_auto_deepen", title=finding.title, directive=review.deepen_directive)
 
         # 阶段③：仅 accepted 且 严重/高危 才触发复现验证。
         # 写/删 PoC 禁止现场复放：URL 含 delete 不是破坏性 SQL，复放既不安全
@@ -427,8 +491,11 @@ class Reviewer:
     def _llm_review(self, finding: Finding) -> Optional[Review]:
         finding_text = json.dumps(_review_finding_payload(finding), ensure_ascii=False, separators=(",", ":"))
         mode_name = "企业 SRC" if self.src_type == "enterprise" else "EduSRC"
+        system = reviewer_system_prompt(self.src_type, src_rules=self.src_rules)
+        if looks_like_xss(finding):
+            system = system.rstrip() + "\n\n" + xss_review_prompt(self.src_type)
         messages = [
-            {"role": "system", "content": reviewer_system_prompt(self.src_type, src_rules=self.src_rules)},
+            {"role": "system", "content": system},
             {"role": "user", "content": _REVIEW_STATIC_PREFIX},
             {"role": "user", "content": (
                 f"按 {mode_name} 标准审核并调用 submit_review：\n```json\n{finding_text}\n```"

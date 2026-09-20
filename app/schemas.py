@@ -26,6 +26,26 @@ class Verdict(str, Enum):
     needs_auth = "needs_auth"  # 目标有攻击面但需要用户提供凭证/完成注册才能继续
 
 
+class XssCheck(BaseModel):
+    """XSS 取证清单（可选）。缺证据时填 missing_evidence，禁止留空硬猜。"""
+    subtype: str = Field(
+        "",
+        description="reflected/stored/dom/self/html_injection/upload/markdown/third_party_storage",
+    )
+    js_executes: Optional[bool] = Field(None, description="JavaScript 是否真能执行；仅 HTML 注入填 false")
+    execution_url: str = Field("", description="浏览器打开后最终执行 JS 的 URL")
+    execution_origin: str = Field("", description="执行 Origin，如 https://www.example.com")
+    same_origin_as_target: Optional[bool] = Field(None, description="执行 Origin 是否与目标站同源（严格 SOP）")
+    reachable_by_others: Optional[bool] = Field(None, description="其他用户能否在正常业务中访问到该内容")
+    content_type: str = Field("", description="访问落地 URL 时的 Content-Type")
+    content_disposition: str = Field("", description="访问落地 URL 时的 Content-Disposition")
+    cross_origin_trust: str = Field(
+        "",
+        description="none/cookie_share/cors/postmessage/oauth/unknown；无实证填 unknown 或 none",
+    )
+    missing_evidence: list[str] = Field(default_factory=list, description="尚缺的验证项，禁止假设")
+
+
 class SelfCheck(BaseModel):
     """worker 提交漏洞前的垃圾洞自检，对照当前 SRC 模式忽略清单。"""
     is_reflected_xss: bool = Field(False, description="是否为反射型 XSS（按当前 SRC 规则判断是否忽略/降级）")
@@ -35,6 +55,7 @@ class SelfCheck(BaseModel):
     scanner_only_no_poc: bool = Field(False, description="是否仅扫描器出结果但无法给出利用方法（会被忽略）")
     is_public_interface: bool = Field(False, description="该接口是否本就是面向公众的公开接口（若是，访问它通常不构成漏洞）")
     info_leak_hits_strict_list: bool = Field(False, description="若属信息泄露类：泄露数据是否命中当前 SRC 模式的高价值敏感数据口径")
+    xss_check: Optional[XssCheck] = Field(None, description="XSS 类漏洞的 Origin/可执行性/可达性取证（可选）")
 
 
 class Evidence(BaseModel):
