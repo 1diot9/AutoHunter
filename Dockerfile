@@ -96,7 +96,8 @@ COPY --from=frontend /web/dist /app/web/dist
 # 工作区 + 数据目录（数据目录建议挂卷持久化）
 RUN mkdir -p /work /app/data
 ENV WORKER_WORK_ROOT=/work \
-    DB_PATH=/app/data/autohunter.db
+    DB_PATH=/app/data/autohunter.db \
+    USAGE_DB_PATH=/app/data/autohunter-usage.db
 
 EXPOSE 18800
 

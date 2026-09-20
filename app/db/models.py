@@ -374,10 +374,10 @@ class SystemSettings(Base):
 
 
 class TokenUsageDaily(Base):
-    """按天聚合的 Token 用量持久化表（CST 日期 + 任务 + 模型维度）。
+    """按天聚合的 Token 用量（CST 日期 + 任务 + 模型）。
 
-    每次 LLM 调用后增量 upsert，进程重启不丢数据。
-    成本在查询时按 pricing 配置实时计算，不预存——用户改单价后历史成本自动重算。
+    实际读写走独立计量库 autohunter-usage.db（见 app.llm.usage），
+    不再写入主库，避免和 worker 抢 SQLite 写锁。本模型仅保留 schema 说明。
     """
     __tablename__ = "token_usage_daily"
     __table_args__ = (

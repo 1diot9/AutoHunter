@@ -52,31 +52,33 @@ def test_host_is_checked_skip_only_does_not_count():
 
 def test_usage_persists_and_hydrates(tmp_path, monkeypatch):
     db = tmp_path / "ah.db"
-    con = sqlite3.connect(db)
-    con.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, runtime_stats TEXT)")
-    con.execute("INSERT INTO tasks (id, runtime_stats) VALUES ('t1', '{}')")
-    con.commit()
-    con.close()
+    sqlite3.connect(db).close()
 
     import app.db.session as session_mod
-    monkeypatch.setattr(session_mod, "DB_PATH", db)
+    monkeypatch.setattr(session_mod, "DB_PATH", str(db))
 
+    usage.reset_usage_db_conn()
     usage._USAGE.clear()
+    usage._FLUSHED.clear()
     usage._DIRTY.clear()
     usage.record_usage("t1", "demo-model", prompt_tokens=10, completion_tokens=5, total_tokens=15)
     usage.persist_usage("t1")
 
-    raw = sqlite3.connect(db).execute("SELECT runtime_stats FROM tasks WHERE id='t1'").fetchone()[0]
-    saved = json.loads(raw)
-    assert saved["llm"]["total_tokens"] == 15
-    assert saved["llm"]["requests"] == 1
-    assert saved["llm"]["model"] == "demo-model"
+    usage_path = db.with_name("ah-usage.db")
+    assert usage_path.is_file()
+    row = sqlite3.connect(usage_path).execute(
+        "SELECT prompt_tokens, completion_tokens, requests, model FROM token_usage_daily WHERE task_id='t1'"
+    ).fetchone()
+    assert row == (10, 5, 1, "demo-model")
 
     usage._USAGE.clear()
+    usage._FLUSHED.clear()
     usage._DIRTY.clear()
-    snap = usage.usage_snapshot("t1", persisted=saved["llm"])
+    snap = usage.usage_snapshot("t1")
     assert snap["total_tokens"] == 15
     assert snap["requests"] == 1
+    by_model = usage.usage_snapshot_by_model("t1")
+    assert by_model[0]["model"] == "demo-model"
 
 
 def test_engine_meter_persists_and_hydrates(tmp_path, monkeypatch):
@@ -107,6 +109,89 @@ def test_engine_meter_persists_and_hydrates(tmp_path, monkeypatch):
     snap = meter.engine_snapshot("t1", persisted=saved["engine"])
     assert snap["count"] == 2
     assert snap["last_engine"] == "fofa"
+
+
+def test_token_usage_does_not_write_main_db(tmp_path, monkeypatch):
+    main = tmp_path / "autohunter.db"
+    sqlite3.connect(main).close()
+
+    import app.db.session as session_mod
+    monkeypatch.setattr(session_mod, "DB_PATH", str(main))
+    usage.reset_usage_db_conn()
+    usage._USAGE.clear()
+    usage._FLUSHED.clear()
+    usage._DIRTY.clear()
+    usage._LAST_FLUSH = 0.0
+    usage.record_usage("t1", "glm-5.3", prompt_tokens=20, completion_tokens=4, total_tokens=24)
+    assert usage.flush_dirty_usage(force=True)
+
+    main_tables = {
+        r[0] for r in sqlite3.connect(main).execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    assert "token_usage_daily" not in main_tables
+    usage_path = main.with_name("autohunter-usage.db")
+    n = sqlite3.connect(usage_path).execute(
+        "SELECT SUM(requests) FROM token_usage_daily"
+    ).fetchone()[0]
+    assert n == 1
+
+
+def test_token_usage_migrates_from_main_db(tmp_path, monkeypatch):
+    main = tmp_path / "autohunter.db"
+    con = sqlite3.connect(main)
+    con.execute("""
+        CREATE TABLE token_usage_daily (
+            date TEXT, task_id TEXT, model TEXT,
+            prompt_tokens INTEGER, completion_tokens INTEGER,
+            cache_hit_tokens INTEGER, cache_miss_tokens INTEGER, requests INTEGER
+        )
+    """)
+    con.execute(
+        "INSERT INTO token_usage_daily VALUES ('2026-09-18','t1','demo-model',100,20,10,90,3)"
+    )
+    con.commit()
+    con.close()
+
+    import app.db.session as session_mod
+    monkeypatch.setattr(session_mod, "DB_PATH", str(main))
+    usage.reset_usage_db_conn()
+    usage._USAGE.clear()
+    usage._FLUSHED.clear()
+    usage._DIRTY.clear()
+    snap = usage.usage_snapshot("t1")
+    assert snap["prompt_tokens"] == 100
+    assert snap["completion_tokens"] == 20
+    assert snap["requests"] == 3
+    rows = usage.query_usage_by_date("2026-09-18")
+    assert rows and rows[0][5] == 3
+
+
+def test_unflushed_delta_added_to_db_snapshot(tmp_path, monkeypatch):
+    """SQLite 锁导致刷盘失败时，读路径仍要把内存增量叠到已落库数据上。"""
+    db = tmp_path / "ah.db"
+    sqlite3.connect(db).close()
+
+    import app.db.session as session_mod
+    monkeypatch.setattr(session_mod, "DB_PATH", str(db))
+
+    usage.reset_usage_db_conn()
+    usage._USAGE.clear()
+    usage._FLUSHED.clear()
+    usage._DIRTY.clear()
+    usage._LAST_FLUSH = 0.0
+    usage.record_usage("t1", "demo-model", prompt_tokens=100, completion_tokens=10, total_tokens=110)
+    assert usage.flush_dirty_usage(force=True)
+
+    monkeypatch.setattr(usage, "flush_dirty_usage", lambda **_kw: False)
+    usage.record_usage("t1", "demo-model", prompt_tokens=50, completion_tokens=5, total_tokens=55)
+    snap = usage.usage_snapshot("t1")
+    assert snap["prompt_tokens"] == 150
+    assert snap["completion_tokens"] == 15
+    assert snap["requests"] == 2
+    pending = usage.pending_deltas()
+    assert pending and pending[0][2]["prompt_tokens"] == 50
 
 
 def test_list_hosts_uses_light_columns():

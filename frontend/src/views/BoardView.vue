@@ -1011,9 +1011,9 @@ async function loadBoard(opts = {}) {
       if (b.stats) task.value.stats = b.stats;
       if (b.fofa_config) task.value.fofa_config = b.fofa_config;
       if (b.model_config_data) task.value.model_config_data = b.model_config_data;
-      if (b.llm_usage) task.value.llm_usage = b.llm_usage;
-      if (b.llm_usage_by_model) task.value.llm_usage_by_model = b.llm_usage_by_model;
-      if (b.engine_usage) task.value.engine_usage = b.engine_usage;
+      if (b.llm_usage != null) task.value.llm_usage = b.llm_usage;
+      if (Array.isArray(b.llm_usage_by_model)) task.value.llm_usage_by_model = b.llm_usage_by_model;
+      if (b.engine_usage != null) task.value.engine_usage = b.engine_usage;
     }
   } finally {
     if (id === props.id) boardReady.value = true;

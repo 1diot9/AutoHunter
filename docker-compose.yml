@@ -16,6 +16,7 @@ services:
       - .env
     environment:
       - DB_PATH=/app/data/autohunter.db
+      - USAGE_DB_PATH=/app/data/autohunter-usage.db
       - WORKER_WORK_ROOT=/work
     volumes:
       - ./data:/app/data       # SQLite + 证据持久化（bind mount，数据在项目 data/ 目录）

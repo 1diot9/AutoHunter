@@ -100,6 +100,26 @@ class ParseCompletionUsageTests(unittest.TestCase):
         self.assertEqual(out["cache_hit_tokens"], 0)
         self.assertEqual(out["cache_miss_tokens"], 0)
 
+    def test_model_dump_nones_fall_back_to_attributes(self):
+        from app.llm.client import parse_completion_usage
+
+        class DumpNoneUsage:
+            prompt_tokens = 120
+            completion_tokens = 9
+            total_tokens = 129
+
+            def model_dump(self):
+                return {
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                }
+
+        out = parse_completion_usage(DumpNoneUsage())
+        self.assertEqual(out["prompt_tokens"], 120)
+        self.assertEqual(out["completion_tokens"], 9)
+        self.assertEqual(out["total_tokens"], 129)
+
 
 class SnapshotReconcileTests(unittest.TestCase):
     def test_apply_cache_reconcile_fixes_old_rows(self):

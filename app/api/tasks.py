@@ -30,7 +30,7 @@ from app.api.findings import (
     _sanitize_assistant_messages,
 )
 from app.agents import collector, site_collab
-from app.agents.deepen import DEEPEN_CAP, clamp_deepen_cap
+from app.agents.deepen import clamp_deepen_cap, deepen_cap_for
 from app.agents.manual_targets import clean_manual_target_list
 from app.agents.prompts import normalize_src_type
 from app.db.models import Finding, Killsweep, Review, Target, Task, TaskEvent, to_cst_iso
@@ -377,6 +377,20 @@ def _runtime_parts(task: Task) -> tuple[dict, dict]:
     llm = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
     engine = raw.get("engine") if isinstance(raw.get("engine"), dict) else {}
     return llm, engine
+
+
+def _board_runtime_usage(task: Task, observer: bool) -> dict:
+    """看板 Token / 测绘次数。sqlite 聚合，比 _compute_stats 便宜，light 轮询也要带上。"""
+    if observer:
+        return {"llm_usage": {}, "llm_usage_by_model": [], "engine_usage": {}}
+    persisted_llm, persisted_engine = _runtime_parts(task)
+    return {
+        "llm_usage": usage_snapshot(
+            task.id, resolve_llm_config(task).model, persisted=persisted_llm,
+        ),
+        "llm_usage_by_model": _llm_usage_by_model_with_cost(task.id),
+        "engine_usage": engine_snapshot(task.id, persisted=persisted_engine),
+    }
 
 
 def _public_fofa_config(task: Task) -> dict:
@@ -1272,7 +1286,7 @@ async def task_board(
 
     活动流默认不随看板轮询下发（避免每次刷新扫 task_events）。
     历史事件走 GET /events 分页；需要兼容旧前端时传 include_events=1。
-    light=1：供前端轮询，跳过 _compute_stats / usage / site_collab（stats 已由 getTask 带上）。
+    light=1：供前端轮询，跳过 _compute_stats / site_collab；Token 与测绘次数仍返回。
     """
     task = await session.get(Task, task_id)
     if not task:
@@ -1344,6 +1358,7 @@ async def task_board(
             "fofa_config": _observer_fofa_config() if observer else _public_fofa_config(task),
             "retest_summary": retest_summary,
             "light": True,
+            **_board_runtime_usage(task, observer),
         }
 
     stats = await _compute_stats(session, task_id)
@@ -1370,13 +1385,7 @@ async def task_board(
         "stats": stats.model_dump(),
         "fofa_config": _observer_fofa_config() if observer else _public_fofa_config(task),
         "model_config_data": _observer_model_config() if observer else _public_model_config(task),
-        "llm_usage": {} if observer else usage_snapshot(
-            task.id, resolve_llm_config(task).model, persisted=_runtime_parts(task)[0],
-        ),
-        "llm_usage_by_model": [] if observer else _llm_usage_by_model_with_cost(task.id),
-        "engine_usage": {} if observer else engine_snapshot(
-            task.id, persisted=_runtime_parts(task)[1],
-        ),
+        **_board_runtime_usage(task, observer),
         "events": events,
         "site_collab": site_overview,
         "retest_summary": retest_summary,
@@ -1914,9 +1923,9 @@ async def reset_failed_targets(task_id: str, request: Request,
         reason = (tgt.dead_reason or "")
         if not any(p in reason for p in _FAILED_DEAD_PATTERNS):
             continue
-        # 已达深挖上限的目标不重置：深挖 2 次仍无果说明攻击面已穷尽，
+        # 已达深挖上限的目标不重置：深挖多次仍无果说明攻击面已穷尽，
         # 重置只是浪费 token。
-        if (tgt.deepen_count or 0) >= DEEPEN_CAP:
+        if (tgt.deepen_count or 0) >= deepen_cap_for(task):
             skipped_deepcapped += 1
             continue
         tgt.status = "queued"

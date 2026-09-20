@@ -16,6 +16,9 @@ class TestUsageByTaskModel(unittest.TestCase):
     def test_batch_groups_by_task(self):
         from app.llm import usage as u
 
+        u._USAGE.clear()
+        u._FLUSHED.clear()
+        u._DIRTY.clear()
         fake_rows = [
             ("t1", "m1", 10, 5, 1, 0, 2),
             ("t1", "m2", 20, 10, 0, 0, 3),
@@ -108,6 +111,18 @@ class TestHeartbeatBatch(unittest.TestCase):
 
         asyncio.run(_run())
         self.assertEqual(runner._heartbeat_marks, {})
+
+
+class TestLightBoardKeepsUsage(unittest.TestCase):
+    def test_light_board_still_returns_token_usage(self):
+        """light 轮询跳过 stats，但不能把 Token/成本一起跳掉，否则看板计费会冻住。"""
+        text = (ROOT / "app/api/tasks.py").read_text(encoding="utf-8")
+        light_fn = text.split("if light:", 1)[1].split("stats = await _compute_stats", 1)[0]
+        self.assertIn("_board_runtime_usage", light_fn)
+        helper = text.split("def _board_runtime_usage", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("llm_usage", helper)
+        self.assertIn("llm_usage_by_model", helper)
+        self.assertIn("engine_usage", helper)
 
 
 if __name__ == "__main__":

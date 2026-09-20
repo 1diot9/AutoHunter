@@ -1,6 +1,7 @@
 """异步数据库会话管理（SQLite + aiosqlite）。"""
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import AsyncGenerator
@@ -15,6 +16,11 @@ Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
+# Windows 绑定挂载 + WAL 下 SQLITE_BUSY 很常见；timeout 传给底层 sqlite3.connect，
+# 与 PRAGMA busy_timeout 一起决定等锁多久而不是立刻炸 worker。
+_SQLITE_CONNECT_ARGS = {"timeout": 30}
+_SQLITE_BUSY_TIMEOUT_MS = 30000
+
 # aiosqlite 默认 NullPool，不接受 pool_size/max_overflow；用 StaticPool 复用同连接，
 # 或省略池参数。SQLite 文件级锁仍是瓶颈，连接数本身开销极低。
 try:
@@ -23,10 +29,14 @@ try:
         pool_size=30,
         max_overflow=60,
         pool_timeout=60,
+        connect_args=_SQLITE_CONNECT_ARGS,
     )
 except TypeError:
     # SQLAlchemy 2.0+ 对 sqlite+aiosqlite 强制 NullPool 时会拒收 pool_* 参数
-    engine = create_async_engine(DATABASE_URL, echo=False, future=True)
+    engine = create_async_engine(
+        DATABASE_URL, echo=False, future=True,
+        connect_args=_SQLITE_CONNECT_ARGS,
+    )
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # 每条物理连接建立时统一设置 PRAGMA（init_db 的一次性 PRAGMA 只作用于建库那条连接，
@@ -34,7 +44,7 @@ SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=
 # 一遇写锁立刻 SQLITE_BUSY）。24x7 下 orchestrator 写事件 + N 个 heartbeat +
 # API 读 + worker 落库高并发，这几项是缓解锁竞争性价比最高的优化。
 _CONNECT_PRAGMAS = (
-    "PRAGMA busy_timeout=15000;",         # 写锁最多等 15s 再报错，吸收高并发竞争
+    f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS};",  # 写锁最多等 30s 再报错
     "PRAGMA synchronous=NORMAL;",         # WAL 下安全，显著降低写延迟
     "PRAGMA foreign_keys=ON;",
     "PRAGMA cache_size=-16000;",          # 约 16MB page cache；每条连接一份，不能再开 64MB
@@ -42,6 +52,39 @@ _CONNECT_PRAGMAS = (
     "PRAGMA temp_store=MEMORY;",          # ORDER BY/GROUP BY 临时表走内存
     "PRAGMA wal_autocheckpoint=1000;",
 )
+
+
+def is_sqlite_lock_error(exc: BaseException | None) -> bool:
+    """识别 SQLITE_BUSY / database is locked（含 SQLAlchemy autoflush 包装）。"""
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        msg = str(cur).lower()
+        if "database is locked" in msg or "database is busy" in msg:
+            return True
+        if "sqlite" in msg and "locked" in msg:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+async def commit_with_retry(session, *, attempts: int = 8, base_delay: float = 0.05) -> None:
+    """COMMIT 遇写锁时指数退避重试。SQLite BUSY 时事务仍在，不要先 rollback。"""
+    last: BaseException | None = None
+    for i in range(max(1, attempts)):
+        try:
+            await session.commit()
+            return
+        except Exception as e:
+            if not is_sqlite_lock_error(e):
+                raise
+            last = e
+            if i >= attempts - 1:
+                break
+            await asyncio.sleep(base_delay * (2 ** min(i, 6)))
+    if last is not None:
+        raise last
 
 
 @event.listens_for(engine.sync_engine, "connect")

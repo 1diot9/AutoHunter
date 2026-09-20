@@ -8,12 +8,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Finding, Killsweep, Review
 from app.db.session import engine, get_session
-from app.llm.usage import apply_cache_reconcile
+from app.llm.usage import apply_cache_reconcile, pending_deltas, query_usage_by_date, query_usage_date_range
 from app.settings_service import resolve_pricing
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
@@ -186,13 +186,30 @@ async def daily_stats(
     )
     archived_task_ids = [r[0] for r in (await session.execute(archived_tasks_q)).all() if r[0]]
 
-    token_q = text(
-        "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cache_hit_tokens), "
-        "SUM(cache_miss_tokens), SUM(requests) "
-        "FROM token_usage_daily WHERE date = :date GROUP BY model"
-    )
-    token_rows = (await session.execute(token_q, {"date": date})).all()
+    token_rows = query_usage_by_date(date)
     pricing_config = resolve_pricing()
+    token_by_model: dict[str, dict] = {}
+    today = datetime.now(CST).strftime("%Y-%m-%d")
+    for row in token_rows:
+        model, pt, ct, cht, cmt, req = row
+        token_by_model[model or ""] = {
+            "prompt_tokens": pt or 0,
+            "completion_tokens": ct or 0,
+            "cache_hit_tokens": cht or 0,
+            "cache_miss_tokens": cmt or 0,
+            "requests": req or 0,
+        }
+    if date == today:
+        for _tid, mdl, delta in pending_deltas():
+            row = token_by_model.setdefault(mdl or "", {
+                "prompt_tokens": 0, "completion_tokens": 0,
+                "cache_hit_tokens": 0, "cache_miss_tokens": 0, "requests": 0,
+            })
+            row["prompt_tokens"] += delta.get("prompt_tokens", 0)
+            row["completion_tokens"] += delta.get("completion_tokens", 0)
+            row["cache_hit_tokens"] += delta.get("cache_hit_tokens", 0)
+            row["cache_miss_tokens"] += delta.get("cache_miss_tokens", 0)
+            row["requests"] += delta.get("requests", 0)
 
     by_model = []
     total_cost = 0.0
@@ -200,18 +217,18 @@ async def daily_stats(
     total_completion = 0
     total_cache_hit = 0
     total_requests = 0
-    for row in token_rows:
-        model, pt, ct, cht, cmt, req = row
+    for model, raw in token_by_model.items():
         usage_row = apply_cache_reconcile({
-            "prompt_tokens": pt or 0,
-            "completion_tokens": ct or 0,
-            "cache_hit_tokens": cht or 0,
-            "cache_miss_tokens": cmt or 0,
+            "prompt_tokens": raw["prompt_tokens"],
+            "completion_tokens": raw["completion_tokens"],
+            "cache_hit_tokens": raw["cache_hit_tokens"],
+            "cache_miss_tokens": raw["cache_miss_tokens"],
         })
         pt = usage_row["prompt_tokens"]
         ct = usage_row["completion_tokens"]
         cht = usage_row["cache_hit_tokens"]
         cmt = usage_row["cache_miss_tokens"]
+        req = raw["requests"]
         pricing = pricing_config.get(model, {}) if model else {}
         cost = _calc_cost(pt, ct, cht, pricing)
         by_model.append({
@@ -324,15 +341,7 @@ async def daily_overview(
     except (ValueError, IndexError):
         return {"month": month, "days": []}
 
-    token_model_q = text(
-        "SELECT date, model, prompt_tokens, completion_tokens, cache_hit_tokens "
-        "FROM token_usage_daily "
-        "WHERE date >= :start AND date < :end"
-    )
-    token_model_rows = (await session.execute(token_model_q, {
-        "start": month_start,
-        "end": month_end,
-    })).all()
+    token_model_rows = query_usage_date_range(month_start, month_end)
 
     cost_by_day: dict[str, float] = {}
     requests_by_day: dict[str, int] = {}
@@ -342,6 +351,23 @@ async def daily_overview(
         cost = _calc_cost(pt, ct, cht, pricing)
         cost_by_day[d] = round(cost_by_day.get(d, 0) + cost, 4)
         requests_by_day[d] = requests_by_day.get(d, 0) + 1
+
+    today = datetime.now(CST).strftime("%Y-%m-%d")
+    if month_start <= today < month_end:
+        pending_by_model: dict[str, dict[str, int]] = {}
+        for _tid, mdl, delta in pending_deltas():
+            row = pending_by_model.setdefault(mdl or "", {
+                "prompt_tokens": 0, "completion_tokens": 0, "cache_hit_tokens": 0, "requests": 0,
+            })
+            row["prompt_tokens"] += delta.get("prompt_tokens", 0)
+            row["completion_tokens"] += delta.get("completion_tokens", 0)
+            row["cache_hit_tokens"] += delta.get("cache_hit_tokens", 0)
+            row["requests"] += delta.get("requests", 0)
+        for model, raw in pending_by_model.items():
+            pricing = pricing_config.get(model, {}) if model else {}
+            cost = _calc_cost(raw["prompt_tokens"], raw["completion_tokens"], raw["cache_hit_tokens"], pricing)
+            cost_by_day[today] = round(cost_by_day.get(today, 0) + cost, 4)
+            requests_by_day[today] = requests_by_day.get(today, 0) + raw["requests"]
 
     all_dates = set(findings_by_day.keys()) | set(accepted_by_day.keys()) | set(submitted_by_day.keys()) | set(cost_by_day.keys())
     days = []

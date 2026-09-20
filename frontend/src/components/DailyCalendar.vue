@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, watch } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import { api, authReadyRef, loadAuthRole } from "../api.js";
 
 const props = defineProps({
@@ -20,6 +20,7 @@ const overview = ref({ month: "", days: [] });
 const detail = ref(null);
 const loadingOverview = ref(false);
 const loadingDetail = ref(false);
+let calendarPoll = null;
 
 // 统计卡片定义：category -> { label, cssClass, path }
 // count 取值路径：user_reviews.* 或顶层字段（killsweep/archived）
@@ -173,25 +174,27 @@ function goToday() {
   loadDetail(selectedDate.value);
 }
 
-async function loadOverview() {
-  loadingOverview.value = true;
+async function loadOverview(opts = {}) {
+  const background = !!opts.background;
+  if (!background) loadingOverview.value = true;
   try {
     overview.value = await api.dailyOverview(_monthStr(viewYear.value, viewMonth.value));
   } catch (e) {
-    overview.value = { month: "", days: [] };
+    if (!background) overview.value = { month: "", days: [] };
   } finally {
-    loadingOverview.value = false;
+    if (!background) loadingOverview.value = false;
   }
 }
 
-async function loadDetail(date) {
-  loadingDetail.value = true;
+async function loadDetail(date, opts = {}) {
+  const background = !!opts.background;
+  if (!background) loadingDetail.value = true;
   try {
     detail.value = await api.dailyStats(date);
   } catch (e) {
-    detail.value = null;
+    if (!background) detail.value = null;
   } finally {
-    loadingDetail.value = false;
+    if (!background) loadingDetail.value = false;
   }
 }
 
@@ -228,9 +231,23 @@ function formatCacheHitLabel(hit, miss, prompt) {
 
 watch([viewYear, viewMonth], () => loadOverview());
 
+function syncCalendarPoll() {
+  if (calendarPoll) clearInterval(calendarPoll);
+  calendarPoll = setInterval(() => {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    loadOverview({ background: true });
+    if (selectedDate.value) loadDetail(selectedDate.value, { background: true });
+  }, 15000);
+}
+
 onMounted(async () => {
   if (!authReadyRef.value) await loadAuthRole();
   await Promise.all([loadOverview(), loadDetail(selectedDate.value)]);
+  syncCalendarPoll();
+});
+onUnmounted(() => {
+  if (calendarPoll) clearInterval(calendarPoll);
+  calendarPoll = null;
 });
 </script>
 

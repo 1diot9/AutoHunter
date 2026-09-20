@@ -15,6 +15,7 @@ import subprocess
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from sqlalchemy import func, select, update
@@ -40,7 +41,7 @@ from app.agent_runtime import (
     agent_semaphore, shutdown_agent_executor,
 )
 from app.db.models import CST, Finding, Killsweep, Review, Target, Task, TaskEvent
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal, commit_with_retry, is_sqlite_lock_error
 from app.events import bus
 from app.maintenance.cleanup import TRACE_FINE_KINDS, prune_target_traces
 from app.engines.meter import persist_engine_usage
@@ -495,6 +496,8 @@ class TaskRunner:
         # 事件落库缓冲：WS 立即推送，DB 批量 commit
         self._event_buffer: list[TaskEvent] = []
         self._event_flush_task: asyncio.Task | None = None
+        # runtime_stats / token 刷盘节流，避免每 tick 另开 sqlite3 连接抢写锁
+        self._last_runtime_stats_flush: float = 0.0
 
     def live_workers(self) -> list[dict]:
         return list(self._live.values())
@@ -655,7 +658,7 @@ class TaskRunner:
         try:
             async with SessionLocal() as session:
                 session.add_all(batch)
-                await session.commit()
+                await commit_with_retry(session)
         except Exception:
             logger.debug(
                 "TaskRunner[%s] event buffer flush failed n=%d",
@@ -1053,7 +1056,11 @@ class TaskRunner:
             self._flush_runtime_stats()
 
     def _flush_runtime_stats(self) -> None:
-        persist_usage(self.task_id)
+        now = monotonic()
+        if now - self._last_runtime_stats_flush < 5.0:
+            return
+        self._last_runtime_stats_flush = now
+        persist_usage(self.task_id, force=False)
         persist_engine_usage(self.task_id)
 
     async def _count(self, session: AsyncSession, status: str) -> int:
@@ -1146,7 +1153,7 @@ class TaskRunner:
             reason = (tgt.dead_reason or "")
             if not any(p in reason for p in self._RETEST_DEAD_PATTERNS):
                 continue
-            if (tgt.deepen_count or 0) >= DEEPEN_CAP:
+            if (tgt.deepen_count or 0) >= deepen_cap_for(task):
                 continue
             eligible.append(tgt.id)
 
@@ -2603,13 +2610,17 @@ class TaskRunner:
             # 而不是让协程静默死亡、目标永远虚挂 scanning 直到被 reclaim 回队空转。
             summary = self._summarize_exc(e)
             host_hint = (url or "").split("://")[-1].rstrip("/")[:60]
+            self._live.pop(target_id, None)
+            self._worker_last_activity.pop(target_id, None)
+            self._worker_cancel_events.pop(target_id, None)
+            if is_sqlite_lock_error(e) or "database is locked" in summary.lower():
+                await self._requeue_after_sqlite_lock(task_id, target_id, url, e)
+                self._schedule_prune_target_traces(task_id, target_id)
+                return
             logger.warning(
                 "TaskRunner[%s] worker crashed target=%s host=%s:\n%s",
                 self.task_id, target_id[:8], host_hint, traceback.format_exc(),
             )
-            self._live.pop(target_id, None)
-            self._worker_last_activity.pop(target_id, None)
-            self._worker_cancel_events.pop(target_id, None)
             try:
                 async with SessionLocal() as s:
                     await self._log(s, "worker", "error",
@@ -2798,6 +2809,12 @@ class TaskRunner:
                     self._live[target_id]["playbook"] = plan.label
                 except Exception:
                     pass
+                if deepen_context:
+                    self._live[target_id]["mode"] = "deepen"
+                    self._live[target_id]["action"] = "🔁 定向深挖启动中…"
+                # 先把 scanning 落盘。脏 Target 上再 SELECT 会 Query-invoked autoflush，
+                # Windows 绑定挂载 SQLite 一忙就 database is locked，worker 被打成异常退出。
+                await commit_with_retry(session)
                 # 触发式检索全局情报库：按 root 域 + 系统指纹命中才注入（不冗余）。
                 try:
                     root = target_cluster.root_domain(tgt.host or "")
@@ -2830,11 +2847,8 @@ class TaskRunner:
                         self._live[target_id]["action"] = f"协作路线：{route.label}"
                 except Exception:
                     pass
-                if deepen_context:
-                    self._live[target_id]["mode"] = "deepen"
-                    self._live[target_id]["action"] = "🔁 定向深挖启动中…"
-                duplicate_history = await self._build_duplicate_history(session, task_id, tgt)
-                await session.commit()
+                with session.no_autoflush:
+                    duplicate_history = await self._build_duplicate_history(session, task_id, tgt)
             llm = _llm_for_task(
                 task_obj,
                 on_provider_failure=self._provider_failure_callback(
@@ -3059,7 +3073,8 @@ class TaskRunner:
             worker_id = tgt.assigned_worker
             saved = 0
             for f in findings:
-                duplicate = await self._find_existing_duplicate(session, target_ref, f)
+                with session.no_autoflush:
+                    duplicate = await self._find_existing_duplicate(session, target_ref, f)
                 if duplicate:
                     continue
                 dedup_key = dedup.dedup_key(target_ref, f)
@@ -3083,7 +3098,7 @@ class TaskRunner:
                 except IntegrityError:
                     continue
             if saved:
-                await session.commit()
+                await commit_with_retry(session)
                 await self._log(session, "orchestrator", "salvage",
                                 f"被取消的 worker 抢救落库 {saved} 个漏洞（目标 {target_id[:8]}）",
                                 level="warn", target_id=target_id, saved=saved)
@@ -3121,7 +3136,7 @@ class TaskRunner:
                     message=msg[:500],
                     payload={"target_id": target_id, "host": tgt.host, **safe},
                 ))
-                await session.commit()
+                await commit_with_retry(session)
         except Exception:
             logger.warning("persist_auth_status failed target=%s", target_id[:8], exc_info=True)
 
@@ -3134,48 +3149,60 @@ class TaskRunner:
         """
         if not f:
             return
-        try:
-            async with SessionLocal() as session:
-                tgt = await session.get(Target, target_id)
-                if not tgt:
+        last_exc: BaseException | None = None
+        for attempt in range(6):
+            try:
+                async with SessionLocal() as session:
+                    tgt = await session.get(Target, target_id)
+                    if not tgt:
+                        return
+                    target_ref = tgt.url or tgt.host
+                    worker_id = tgt.assigned_worker
+                    with session.no_autoflush:
+                        duplicate = await self._find_existing_duplicate(session, target_ref, f)
+                    if duplicate:
+                        return
+                    dedup_key = dedup.dedup_key(target_ref, f)
+                    llm_fields = self._finding_llm_fields(
+                        model=f.get("_llm_model") or f.get("llm_model") or "",
+                        base_url=f.get("_llm_base_url") or f.get("llm_base_url") or "",
+                    )
+                    if not llm_fields["llm_model"] and not llm_fields["llm_base_url"]:
+                        llm_fields = self._live_llm_fields(target_id)
+                    try:
+                        async with session.begin_nested():
+                            session.add(Finding(
+                                task_id=task_id, target_id=target_id, worker_id=worker_id,
+                                vuln_type=f.get("vuln_type", ""), title=f.get("title", ""),
+                                severity_claimed=f.get("severity_claimed", ""),
+                                target_url=f.get("target_url", ""), owner=f.get("owner", ""),
+                                description=f.get("description", ""), steps=f.get("steps", []),
+                                poc=f.get("poc", ""), raw_request=f.get("raw_request", ""),
+                                raw_response=f.get("raw_response", ""), evidence=f.get("evidence", {}),
+                                affected_scope=f.get("affected_scope", ""),
+                                kill_chain=f.get("kill_chain", []),
+                                self_check=f.get("self_check", {}),
+                                dedup_key=dedup_key, status="pending_review",
+                                **llm_fields,
+                            ))
+                        await commit_with_retry(session)
+                    except IntegrityError:
+                        return
+                    logger.info("[realtime_persist] target=%s title=%s model=%s 实时落库成功",
+                                target_id[:8], (f.get("title") or "")[:40],
+                                llm_fields.get("llm_model") or "-")
                     return
-                target_ref = tgt.url or tgt.host
-                worker_id = tgt.assigned_worker
-                duplicate = await self._find_existing_duplicate(session, target_ref, f)
-                if duplicate:
-                    return
-                dedup_key = dedup.dedup_key(target_ref, f)
-                llm_fields = self._finding_llm_fields(
-                    model=f.get("_llm_model") or f.get("llm_model") or "",
-                    base_url=f.get("_llm_base_url") or f.get("llm_base_url") or "",
-                )
-                if not llm_fields["llm_model"] and not llm_fields["llm_base_url"]:
-                    llm_fields = self._live_llm_fields(target_id)
-                try:
-                    async with session.begin_nested():
-                        session.add(Finding(
-                            task_id=task_id, target_id=target_id, worker_id=worker_id,
-                            vuln_type=f.get("vuln_type", ""), title=f.get("title", ""),
-                            severity_claimed=f.get("severity_claimed", ""),
-                            target_url=f.get("target_url", ""), owner=f.get("owner", ""),
-                            description=f.get("description", ""), steps=f.get("steps", []),
-                            poc=f.get("poc", ""), raw_request=f.get("raw_request", ""),
-                            raw_response=f.get("raw_response", ""), evidence=f.get("evidence", {}),
-                            affected_scope=f.get("affected_scope", ""),
-                            kill_chain=f.get("kill_chain", []),
-                            self_check=f.get("self_check", {}),
-                            dedup_key=dedup_key, status="pending_review",
-                            **llm_fields,
-                        ))
-                    await session.commit()
-                except IntegrityError:
-                    return
-                logger.info("[realtime_persist] target=%s title=%s model=%s 实时落库成功",
-                            target_id[:8], (f.get("title") or "")[:40],
-                            llm_fields.get("llm_model") or "-")
-        except Exception:
+            except Exception as e:
+                last_exc = e
+                if not is_sqlite_lock_error(e) or attempt >= 5:
+                    break
+                await asyncio.sleep(0.05 * (2 ** attempt))
+        if last_exc is not None and is_sqlite_lock_error(last_exc):
+            logger.warning("[realtime_persist] target=%s 实时落库遇写锁（整轮 result 仍会兜底）",
+                           target_id[:8])
+        elif last_exc is not None:
             logger.warning("[realtime_persist] target=%s 实时落库失败（整轮 result 仍会兜底）",
-                            target_id[:8], exc_info=True)
+                           target_id[:8], exc_info=last_exc)
 
     async def _heartbeat_target(self, target_id: str) -> None:
         """内存标记心跳；由 flusher 批量 UPDATE，避免每 worker 单独 commit。"""
@@ -3225,7 +3252,7 @@ class TaskRunner:
                     )
                     .values(heartbeat_at=ts)
                 )
-                await session.commit()
+                await commit_with_retry(session)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -3399,7 +3426,8 @@ class TaskRunner:
 
             # 落 Finding（含漏洞级去重；DB 唯一索引兜底，逐条 savepoint 容错并发重复）
             for f in findings:
-                duplicate = await self._find_existing_duplicate(session, target_ref, f)
+                with session.no_autoflush:
+                    duplicate = await self._find_existing_duplicate(session, target_ref, f)
                 if duplicate:
                     continue
                 dedup_key = dedup.dedup_key(target_ref, f)
@@ -3677,7 +3705,7 @@ class TaskRunner:
             produced_new_finding = (verdict == Verdict.found.value) or bool(findings)
             if tgt.status == "dead" and not produced_new_finding:
                 revived_origin_fid = await self._revive_deepen_origin(session, tgt)
-            await session.commit()
+            await commit_with_retry(session)
             if auto_deepen_info:
                 host, dc, lead = auto_deepen_info
                 await self._log(session, "worker", "auto_deepen",
@@ -3790,9 +3818,41 @@ class TaskRunner:
             "rounds_done": int(resume.get("rounds_done") or 0),
         }
 
+    async def _requeue_after_sqlite_lock(
+        self, task_id: str, target_id: str, url: str, exc: BaseException
+    ) -> None:
+        """SQLite 写锁是瞬时故障：目标回队，不要打成 error 终态。"""
+        summary = self._summarize_exc(exc)
+        host_hint = (url or "").split("://")[-1].rstrip("/")[:60]
+        logger.warning(
+            "TaskRunner[%s] worker sqlite lock, requeue target=%s host=%s: %s",
+            self.task_id, target_id[:8], host_hint, summary,
+        )
+        try:
+            async with SessionLocal() as session:
+                tgt = await session.get(Target, target_id)
+                if tgt and tgt.status in ("scanning", "assigned"):
+                    tgt.status = "queued"
+                    tgt.assigned_worker = ""
+                    tgt.heartbeat_at = None
+                    tgt.last_error = "database is locked, requeued"
+                    await commit_with_retry(session)
+                await self._log(
+                    session, "worker", "target_requeued",
+                    f"SQLite 写锁冲突，目标回队重试（{host_hint}）",
+                    level="warn", target_id=target_id, verdict="retry",
+                )
+        except Exception:
+            logger.warning(
+                "TaskRunner[%s] requeue after lock failed target=%s",
+                self.task_id, target_id[:8], exc_info=True,
+            )
+
     @staticmethod
     def _is_transient_worker_error(error: str) -> bool:
         text = (error or "").lower()
+        if "database is locked" in text or "database is busy" in text:
+            return True
         if not any(k in text for k in ("llm 调用失败", "llm 请求", "llm 网络", "llm 上游", "llm 端点")):
             return False
         if TaskRunner._is_quota_error(error):

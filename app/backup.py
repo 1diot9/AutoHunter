@@ -6,6 +6,7 @@
 归档格式（迁移用 tar.gz）：
   manifest.json
   db/autohunter.db
+  db/autohunter-usage.db   # 可选，Token 计量独立库
   work/...                 # 仅 include_work=True
 
 服务器本地快照只留一份压缩文件：{db_dir}/backups/autohunter-latest.db.gz
@@ -361,6 +362,19 @@ def create_archive(dest: str | Path, include_work: bool = False) -> dict[str, An
             info.size = len(payload)
             tar.addfile(info, fileobj=io.BytesIO(payload))
             tar.add(tmp_db, arcname="db/autohunter.db")
+            usage_live = None
+            try:
+                from app.llm.usage import usage_db_path
+                usage_live = Path(usage_db_path())
+            except Exception:
+                usage_live = None
+            if usage_live is not None and usage_live.is_file() and usage_live.resolve() != live.resolve():
+                tmp_usage = Path(td) / "autohunter-usage.db"
+                try:
+                    snapshot_sqlite(usage_live, tmp_usage)
+                    tar.add(tmp_usage, arcname="db/autohunter-usage.db")
+                except Exception as exc:
+                    logger.warning("Token 计量库未打进备份: %s", exc)
             if include_work and work_root is not None:
                 for p in _iter_work_files(work_root):
                     rel = p.relative_to(work_root).as_posix()
@@ -496,6 +510,24 @@ def restore_archive(
             with _op_lock:
                 assert_free_space(_file_size(extracted_db) * 2, live.parent, "恢复数据库")
                 _install_db(extracted_db, live)
+                try:
+                    usage_member = tar.getmember("db/autohunter-usage.db")
+                except KeyError:
+                    usage_member = None
+                if usage_member is not None and usage_member.isfile() and usage_member.size >= 100:
+                    src_usage = tar.extractfile(usage_member)
+                    if src_usage is not None:
+                        extracted_usage = td_path / "autohunter-usage.db"
+                        extracted_usage.write_bytes(src_usage.read())
+                        ok_u, msg_u = integrity_check(extracted_usage)
+                        if ok_u:
+                            try:
+                                from app.llm.usage import usage_db_path
+                                _install_db(extracted_usage, Path(usage_db_path()))
+                            except Exception as exc:
+                                logger.warning("Token 计量库恢复失败: %s", exc)
+                        else:
+                            logger.warning("备份中的计量库损坏，已跳过: %s", msg_u)
                 rotate_snapshots()
 
     return {
