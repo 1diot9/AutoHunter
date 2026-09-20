@@ -152,6 +152,29 @@ def _parse_cookie_header(raw: str) -> dict[str, str]:
     return out
 
 
+def _split_set_cookie(raw: str) -> tuple[str, str, str, str] | None:
+    """Parse a Set-Cookie value into (name, value, domain, path)."""
+    parts = [p.strip() for p in (raw or "").split(";") if p.strip()]
+    if not parts or "=" not in parts[0]:
+        return None
+    name, _, value = parts[0].partition("=")
+    name, value = name.strip(), value.strip()
+    if not name:
+        return None
+    domain = ""
+    path = "/"
+    for attr in parts[1:]:
+        if "=" not in attr:
+            continue
+        ak, _, av = attr.partition("=")
+        akl = ak.strip().lower()
+        if akl == "domain":
+            domain = av.strip()
+        elif akl == "path":
+            path = av.strip() or "/"
+    return name, value, domain, path
+
+
 def _pop_header(headers: dict[str, str], name: str) -> str:
     for k in list(headers.keys()):
         if k.lower() == name.lower():
@@ -584,7 +607,11 @@ class ToolExecutor:
         # 原始请求行（取证/格式参考）。响应报文不再单独回传：状态码 + response_headers +
         # body 已结构化提供，raw_response 会与它们 100% 重复，是当轮就纯冗余的双份大文本。
         # 模型 submit_finding 时按 prompt 规范从 body 自行裁剪取证，不依赖这份 raw_response。
-        raw_req = self._raw_request(req, data, json_body)
+        # multipart/files 是流式 body，send 后不能再 req.content；dump 失败也不能把已成功的请求打成工具异常。
+        try:
+            raw_req = self._raw_request(req, data, json_body, files_norm)
+        except Exception:
+            raw_req = f"{method.upper()} {url}"
 
         result = {
             "ok": True,
@@ -682,7 +709,7 @@ class ToolExecutor:
             return {"ok": False, "error": "代理模式未启用或无可用代理", "url": url}
 
         headers = _normalize_headers(headers)
-        merged_headers, session_applied = self._apply_session(headers)
+        merged_headers, session_applied = self._apply_session(headers, url)
 
         # 请求体序列化
         body_data: Optional[str] = None
@@ -772,7 +799,10 @@ class ToolExecutor:
             self._mark_proxy_healthy(srv)
             self._proxy_server_idx = (servers.index(srv) + 1) % len(servers)
 
-            resp_headers, redirect_chain, session_updated = self._parse_proxy_headers(err)
+            try:
+                resp_headers, redirect_chain, session_updated = self._parse_proxy_headers(err, url)
+            except Exception:
+                resp_headers, redirect_chain, session_updated = {}, [], []
 
             # 截断响应体（与本地 http_request 一致的上限）
             truncated = False
@@ -866,7 +896,7 @@ class ToolExecutor:
         if h["failures"] >= _PROXY_FAIL_THRESHOLD:
             h["healthy"] = False
 
-    def _parse_proxy_headers(self, raw: str) -> tuple[dict[str, str], list[str], list[str]]:
+    def _parse_proxy_headers(self, raw: str, url: str = "") -> tuple[dict[str, str], list[str], list[str]]:
         """解析 curl -D 输出的响应头流，返回 (最终响应头, 重定向状态码链, 更新的cookie名)。
 
         curl -D /dev/stderr 把每个响应（含重定向中间跳）的头块依次写入 stderr，
@@ -875,6 +905,7 @@ class ToolExecutor:
         resp_headers: dict[str, str] = {}
         redirect_chain: list[str] = []
         updated: list[str] = []
+        fallback_host = _host_from_url(url) or self._target_host()
         norm = raw.replace("\r\n", "\n").replace("\r", "\n")
         blocks = [b for b in norm.split("\n\n") if b.strip()]
         for block in blocks:
@@ -896,10 +927,18 @@ class ToolExecutor:
                         continue
                     hdrs[k] = v
                     if k.lower() == "set-cookie":
-                        cv = v.split(";")[0].strip()
-                        if "=" in cv:
-                            cn, cval = cv.split("=", 1)
-                            self._put_cookie(cn.strip(), cval.strip(), updated)
+                        parsed = _split_set_cookie(v)
+                        if parsed:
+                            cn, cval, domain, path = parsed
+                            try:
+                                self._put_cookie_entry(
+                                    cn, cval,
+                                    domain=domain or fallback_host,
+                                    path=path,
+                                    updated=updated,
+                                )
+                            except Exception:
+                                pass
             if hdrs:
                 resp_headers = hdrs
         return resp_headers, redirect_chain, updated
@@ -1250,19 +1289,51 @@ class ToolExecutor:
         return body, truncated
 
     @staticmethod
-    def _raw_request(req: httpx.Request, data: Optional[str], json_body: Any) -> str:
+    def _request_body_text(
+        req: httpx.Request,
+        data: Optional[str],
+        json_body: Any,
+        files: Any = None,
+    ) -> str:
+        """取证预览请求体。multipart 等流式 body 不能读 req.content（RequestNotRead）。"""
+        try:
+            content = req.content
+        except Exception:
+            content = None
+        if content:
+            try:
+                return content.decode("utf-8", "replace")
+            except Exception:
+                return "<binary>"
+        if json_body is not None:
+            try:
+                import json as _json
+                return _json.dumps(json_body, ensure_ascii=False)
+            except Exception:
+                return str(json_body)
+        if data:
+            return str(data)
+        if files:
+            if isinstance(files, dict):
+                names = ", ".join(str(k) for k in files)
+                return f"<multipart: {names}>" if names else "<multipart>"
+            return "<multipart>"
+        return ""
+
+    @staticmethod
+    def _raw_request(
+        req: httpx.Request,
+        data: Optional[str],
+        json_body: Any,
+        files: Any = None,
+    ) -> str:
         lines = [f"{req.method} {req.url.raw_path.decode('latin-1')} HTTP/1.1"]
         lines.append(f"Host: {req.url.host}")
         for k, v in req.headers.items():
             if k.lower() == "host":
                 continue
             lines.append(f"{k}: {v}")
-        body = ""
-        if req.content:
-            try:
-                body = req.content.decode("utf-8", "replace")
-            except Exception:
-                body = "<binary>"
+        body = ToolExecutor._request_body_text(req, data, json_body, files)
         return "\n".join(lines) + "\n\n" + body
 
     # ---- analyze_javascript（条件开放给 worker）----
