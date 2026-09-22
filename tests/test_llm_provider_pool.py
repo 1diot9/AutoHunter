@@ -638,6 +638,28 @@ class ProviderHealthTests(StateResetMixin, unittest.TestCase):
                 (True, "ready"),
             )
 
+    def test_behavior_half_open_probe_owner_can_still_be_scheduled(self) -> None:
+        provider = _provider("behavior-pick")
+        with patch.object(health, "_BEHAVIOR_FAIL_THRESHOLD", 1):
+            health.mark_provider_behavior_failed(
+                provider.base_url, provider.model, "mock empty tool loop",
+                provider.api_key, provider.protocol,
+            )
+            with health._LOCK:
+                health._HEALTH[health.provider_ref(
+                    provider.base_url, provider.model, provider.api_key, provider.protocol,
+                )]["behavior_cooldown_until_ts"] = 0
+            self.assertEqual(
+                health.acquire_provider_slot(
+                    provider.base_url, provider.model, provider.api_key, provider.protocol,
+                    owner="worker-a",
+                ),
+                (True, "ready"),
+            )
+            picked = provider_slots.acquire([provider])
+            self.assertIs(picked, provider)
+            provider_slots.release(provider)
+
 
 class LLMClientPoolTests(StateResetMixin, unittest.TestCase):
     def test_error_classification_covers_non_retryable_provider_failures(self) -> None:

@@ -30,7 +30,7 @@ from app.agents import auth_bootstrap
 from app.config import worker_config
 from app.tools.cookie_manager import CookieHub
 from app import dedup
-from app.llm.client import LLMClient, LLMError, llm_error_event_fields
+from app.llm.client import LLMClient, LLMError, assistant_history_message, llm_error_event_fields
 from app.schemas import Finding, Verdict, WorkerResult
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import (
@@ -218,10 +218,14 @@ class Worker:
         return auth_bootstrap.user_auth_prompt_block(ctx, attempt)
 
     def _bootstrap_user_auth(self) -> None:
-        """启动时：全局 Cookie 优先，否则用用户凭据登录；失败则后续 http 自动重登。"""
+        """启动时注入用户 cookie 的全部字段；没有用户 cookie 时才复用全局会话。"""
         ctx = (self.target_meta or {}).get("user_auth") or (self.target_meta or {}).get("auth_context")
         if not isinstance(ctx, dict):
             ctx = None
+        ctx = auth_bootstrap.overlay_auth_context(ctx, (self.target_meta or {}).get("user_credentials"))
+        if isinstance(ctx, dict) and ctx.get("cookies"):
+            self.target_meta["user_auth"] = ctx
+            self.target_meta["auth_context"] = ctx
         hub = self._cookie_hub
         if ctx:
             hub.remember_from_auth_context(ctx)
@@ -241,17 +245,17 @@ class Worker:
         hub.bootstrapping = True
         result = None
         login_base = auth_bootstrap.login_origin(self.target) or self.target
+        user_cookies = dict((ctx or {}).get("cookies") or {}) if isinstance(ctx, dict) else {}
         try:
-            if hub.apply(self.executor):
-                names = sorted(getattr(self.executor, "_session_cookies", {}).keys())[:30]
-                headers = sorted(getattr(self.executor, "_session_headers", {}).keys())[:20]
-                result = auth_bootstrap.AuthAttemptResult(
-                    used=True, matched=True, status="injected",
-                    kinds=["cookie"], matched_by="shared", binding_target="全局会话",
-                    reason="复用本站全局 Cookie",
-                    cookie_names=names, header_names=headers,
-                )
-            if result is None and ctx:
+            # 用户提交了 cookie 时必须整组注入。全局会话里残留的 JSESSIONID 不能抢先结束启动。
+            has_headers = isinstance(ctx, dict) and bool(ctx.get("headers"))
+            has_password = isinstance(ctx, dict) and bool(ctx.get("username") and ctx.get("password"))
+            if user_cookies or has_headers:
+                hub.apply(self.executor)
+                result = auth_bootstrap.bootstrap_auth(self.executor, ctx, login_base)
+                if result.status in ("injected", "login_ok"):
+                    hub.ingest(self.executor, status=result.status)
+            elif has_password:
                 with hub.login_turn() as action:
                     if action == "reuse" and hub.apply(self.executor):
                         names = sorted(getattr(self.executor, "_session_cookies", {}).keys())[:30]
@@ -265,6 +269,15 @@ class Worker:
                         result = auth_bootstrap.bootstrap_auth(self.executor, ctx, login_base)
                         if result.status in ("injected", "login_ok"):
                             hub.ingest(self.executor, status=result.status)
+            elif hub.apply(self.executor):
+                names = sorted(getattr(self.executor, "_session_cookies", {}).keys())[:30]
+                headers = sorted(getattr(self.executor, "_session_headers", {}).keys())[:20]
+                result = auth_bootstrap.AuthAttemptResult(
+                    used=True, matched=True, status="injected",
+                    kinds=["cookie"], matched_by="shared", binding_target="全局会话",
+                    reason="复用本站全局 Cookie",
+                    cookie_names=names, header_names=headers,
+                )
         finally:
             hub.bootstrapping = False
         if result is None:
@@ -491,18 +504,10 @@ class Worker:
             if self.cancel_event.is_set():
                 return self._cancelled_result(rounds)
 
-            # 模型可能只回文本（思考），也可能带 tool_calls
+            # 模型可能只回文本（思考），也可能带 tool_calls。
+            # GLM-5.x 等思考模型后续轮必须带回 reasoning_content，否则会退化成纯文字绕圈。
             tool_calls = getattr(msg, "tool_calls", None)
-            assistant_msg: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-            if tool_calls:
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in tool_calls
-                ]
+            assistant_msg = assistant_history_message(msg)
             messages.append(assistant_msg)
 
             # 是否在本轮要插入 JS 工具提示。注意：若本轮带 tool_calls，这条 user 提示必须
@@ -568,6 +573,7 @@ class Worker:
                 messages.append({"role": "user", "content": "继续调用工具验证，或 finish。"})
                 continue
             no_tool_rounds = 0
+            self._report_provider_success()
 
             # 逐个执行工具调用。
             # 关键：OpenAI 协议要求 assistant.tool_calls 里【每一个】tool_call_id 都必须有
@@ -932,12 +938,16 @@ class Worker:
         # 用户提交的凭证注入：当 deepen_context.source=user_credentials 时，在 brief 中附带用户凭证
         user_creds = (self.target_meta or {}).get("user_credentials")
         if user_creds:
-            cred_lines = ["", "# 用户提供的登录凭证（请先用 session_set 登记，再登录后深挖）"]
+            cred_lines = ["", "# 用户提供的登录凭证"]
             if user_creds.get("type") == "password":
+                cred_lines.append("请先用 session_set 登记，再登录后深挖。")
                 cred_lines.append(f"账号：{user_creds.get('username', '')}")
                 cred_lines.append(f"密码：{user_creds.get('password', '')}")
             elif user_creds.get("type") == "cookie":
+                cred_lines.append("系统已把 Cookie 字符串里的每一个字段注入会话，并绑定到目标主机以及它跳转到的业务主机。")
                 cred_lines.append(f"Cookie/Token：{user_creds.get('cookie', '')}")
+                cred_lines.append("直接用 http_request 访问业务接口，这些字段会自动带上。不要用 curl 另拼一份缺字段的 Cookie。")
+                cred_lines.append("账号中心 /pass/serviceLogin 在没有 passToken 时会下发 serviceToken=EXPIRED，这只说明账号中心未登录。先用完整 cookie 访问跳转后的业务主机，业务接口仍未登录，才算凭据失效。")
             cred_lines.append("这是用户授权你使用的入场券，登录后继续实证危害才算出洞。不要修改任何账号密码。")
             cred_lines.extend([
                 "",

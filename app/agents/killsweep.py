@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional
 
 from app.agents.history import compact_messages
 from app.agents.prompts import is_enterprise_src, killsweep_system_prompt
-from app.llm.client import LLMClient
+from app.llm.client import LLMClient, assistant_history_message
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import KILLSWEEP_TOOL_SCHEMAS
 
@@ -180,14 +180,7 @@ class KillsweepHunter:
                 return KillsweepResult({"error": f"LLM 调用失败: {e}"})
 
             tool_calls = getattr(msg, "tool_calls", None)
-            am: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-            if tool_calls:
-                am["tool_calls"] = [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in tool_calls
-                ]
-            messages.append(am)
+            messages.append(assistant_history_message(msg))
 
             if not tool_calls:
                 messages.append({"role": "user", "content": "请继续，或调用 submit_killsweep 给出结论。"})

@@ -25,15 +25,18 @@ _TRANSIENT_TRANSPORT_KINDS = frozenset({"network", "timeout"})
 _PROBE_RECOVERABLE_KINDS = frozenset({"network", "timeout", ""})
 
 
+_MAX_COOLDOWN_SECONDS = 600  # 10 minutes
+
+
 def _cooldown_steps() -> list[int]:
     values: list[int] = []
-    for raw in os.environ.get("LLM_PROVIDER_COOLDOWN_SECONDS", "300,900,1800,3600").split(","):
+    for raw in os.environ.get("LLM_PROVIDER_COOLDOWN_SECONDS", "300,600").split(","):
         try:
             value = int(raw.strip())
         except ValueError:
             continue
         if value > 0:
-            values.append(value)
+            values.append(min(value, _MAX_COOLDOWN_SECONDS))
     return values or [300]
 
 

@@ -566,8 +566,159 @@ def _strip_thinking_tags(text: str) -> str:
     return _THINK_TAG_RE.sub("", text).strip()
 
 
+_REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
+_THINKING_BODY_KEYS = ("thinking", "enable_thinking", "reasoning_effort")
+_GLM_THINKING_RE = re.compile(r"(?:^|[-./_])glm-(?:4\.[5-9]|5)(?:[-.].*)?$", re.IGNORECASE)
+_QWEN_THINKING_RE = re.compile(r"(?:^|[-./_])(?:qwen3|qwq)(?:[-.].*)?$", re.IGNORECASE)
+_KIMI_THINKING_RE = re.compile(
+    r"(?:^|[-./_])kimi-k(?:3|2\.(?:5|6|7))(?:[-.].*)?$", re.IGNORECASE
+)
+_DEEPSEEK_REASONER_RE = re.compile(
+    r"(?:^|[-./_])(?:deepseek-reasoner|deepseek-r1)(?:[-.].*)?$", re.IGNORECASE
+)
+_THINKING_MAX_TOKENS_FLOOR = max(4096, int(os.environ.get("LLM_THINKING_MAX_TOKENS", "16384")))
+# 网关拒绝关思考后记住，避免 ali1/ali2 每一轮都先 400 再重试。
+_THINKING_DISABLE_UNSUPPORTED: set[str] = set()
+
+
+def _model_slug(model: str | None) -> str:
+    return (model or "").strip().split("/")[-1].strip()
+
+
+def preserves_assistant_reasoning(model: str | None) -> bool:
+    """GLM-4.5+/5、Qwen3、Kimi K2.5+、DeepSeek-R1：后续轮必须带回 reasoning_content。"""
+    slug = _model_slug(model)
+    if not slug:
+        return False
+    return bool(
+        _GLM_THINKING_RE.search(slug)
+        or _QWEN_THINKING_RE.search(slug)
+        or _KIMI_THINKING_RE.search(slug)
+        or _DEEPSEEK_REASONER_RE.search(slug)
+    )
+
+
+def disable_thinking_extra_body(model: str | None, base_url: str | None = None) -> dict[str, Any]:
+    """工具循环关掉默认思考：否则思考吃光 max_tokens，只回文字不调工具。"""
+    slug = _model_slug(model)
+    if not slug:
+        return {}
+    url = (base_url or "").lower()
+    # 阿里云百炼/MaaS 上的 GLM 强制 enable_thinking=True，关思考会 400。
+    if _GLM_THINKING_RE.search(slug) and "aliyuncs.com" in url:
+        return {}
+    if _GLM_THINKING_RE.search(slug) or _KIMI_THINKING_RE.search(slug):
+        return {"thinking": {"type": "disabled"}}
+    if _QWEN_THINKING_RE.search(slug):
+        return {"enable_thinking": False}
+    if _DEEPSEEK_REASONER_RE.search(slug):
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
+def _message_reasoning(msg: Any) -> str:
+    if msg is None:
+        return ""
+    values: list[Any] = []
+    if isinstance(msg, dict):
+        values.extend(msg.get(key) for key in _REASONING_KEYS)
+    else:
+        values.extend(getattr(msg, key, None) for key in _REASONING_KEYS)
+        extra = getattr(msg, "model_extra", None)
+        if isinstance(extra, dict):
+            values.extend(extra.get(key) for key in _REASONING_KEYS)
+    for val in values:
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            text = str(val.get("content") or val.get("text") or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _serialize_history_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tc in tool_calls or []:
+        if isinstance(tc, dict):
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            args = fn.get("arguments")
+            if args is not None and not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            out.append({
+                "id": tc.get("id", ""),
+                "type": tc.get("type", "function"),
+                "function": {"name": fn.get("name", ""), "arguments": args or ""},
+            })
+            continue
+        fn = getattr(tc, "function", None)
+        args = getattr(fn, "arguments", "") if fn is not None else ""
+        if args is not None and not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        out.append({
+            "id": getattr(tc, "id", ""),
+            "type": getattr(tc, "type", "function"),
+            "function": {
+                "name": getattr(fn, "name", "") if fn is not None else "",
+                "arguments": args or "",
+            },
+        })
+    return out
+
+
+def assistant_history_message(msg: Any) -> dict[str, Any]:
+    """把模型回包收成可重放的 assistant 消息（含 GLM 所需的 reasoning_content）。"""
+    content = getattr(msg, "content", None)
+    if content is None:
+        content = ""
+    elif not isinstance(content, str):
+        content = str(content)
+    out: dict[str, Any] = {"role": "assistant", "content": content}
+    serialized = _serialize_history_tool_calls(getattr(msg, "tool_calls", None))
+    if serialized:
+        out["tool_calls"] = serialized
+    reasoning = _message_reasoning(msg)
+    if reasoning:
+        out["reasoning_content"] = reasoning
+    return out
+
+
+def _messages_have_reasoning(messages: list[dict[str, Any]] | None) -> bool:
+    for item in messages or []:
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        if _message_reasoning(item):
+            return True
+    return False
+
+
+def prepare_openai_extra_body(
+    model: str | None,
+    messages: list[dict[str, Any]] | None,
+    extra_body: dict[str, Any] | None = None,
+    *,
+    tools: Any = None,
+    base_url: str | None = None,
+    skip_thinking_disable: bool = False,
+) -> dict[str, Any]:
+    """合并思考开关，并用 extra_body.messages 绕过 SDK 丢掉 reasoning_content。"""
+    extra = dict(extra_body or {})
+    if tools and not skip_thinking_disable:
+        for key, value in disable_thinking_extra_body(model, base_url).items():
+            extra.setdefault(key, value)
+    if preserves_assistant_reasoning(model) and _messages_have_reasoning(messages):
+        extra["messages"] = list(messages or [])
+    return extra
+
+
+def thinking_max_tokens(model: str | None, requested: int, *, tools: Any = None) -> int:
+    if not tools or not preserves_assistant_reasoning(model):
+        return requested
+    return max(requested, _THINKING_MAX_TOKENS_FLOOR)
+
+
 def _strip_message_thinking(msg: Any) -> Any:
-    """剥掉 message.content 里的 <think> 块，不改 tool_calls。"""
+    """剥掉 message.content 里的 <think> 块，不改 tool_calls / reasoning_content。"""
     content = getattr(msg, "content", None)
     if not isinstance(content, str) or not content:
         return msg
@@ -578,11 +729,15 @@ def _strip_message_thinking(msg: Any) -> Any:
         msg.content = stripped
         return msg
     except Exception:
-        return SimpleNamespace(
+        ns = SimpleNamespace(
             content=stripped,
             tool_calls=getattr(msg, "tool_calls", None),
             role=getattr(msg, "role", "assistant"),
         )
+        reasoning = _message_reasoning(msg)
+        if reasoning:
+            ns.reasoning_content = reasoning
+        return ns
 
 
 def _apply_emulated_tool_calls(msg: Any) -> Any:
@@ -590,7 +745,11 @@ def _apply_emulated_tool_calls(msg: Any) -> Any:
     text = getattr(msg, "content", None) or ""
     content, calls = _parse_emulated_tool_calls(text)
     if calls:
-        return SimpleNamespace(content=content, tool_calls=calls, role="assistant")
+        ns = SimpleNamespace(content=content, tool_calls=calls, role="assistant")
+        reasoning = _message_reasoning(msg)
+        if reasoning:
+            ns.reasoning_content = reasoning
+        return ns
     return msg
 
 
@@ -621,11 +780,15 @@ def _dict_to_message(msg: dict[str, Any]) -> SimpleNamespace:
                 type=c.get("type", "function"),
                 function=SimpleNamespace(name=fn.get("name", ""), arguments=args or ""),
             ))
-    return SimpleNamespace(
+    ns = SimpleNamespace(
         content="" if content is None else content,
         tool_calls=ns_calls or None,
         role=msg.get("role") or "assistant",
     )
+    reasoning = _message_reasoning(msg)
+    if reasoning:
+        ns.reasoning_content = reasoning
+    return ns
 
 
 def _coerce_chat_message(resp: Any) -> Any:
@@ -1469,14 +1632,22 @@ class LLMClient:
             "temperature": self.config.temperature if temperature is None else temperature,
         }
         if not omit_max_tokens:
-            kwargs["max_tokens"] = int(max_tokens or os.environ.get("LLM_MAX_TOKENS", "4096"))
+            requested = int(max_tokens or os.environ.get("LLM_MAX_TOKENS", "4096"))
+            kwargs["max_tokens"] = thinking_max_tokens(
+                self.config.model, requested, tools=tools or tools_orig,
+            )
         if _is_kimi_coding_endpoint(self.config.base_url):
             kwargs["temperature"] = 1  # 该端点只接受 temperature=1
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
-        if extra_body:
-            kwargs["extra_body"] = dict(extra_body)
+        merged_extra = prepare_openai_extra_body(
+            self.config.model, messages, extra_body, tools=tools or tools_orig,
+            base_url=self.config.base_url,
+            skip_thinking_disable=self._current_provider_ref() in _THINKING_DISABLE_UNSUPPORTED,
+        )
+        if merged_extra:
+            kwargs["extra_body"] = merged_extra
         # 逐请求再抹掉 SDK 在 _build_headers 里补写的 retry-count/read-timeout 两个
         # x-stainless-* 头（它们不在 default_headers 里，只能靠 per-request 覆盖）。
         extra = _per_request_omit_headers()
@@ -1488,6 +1659,7 @@ class LLMClient:
         tool_choice_fallback_used = False
         max_tokens_fallback_used = False
         extra_body_fallback_used = False
+        thinking_body_fallback_used = False
         max_retries = _POOL_SAME_PROVIDER_RETRIES if self.pool_mode else _MAX_RETRIES
         retry_count = 0
         # TLS/协议/参数兼容降级各自最多触发一次，不占传输重试次数。
@@ -1559,6 +1731,15 @@ class LLMClient:
                     kwargs["messages"] = messages
                     kwargs.pop("tools", None)
                     kwargs.pop("tool_choice", None)
+                    rebuilt_extra = prepare_openai_extra_body(
+                        self.config.model, messages, extra_body, tools=None,
+                        base_url=self.config.base_url,
+                        skip_thinking_disable=True,
+                    )
+                    if rebuilt_extra:
+                        kwargs["extra_body"] = rebuilt_extra
+                    else:
+                        kwargs.pop("extra_body", None)
                     continue
                 if (
                     not max_tokens_fallback_used
@@ -1575,6 +1756,29 @@ class LLMClient:
                     kwargs.pop("max_tokens", None)
                     max_tokens_fallback_used = True
                     continue
+                if (
+                    not thinking_body_fallback_used
+                    and kwargs.get("extra_body")
+                    and isinstance(last_exc, LLMError)
+                    and _is_extra_body_unsupported(last_exc)
+                ):
+                    extra = dict(kwargs.get("extra_body") or {})
+                    dropped = [key for key in _THINKING_BODY_KEYS if key in extra]
+                    if dropped:
+                        for key in dropped:
+                            extra.pop(key, None)
+                        logger.warning(
+                            "LLM thinking extra_body rejected; retrying without %s "
+                            "(model=%s, detail=%s)",
+                            ",".join(dropped), self.config.model, last_exc.detail[:300],
+                        )
+                        _THINKING_DISABLE_UNSUPPORTED.add(self._current_provider_ref())
+                        if extra:
+                            kwargs["extra_body"] = extra
+                        else:
+                            kwargs.pop("extra_body", None)
+                        thinking_body_fallback_used = True
+                        continue
                 if (
                     not extra_body_fallback_used
                     and kwargs.get("extra_body")

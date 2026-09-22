@@ -33,7 +33,7 @@ from app.agents.xss_audit import (
     map_xss_verdict,
     xss_review_prompt,
 )
-from app.llm.client import LLMClient, LLMError, _is_forced_tool_choice_unsupported
+from app.llm.client import LLMClient, LLMError, assistant_history_message, _is_forced_tool_choice_unsupported
 from app.schemas import Confidence, Finding, Review, ReviewVerdict, Severity
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import REVIEWER_TOOL_SCHEMAS
@@ -539,7 +539,7 @@ class Reviewer:
 
             tool_calls = getattr(msg, "tool_calls", None)
             if not tool_calls:
-                messages.append({"role": "assistant", "content": msg.content or ""})
+                messages.append(assistant_history_message(msg))
                 messages.append({"role": "user", "content": "请调用 submit_review 工具输出结构化结论。"})
                 continue
 

@@ -69,13 +69,9 @@ def _health_blocks(ref: str, health: dict[str, dict[str, Any]]) -> bool:
         return True
     if str(state.get("behavior_status") or "ok") in {"failed", "cooldown"}:
         return True
-    if (
-        str(state.get("behavior_status") or "") == "half_open"
-        and str(state.get("behavior_probe_owner") or "")
-    ):
-        # Another owner holds the behavior probe; skip for selection.
-        # Same-owner re-entry is handled later by acquire_provider_slot.
-        return True
+    # behavior half-open 不在这里拦截：acquire_provider_slot 按 owner 放行探测 worker，
+    # 其它 owner 会拿到 behavior_half_open_inflight。这里一拦，认领探测的 worker 下一轮
+    # 也无法再打到这个端点，界面会一直停在「探测中」。
     return False
 
 
