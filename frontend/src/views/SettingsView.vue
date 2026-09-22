@@ -33,6 +33,7 @@ const singleModelsError = ref("");
 const workdirLoading = ref(false);
 const workdirCleaning = ref(false);
 const workdirStats = ref(null);
+const workdirError = ref("");
 const workdirResult = ref(null);
 const cleanupRetentionDays = ref(7);
 const cleanupDryRun = ref(true);
@@ -843,15 +844,26 @@ const autoSaveLabel = computed(() => {
 
 async function loadWorkdirStats() {
   workdirLoading.value = true;
+  workdirError.value = "";
   try {
     workdirStats.value = await api.workdirStats();
     if (workdirStats.value) {
       cleanupRetentionDays.value = workdirStats.value.retention_days || 7;
     }
   } catch (e) {
-    toast(String(e.message || e).replace(/^\d+\s*/, ""));
+    const msg = String(e.message || e).replace(/^\d+\s*/, "");
+    workdirError.value = msg || "工作目录统计加载失败";
+    toast(workdirError.value);
   } finally {
     workdirLoading.value = false;
+  }
+}
+
+function selectSettingsTab(id) {
+  settingsTab.value = id;
+  // 打开设置页不扫盘；只有进入「数据」且还没有统计时才请求。
+  if (id === "data" && !workdirStats.value && !workdirLoading.value) {
+    loadWorkdirStats();
   }
 }
 
@@ -990,7 +1002,6 @@ onMounted(async () => {
   uiPrefs.value = loadUiPrefs();
   window.addEventListener("ah-ui-changed", onUiChanged);
   await load();
-  // workdir 统计改为手动刷新，避免设置页打开时扫盘卡顿
   loadBackupStats();
   refreshProviderHealth().catch(() => {});
   startHealthPoll();
@@ -1136,7 +1147,7 @@ async function restoreBackup() {
             :key="tab.id"
             type="button"
             :class="{ active: settingsTab === tab.id }"
-            @click="settingsTab = tab.id"
+            @click="selectSettingsTab(tab.id)"
           >
             {{ tab.label }}
             <small>{{ tab.hint }}</small>
@@ -1661,8 +1672,15 @@ async function restoreBackup() {
             <span>工作目录管理</span>
             <small>Worker / Escalate 等 agent 产生的临时文件磁盘占用与清理</small>
           </legend>
-          <div v-if="workdirLoading" class="field-hint">加载中…</div>
-          <div v-else-if="workdirStats" class="workdir-panel">
+          <div v-if="workdirLoading && !workdirStats" class="field-hint">正在统计工作目录…</div>
+          <div v-else-if="!workdirStats" class="workdir-panel">
+            <p v-if="workdirError" class="update-error">{{ workdirError }}</p>
+            <p v-else class="field-hint">尚未加载工作目录统计。</p>
+            <button type="button" class="test-btn" :disabled="workdirLoading" @click="loadWorkdirStats">
+              {{ workdirError ? "重试" : "加载统计" }}
+            </button>
+          </div>
+          <div v-else class="workdir-panel">
             <div class="workdir-stats-grid">
               <div class="workdir-stat-item">
                 <span class="workdir-stat-label">磁盘占用</span>
@@ -1701,7 +1719,7 @@ async function restoreBackup() {
                 {{ workdirCleaning ? "清理中…" : (cleanupDryRun ? "模拟清理" : "执行清理") }}
               </button>
               <button type="button" class="test-btn" @click="loadWorkdirStats" :disabled="workdirLoading">
-                刷新统计
+                {{ workdirLoading ? "统计中…" : "刷新统计" }}
               </button>
             </div>
 
