@@ -81,6 +81,7 @@ class CookieSlot:
         self.cookies: dict[str, str] = {}
         self.headers: dict[str, str] = {}
         self.creds: dict[str, str] = {}
+        self.alias_hosts: list[str] = []
         self.status: str = ""
         self.updated_at: float = 0.0
         self.last_relogin: float = 0.0
@@ -145,6 +146,9 @@ class CookieManager:
                     k: str(v) for k, v in creds.items()
                     if k in ("username", "password", "login_url") and v
                 }
+            aliases = data.get("alias_hosts")
+            if isinstance(aliases, list):
+                slot.alias_hosts = [str(h).strip().lower() for h in aliases if str(h).strip()]
             slot.status = str(data.get("status") or "")[:40]
             try:
                 slot.updated_at = float(data.get("updated_at") or 0)
@@ -158,6 +162,7 @@ class CookieManager:
             "cookie_jar": [dict(e) for e in slot.cookie_jar],
             "headers": dict(slot.headers),
             "creds": dict(slot.creds),
+            "alias_hosts": list(slot.alias_hosts),
             "status": slot.status,
             "updated_at": slot.updated_at,
         }
@@ -226,6 +231,12 @@ class CookieManager:
             jar = [dict(e) for e in slot.cookie_jar]
             cookies = dict(slot.cookies)
             headers = dict(slot.headers)
+            aliases = list(slot.alias_hosts)
+        hosts = getattr(executor, "_cookie_alias_hosts", None)
+        if isinstance(hosts, list):
+            for h in aliases:
+                if h and h not in hosts:
+                    hosts.append(h)
         restore = getattr(executor, "restore_resume_state", None)
         if callable(restore):
             restore(
@@ -250,6 +261,12 @@ class CookieManager:
                 slot.cookies.update({str(k): str(v)[:4096] for k, v in cookies.items()})
             if headers:
                 slot.headers.update(headers)
+            aliases = getattr(executor, "_cookie_alias_hosts", None)
+            if isinstance(aliases, list):
+                for h in aliases:
+                    host_name = str(h or "").strip().lower().lstrip(".")
+                    if host_name and host_name not in slot.alias_hosts:
+                        slot.alias_hosts.append(host_name)
             if status:
                 slot.status = status[:40]
             slot.updated_at = time.time()

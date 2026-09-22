@@ -36,6 +36,8 @@ _FOFA_LOOKUP_MAX_SIZE = 30
 # 企业 session cookie jar 上限，防异常站点塞爆内存。
 _SESSION_MAX_COOKIES = 50
 _SESSION_MAX_HEADERS = 30
+# 用户 cookie 跟随跳转时最多再走几跳，避免开放重定向把凭据送到一长串外站。
+_REDIRECT_HOST_HOPS = 4
 # 代理服务器被标记为不健康后的冷却时间（秒）。冷却结束后重新纳入轮询候选。
 # 轮询策略：每次请求后轮转到下一台健康代理，分散流量降低单 IP 被目标 WAF 封禁概率。
 _PROXY_UNHEALTHY_COOLDOWN = int(os.environ.get("PROXY_UNHEALTHY_COOLDOWN", "60"))
@@ -137,6 +139,16 @@ def _cookie_host_ok(domain: str, host: str) -> bool:
     if not d:
         return True
     return h == d or h.endswith("." + d)
+
+
+def _redirect_hop(url: str, cookies: dict[str, str]) -> tuple[int, str]:
+    """只读一跳 Location，不把响应 Set-Cookie 写进会话。"""
+    headers = {"User-Agent": BROWSER_UA}
+    if cookies:
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    with httpx.Client(verify=False, timeout=12, follow_redirects=False, trust_env=False) as client:
+        resp = client.get(url, headers=headers)
+    return int(resp.status_code or 0), str(resp.headers.get("location") or "")
 
 
 def _parse_cookie_header(raw: str) -> dict[str, str]:
@@ -296,6 +308,9 @@ class ToolExecutor:
         self._over_cap: bool = False   # 一旦确认超上限即置位：work_dir 只增不删，此后直接短路不再全扫
         self._cookie_hub: Any = None
         self._relogin_retrying = False
+        # 用户注入的 cookie 额外绑定到这些主机（目标主机 + 跳转到达的主机）。
+        self._cookie_alias_hosts: list[str] = []
+        self._user_cookie_names: set[str] = set()
 
         # 代理模式：本地 IP 被目标 WAF 封禁后，http_request 透明改走 SSH 代理，
         # 保留同一 worker 的上下文与会话态（cookie jar 原地延续），无需重派。
@@ -560,6 +575,7 @@ class ToolExecutor:
         except CommandBlocked as e:
             return {"ok": False, "blocked": True, "error": str(e), "url": url}
         merged_headers, session_applied = self._apply_session(headers, url, overlay)
+        pinned_cookies = self._pinned_user_cookies(_host_from_url(url) or self._target_host())
 
         req: httpx.Request | None = None
         try:
@@ -601,6 +617,7 @@ class ToolExecutor:
             # 吸收整条重定向链（resp.history 里每个中间 302 + 最终响应）的 Set-Cookie，
             # 而不是只读最终 resp.cookies；再兜底吸收 client.cookies jar 里的全部。
             session_updated = self._absorb_redirect_chain(resp, client)
+            self._bind_pinned_locations(pinned_cookies, resp)
         except Exception as e:
             return {"ok": False, "error": f"HTTP 请求异常: {e}", "url": url}
 
@@ -1095,6 +1112,115 @@ class ToolExecutor:
             pass
         return updated
 
+    def _session_cookie_hosts(self) -> list[str]:
+        """用户注入 cookie 要写入的主机：目标主机，以及跳转链上记下的主机。"""
+        hosts: list[str] = []
+        target = self._target_host()
+        if target:
+            hosts.append(target)
+        for raw in self._cookie_alias_hosts:
+            host = str(raw or "").strip().lower().lstrip(".")
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts or [target]
+
+    def _bind_cookie_values(self, values: dict[str, str], host: str) -> None:
+        host = (host or "").strip().lower().lstrip(".")
+        if not host:
+            return
+        if host not in self._cookie_alias_hosts:
+            self._cookie_alias_hosts.append(host)
+        for name, value in values.items():
+            if not name:
+                continue
+            self._put_cookie_entry(name, value, domain=host, path="/")
+
+    def spread_cookies_to_redirect_hosts(self, names: list[str]) -> list[str]:
+        """把指定 cookie 的当前值复制到目标 URL 的跳转主机上。
+
+        任务 URL 经常 301 到另一个域名（mibi.xiaomi.com → mibi.wali.com）。
+        只绑在入口主机上时，业务站请求不会带上登录 cookie。
+        """
+        from urllib.parse import urljoin
+
+        from app.tools.netguard import is_loopback_target
+
+        wanted = [str(n) for n in (names or []) if str(n or "").strip()]
+        origin = self._target_host()
+        current = self._cookies_for_host(origin) if origin else {}
+        values = {name: current[name] for name in wanted if name in current}
+        if origin:
+            self._bind_cookie_values(values, origin)
+        if not values:
+            return list(self._session_cookie_hosts())
+
+        fetch = self._redirect_hop if callable(getattr(self, "_redirect_hop", None)) else _redirect_hop
+        url = (self.target or "").strip()
+        seen: set[str] = set()
+        for _ in range(_REDIRECT_HOST_HOPS):
+            if not url or url in seen:
+                break
+            seen.add(url)
+            hop_host = _host_from_url(url)
+            if not hop_host or is_loopback_target(hop_host):
+                break
+            self._bind_cookie_values(values, hop_host)
+            try:
+                status, location = fetch(url, values)
+            except Exception:
+                break
+            try:
+                status_i = int(status or 0)
+            except (TypeError, ValueError):
+                break
+            loc = str(location or "").strip()
+            if status_i not in (301, 302, 303, 307, 308) or not loc:
+                break
+            nxt = urljoin(url, loc)
+            if not (nxt.startswith("http://") or nxt.startswith("https://")):
+                break
+            url = nxt
+        return list(self._session_cookie_hosts())
+
+    def _pinned_user_cookies(self, host: str) -> dict[str, str]:
+        if not self._user_cookie_names:
+            return {}
+        current = self._cookies_for_host(host)
+        return {name: current[name] for name in self._user_cookie_names if name in current}
+
+    def _bind_pinned_locations(self, pinned: dict[str, str], resp: Any) -> None:
+        """跳转目标主机也带上请求前的用户 cookie，避免 Set-Cookie 清场覆盖后再复制。"""
+        if not pinned or resp is None:
+            return
+        from app.tools.netguard import is_loopback_target
+
+        locs: list[str] = []
+        try:
+            loc = resp.headers.get("location") or resp.headers.get("Location") or ""
+        except Exception:
+            loc = ""
+        if loc:
+            locs.append(str(loc))
+        try:
+            for hist in list(getattr(resp, "history", []) or []):
+                hloc = ""
+                try:
+                    hloc = hist.headers.get("location") or ""
+                except Exception:
+                    hloc = ""
+                if hloc:
+                    locs.append(str(hloc))
+        except Exception:
+            pass
+        base = str(getattr(resp, "url", "") or "")
+        from urllib.parse import urljoin
+        for loc in locs:
+            nxt = urljoin(base, loc) if base else loc
+            host = _host_from_url(nxt)
+            if not host or is_loopback_target(host):
+                continue
+            self._bind_cookie_values(pinned, host)
+
     def session_set(
         self,
         cookies: Optional[dict[str, str]] = None,
@@ -1106,20 +1232,26 @@ class ToolExecutor:
                 self._session_cookies.clear()
                 self._cookie_jar.clear()
                 self._session_headers.clear()
-            host = self._target_host()
+                self._cookie_alias_hosts.clear()
+                self._user_cookie_names.clear()
+            hosts = self._session_cookie_hosts()
             if isinstance(cookies, dict):
+                self._user_cookie_names.update(k for k in cookies if isinstance(k, str) and k)
                 for k, v in cookies.items():
                     if not isinstance(k, str):
                         continue
-                    self._put_cookie_entry(k, str(v)[:4096], domain=host, path="/")
+                    for host in hosts:
+                        self._put_cookie_entry(k, str(v)[:4096], domain=host, path="/")
             if isinstance(headers, dict):
                 for k, v in headers.items():
                     if not isinstance(k, str):
                         continue
                     if k.lower() == "cookie":
                         parsed = _parse_cookie_header(str(v))
+                        self._user_cookie_names.update(parsed)
                         for ck, cv in parsed.items():
-                            self._put_cookie_entry(ck, cv, domain=host, path="/")
+                            for host in hosts:
+                                self._put_cookie_entry(ck, cv, domain=host, path="/")
                         continue
                     if k in self._session_headers or len(self._session_headers) < _SESSION_MAX_HEADERS:
                         self._session_headers[k] = str(v)[:4096]

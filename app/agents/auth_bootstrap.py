@@ -26,6 +26,48 @@ def _strip(s: Any) -> str:
     return str(s or "").strip()
 
 
+def cookies_from_user_credentials(raw: dict | None) -> dict[str, str]:
+    """待注册目标提交的 cookie 串：每个字段都保留，后写覆盖同名。"""
+    src = dict(raw or {})
+    if str(src.get("type") or "cookie") != "cookie":
+        return {}
+    blob = src.get("cookie")
+    if isinstance(blob, dict):
+        return {str(k).strip(): str(v) for k, v in blob.items() if str(k).strip()}
+    return parse_cookie_string(str(blob or ""))
+
+
+def overlay_auth_context(ctx: dict | None, user_credentials: dict | None) -> dict | None:
+    """把用户提交的全部 cookie 字段叠进 auth context，提交值覆盖同名字段。"""
+    cookies = cookies_from_user_credentials(user_credentials)
+    if not cookies:
+        return ctx if isinstance(ctx, dict) else None
+    out = dict(ctx or {})
+    merged = dict(out.get("cookies") or {})
+    merged.update(cookies)
+    out["cookies"] = merged
+    out["cookie_names"] = sorted(merged)
+    kinds = [k for k in (out.get("kinds") or []) if k]
+    if "cookie" not in kinds:
+        kinds.append("cookie")
+    out["kinds"] = kinds
+    out["matched"] = True
+    if not _strip(out.get("matched_by")):
+        out["matched_by"] = "user_credentials"
+    return out
+
+
+def _spread_executor_cookies(executor: Any, cookies: dict[str, str]) -> list[str]:
+    spread = getattr(executor, "spread_cookies_to_redirect_hosts", None)
+    if not callable(spread) or not cookies:
+        return []
+    try:
+        hosts = spread(list(cookies.keys()))
+    except Exception:
+        return []
+    return [str(h) for h in (hosts or []) if str(h or "").strip()]
+
+
 def parse_cookie_string(raw: str) -> dict[str, str]:
     out: dict[str, str] = {}
     text = _strip(raw)
@@ -383,7 +425,8 @@ def bootstrap_auth(executor: Any, auth_context: dict | None, base_url: str) -> A
             reason="凭据为空", matched_by=matched_by, binding_target=binding_target,
         )
 
-    # 1) Cookie / Bearer 注入
+    # 1) Cookie / Bearer 注入。cookie 串里的每个字段都写入，并复制到跳转主机。
+    bound_hosts: list[str] = []
     if cookies or headers:
         r = executor.session_set(cookies=cookies or None, headers=headers or None)
         if not r.get("ok"):
@@ -394,13 +437,16 @@ def bootstrap_auth(executor: Any, auth_context: dict | None, base_url: str) -> A
                 cookie_names=sorted(cookies.keys()),
                 header_names=sorted(headers.keys()),
             )
+        if cookies:
+            bound_hosts = _spread_executor_cookies(executor, cookies)
 
     # 2) 仅会话注入、无账密
     if not (username and password):
+        host_note = f"；已绑定 {', '.join(bound_hosts)}" if bound_hosts else ""
         return AuthAttemptResult(
             used=True, matched=True, status="injected", kinds=kinds,
             matched_by=matched_by, binding_target=binding_target,
-            reason="已注入用户提供的 Cookie/Authorization，后续请求自动携带",
+            reason=("已注入用户提供的全部 Cookie/Authorization，后续请求自动携带" + host_note)[:300],
             cookie_names=sorted(cookies.keys()) or list(getattr(executor, "_session_cookies", {}).keys())[:20],
             header_names=sorted(headers.keys()) or list(getattr(executor, "_session_headers", {}).keys())[:20],
         )
